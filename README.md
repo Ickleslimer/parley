@@ -6,7 +6,7 @@
 
 **Your coding agents are smarter together.**
 
-A **CLI** *and* an **MCP server** that convene a panel of the agents you already run — Claude, Codex, Gemini, and more — and fuse their answers into one.
+A **CLI** *and* an **MCP server** that convene a panel of the agents you already run — Claude, Codex, Gemini, Grok, and more — and fuse their answers into one.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 &nbsp;![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)
@@ -147,7 +147,7 @@ The script installs a prebuilt release binary for your platform when available, 
 | [`par fuse "..."`](#fuse--a-panel-of-agents-one-answer) | Run a panel of agents in parallel; a judge fuses one answer (also an MCP tool) |
 | [`par default <agent>`](#set-a-default-agent) | Pick the default agent (and options) for this machine |
 | [`par install <agent>`](#install-agent-clis) | Install a downstream agent CLI |
-| [`par shims install`](#shims) | Create `claudey` / `codexy` one-shot shortcuts |
+| [`par shims install`](#shims) | Create `claudey` / `codexy` / `groky` one-shot shortcuts |
 | [`par convert`](#convert--share-one-config-across-agents) | Port your `.claude/` config to every other agent |
 | [`par resume`](#resume--continue-a-past-session-from-any-agent) | Browse & resume past sessions across all agents, scoped to the folder |
 | [`par ask`](#ask--one-agent-talks-to-another) | Ask another agent headless, optionally seeded with a prior session's context |
@@ -174,8 +174,7 @@ par -p "review src" --dry-run          # print the routed command instead of run
 | `co` | codex | `go` | goose | `a` / `ai` | aider |
 | `cu` | cursor | `oc` | opencode | `aq` | amazon-q |
 | `cp` | copilot | `k` | kimi | `ag` | antigravity |
-| `m` / `mu` | muse | | | | |
-| `p` | pi | | | | |
+| `m` / `mu` | muse | `gr` | grok | `p` | pi |
 
 ```sh
 par -h cl "review this"
@@ -198,6 +197,8 @@ par -h k -p "drain the queue"
 | `--input-format <fmt>` | Claude-compatible input format. |
 | `--permission-mode <mode>` | Permission/sandbox mode, where supported. |
 | `--max-turns <n>` | Max agent turns, where supported. |
+| `--session-id <uuid>` | Start a new native session with a caller-supplied UUID, where supported. |
+| `--resume-id <id>` | Continue an existing native session, where supported. |
 | `--cwd <path>` | Working directory for the child process. |
 | `--yolo` / `--no-yolo` | Add / skip the agent's permission-bypass flag. **On by default.** |
 | `--dry-run` | Print the routed invocation as JSON; run nothing. |
@@ -248,9 +249,11 @@ export PARLEY_YOLO=true
 # legacy AGENT_ROUTER_* names are still honored as a fallback
 ```
 
+Captured calls also recognize `PARLEY_TIMEOUT` and `PARLEY_IDLE_TIMEOUT` (seconds, `0` disables a bound). Set `PARLEY_EVENT_LOG` to append verbatim request/response JSONL and `PARLEY_CALLER` to label its source.
+
 ### Shims
 
-Generate `*y` one-shot shortcuts for yolo-capable agents:
+Generate `*y` one-shot shortcuts for yolo-capable agents, including `groky`:
 
 ```sh
 par shims install            # writes claudey, codexy, ... to ~/.local/bin
@@ -384,7 +387,7 @@ A selector is either a list index (`par resume 2`) or a raw session id (`par res
 
 **Two tiers of support:**
 
-- **Native listing** — `claude`, `codex`, `opencode`, `pi`. Read straight from disk (`~/.claude/projects/<slug>/`, `~/.codex/sessions/`, `~/.local/share/opencode/storage/session/`, `~/.pi/agent/sessions/<encoded-cwd>/`), matched on exact cwd, with title and recency. These show up in the cross-agent listing.
+- **Native listing** — `claude`, `codex`, `grok`, `opencode`, `pi`. Read straight from disk (`~/.claude/projects/<slug>/`, `~/.codex/sessions/`, `~/.grok/sessions/`, `~/.local/share/opencode/storage/session/`, `~/.pi/agent/sessions/<encoded-cwd>/`), matched on exact cwd, with title and recency. Grok uses the canonical cwd recorded in `summary.json`, not its encoded directory name, and imports only real user/assistant text from `chat_history.jsonl`, skipping system, synthetic, reasoning, and tool records.
 - **Delegate resume** — `cursor`, `gemini`. Their stores are hash-scoped in a way `par` doesn't reproduce, but the binaries self-scope to the cwd. Listing is skipped (marked `~`); resume runs the agent's own cwd-scoped resume (`cursor-agent resume`, `gemini --resume latest`). `par resume -h cu` / `par resume -h g` work directly.
 
 ---
@@ -397,13 +400,15 @@ A selector is either a list index (`par resume 2`) or a raw session id (`par res
 par ask -h g -p "critique this approach in 3 bullets"        # ask gemini, print its reply
 par ask -h g -p "what did we decide?" --context-from cl      # seed with your latest claude session here
 par ask -h cl -p "continue this" --context-from co:<id>      # use a specific source session id
+par ask -h gr -p "implement this" --session-id <uuid> --permission-mode auto --no-yolo
+par ask -h gr -p "review only" --resume-id <uuid> --permission-mode auto --no-yolo
 par ask -h g -p "..." --max-context 8000                     # cap injected context (default 12000 chars)
 par ask -h g -p "..." --dry-run                              # show the routed command + final prompt, run nothing
 ```
 
-`--context-from` takes `harness[:session]`; omit the session (or use `latest`) for the newest in the directory. **Context sources:** `claude`, `codex`, `opencode`, `pi` (full transcripts). `cursor` / `gemini` can't export transcripts, so they can't be context *sources* — they can still be asked.
+`--context-from` takes `harness[:session]`; omit the session (or use `latest`) for the newest in the directory. **Context sources:** `claude`, `codex`, `grok`, `opencode`, `pi` (full transcripts). `cursor` / `gemini` can't export transcripts, so they can't be context *sources* — they can still be asked.
 
-Notes: each call is one-shot (the target keeps no memory between asks); yolo is on by default so the headless agent can't block on a permission prompt; long transcripts are truncated to the most recent turns within the budget.
+Notes: calls are one-shot unless the target supports `--session-id` / `--resume-id`; these two options are mutually exclusive, and Grok requires a UUID for a new session. Yolo remains on by default for legacy use, so combine Grok permission modes with `--no-yolo`. Long injected transcripts are truncated to the most recent turns within the budget.
 
 ## Converse — two agents, multi-turn
 
@@ -431,7 +436,7 @@ Each turn spawns a full agent process, so cost and latency scale with `--turns`.
 **Tools:**
 
 - **`fuse {prompt, panel?, judge?, judge_model?, cwd?, context_from?: {harness, session?}}`** — the collective-intelligence tool. Sends `prompt` to every agent in `panel` (default `claude,codex,gemini`) **in parallel**, then a judge agent (`judge`, default `claude`) synthesizes one answer — consensus as high-confidence, contradictions resolved, gaps filled, blind spots flagged — and returns it as text. `context_from` seeds every panelist with a prior session. Needs ≥2 panelists; ones whose CLI isn't installed are skipped with a note. (Same engine as the `par fuse` command.)
-- `ask_agent {harness, prompt, model?, provider?, cwd?, context_from?: {harness, session?}}` — run another agent headless and return its reply, optionally seeded with a session transcript. The agent-to-agent / context-bridge primitive.
+- `ask_agent {harness, prompt, model?, provider?, permission_mode?, max_turns?, session_id?, resume_id?, yolo?, cwd?, context_from?: {harness, session?}}` — run another agent headless and return its reply, optionally seeded with a transcript or attached to a native session. The runtime policy can lock permissions, cap turns, require sessions, reject yolo, and constrain cwd.
 - `list_sessions {cwd?, harness?}` — resumable sessions for a directory, newest first.
 - `get_last_session {cwd?, harness?}` — the most recent session plus a ready-to-run resume command.
 - `resume_command {harness, id, cwd?, yolo?}` — build the native resume command for a session id (text; never spawns an interactive agent).
@@ -471,6 +476,7 @@ Then, from any registered agent: *"use par to pick up my last claude session her
 | --- | --- | --- |
 | `claude` | `cl` | `claude -p "<prompt>"` |
 | `codex` | `co`, `openai` | `codex exec "<prompt>"` |
+| `grok` | `gr`, `xai`, `grok-build` | `grok --no-auto-update --single "<prompt>" --output-format plain` |
 | `cursor` | `cu`, `cursor-agent` | `cursor-agent -p "<prompt>"` |
 | `gemini` | `g`, `google`, `google-gemini` | `gemini --prompt "<prompt>"` |
 | `goose` | `go` | `goose run -t "<prompt>"` |
@@ -490,6 +496,8 @@ Then, from any registered agent: *"use par to pick up my last claude session her
 **Claude** — `claude -p`. Supports `--model`, `--output-format`, `--input-format`, `--permission-mode`, `--max-turns`. Yolo → `--dangerously-skip-permissions`.
 
 **Codex** — `codex exec`. `--output-format json|stream-json` → `--json`. Provider is preserved in `PARLEY_PROVIDER` (Codex receives the plain model name). Yolo → `--dangerously-bypass-approvals-and-sandbox` for routed runs; the `codexy` shim uses `codex --yolo`.
+
+**Grok** — `grok --no-auto-update --single`. Captured calls default to `--output-format plain`; `--model`, `--permission-mode`, `--max-turns`, `--session-id`, and `--resume` / `--continue` map natively. Yolo → `--always-approve`. Native sessions are discovered under `%USERPROFILE%\.grok\sessions` on Windows (or `~/.grok/sessions` elsewhere).
 
 **Cursor** — `cursor-agent -p`. Plain `--model`; `--output-format` when accepted. Yolo → `--force` (required for print-mode file writes).
 
@@ -557,19 +565,21 @@ src/
   process.rs           child process execution (inherit-stdio run + captured run)
   json.rs              zero-dep JSON parser/serializer (used by convert, session, ask, mcp)
   ask.rs               agent-to-agent calls (headless run + transcript context injection)
+  event_log.rs         opt-in append-only request/response JSONL
+  policy.rs            cwd, yolo, Grok session/permission, and deny enforcement
   converse.rs          multi-turn two-agent conversation loop (+ loop detection)
   fuse.rs              panel fusion engine — parallel panel + judge (`par fuse` and the mcp `fuse` tool)
   signals.rs           pure loop-detection heuristic for `par converse`
   fsx.rs               symlink-safe file writes for project-directory config
   mcp.rs               stdio MCP server (resume tools + ask_agent + fuse) + `mcp connect` / on/off/status
-  harness/             per-agent adapters (claude, codex, cursor, gemini, goose,
+  harness/             per-agent adapters (claude, codex, grok, cursor, gemini, goose,
                        opencode, qwen, aider, amazon_q, copilot, kimi, antigravity, muse, pi)
     mod.rs             Harness trait, Request, HarnessFactory, normalize_harness
     invocation.rs      command/args/env representation
   convert/             .claude/ reader + per-target writers + cross-reference resolver
   session/             cross-agent session discovery, resume, and transcript export
     mod.rs             SessionStore trait, SessionRef, Turn, listing + resume + context
-    claude.rs codex.rs opencode.rs pi.rs   native parsers (cwd-scoped listing + transcripts)
+    claude.rs codex.rs grok.rs opencode.rs pi.rs   native parsers (cwd-scoped listing + transcripts)
     cursor.rs gemini.rs              delegate adapters (resume via native CLI)
   installer.rs         agent installer registry
 ```
@@ -630,12 +640,16 @@ A Homebrew tap can follow once artifact names are stable.
 
 ## Security & privacy
 
-`par` does not inspect or redact prompt content. Anything passed via stdin or `-p` is forwarded to the selected agent, which may send it to its configured provider. `par` itself makes no network calls and keeps no logs — it only starts the local agent CLIs you already have.
+`par` does not inspect or redact prompt content. Anything passed via stdin or `-p` is forwarded to the selected agent, which may send it to its configured provider. `par` itself makes no network calls and keeps no logs unless `PARLEY_EVENT_LOG` is explicitly set.
 
 **Yolo (permission bypass) is on by default** — each run adds the agent's bypass flag unless you pass `--no-yolo` or set `PARLEY_YOLO=false`. This favors hands-off automation over sandboxing; opt out for untrusted prompts or sensitive directories. Use `--dry-run` to validate automation that may include secrets before running it.
+
+**Hardened MCP profiles** — `PARLEY_MCP_DEFAULT_YOLO=false` changes only MCP's legacy default, while `PARLEY_DISABLE_YOLO=true` rejects explicit bypass requests. `PARLEY_ALLOWED_CWD_ROOT` canonicalizes every spawn-capable MCP cwd and permits only existing descendants, never the root itself. For Grok, `PARLEY_GROK_LOCKED_PERMISSION_MODE`, `PARLEY_GROK_REQUIRE_SESSION_ID`, and `PARLEY_GROK_MAX_TURNS` lock the mode, require a native session, and set/cap turns. A locked Grok mode also injects non-overridable deny rules for web/MCP tools, dangerous Git operations, deletion, nested shells, downloads, and package managers; caller-supplied allow rules are not part of `ask_agent`.
+
+**Event log** — when `PARLEY_EVENT_LOG` is set, every captured ask appends and flushes one schema-v1 JSON object for the request and one for the response/error. The fields are `schema_version`, `event_type`, `event_id`, `exchange_id`, `timestamp_ms`, `source`, `target`, `cwd`, `session_id`, `session_action`, `content`, `status`, `duration_ms`, and `error`. Prompt and reply content is verbatim and is not redacted, so protect the file accordingly. No separate environment dump, credential field, raw tool payload, or command-argument list is added. A request-log failure prevents launch; a completion-log failure returns a non-retriable error containing the captured result.
 
 ---
 
 ## Source notes
 
-Written against public docs (checked May 19, 2026): [Claude](https://code.claude.com/docs/en/cli-reference), [Codex](https://www.mintlify.com/openai/codex/advanced/exec-mode), [Cursor](https://docs.cursor.com/en/cli/using), [Gemini](https://google-gemini.github.io/gemini-cli/docs/cli/), [OpenCode](https://dev.opencode.ai/docs/cli/), [Qwen](https://qwenlm.github.io/qwen-code-docs/en/cli/index), [Aider](https://aider.chat/docs/scripting.html), [Amazon Q](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-reference.html), [Goose](https://block.github.io/goose/docs/tutorials/headless-goose/), [Antigravity](https://antigravity.google/docs/cli-using). [Pi](https://pi.dev/docs/latest/usage) was checked August 23, 2026. [Muse Code](https://developer.meta.com/ai/products/muse-code/) ships no public CLI flag reference yet (beta, Aug 5 2026) — its adapter was written against `muse --help` / `muse exec --help` from Muse Code 0.1.0 (0.1.0-R708.1) and verified against the local binary, so re-check it as the beta moves. Installer commands live in `src/installer.rs`. Agent CLIs change fast — re-check these surfaces before a public release.
+Written against public docs (checked May 19, 2026): [Claude](https://code.claude.com/docs/en/cli-reference), [Codex](https://www.mintlify.com/openai/codex/advanced/exec-mode), [Cursor](https://docs.cursor.com/en/cli/using), [Gemini](https://google-gemini.github.io/gemini-cli/docs/cli/), [OpenCode](https://dev.opencode.ai/docs/cli/), [Qwen](https://qwenlm.github.io/qwen-code-docs/en/cli/index), [Aider](https://aider.chat/docs/scripting.html), [Amazon Q](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-reference.html), [Goose](https://block.github.io/goose/docs/tutorials/headless-goose/), [Antigravity](https://antigravity.google/docs/cli-using). [Pi](https://pi.dev/docs/latest/usage) was checked August 23, 2026. [Grok Build headless mode](https://docs.x.ai/build/cli/headless-scripting) and [permissions](https://docs.x.ai/build/features/permissions) were checked September 19, 2026 against Grok Build 1.0.13. [Muse Code](https://developer.meta.com/ai/products/muse-code/) ships no public CLI flag reference yet (beta, Aug 5 2026) — its adapter was written against `muse --help` / `muse exec --help` from Muse Code 0.1.0 (0.1.0-R708.1) and verified against the local binary, so re-check it as the beta moves. Installer commands live in `src/installer.rs`. Agent CLIs change fast — re-check these surfaces before a public release.

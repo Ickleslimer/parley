@@ -7,7 +7,7 @@
 //! harness's native resume invocation.
 //!
 //! Two reliability tiers:
-//! - **Native parsers** (claude, codex, opencode, pi): exact cwd match with rich
+//! - **Native parsers** (claude, codex, grok, opencode, pi): exact cwd match with rich
 //!   listing (id, title, mtime).
 //! - **Delegate adapters** (cursor, gemini): the cwd→store mapping is a hash we
 //!   do not reproduce, but the binaries self-scope to cwd via their own resume
@@ -17,6 +17,7 @@ mod claude;
 mod codex;
 mod cursor;
 mod gemini;
+mod grok;
 mod opencode;
 mod pi;
 
@@ -78,6 +79,7 @@ fn registry() -> Vec<Box<dyn SessionStore>> {
     vec![
         Box::new(claude::ClaudeSessions),
         Box::new(codex::CodexSessions),
+        Box::new(grok::GrokSessions::default()),
         Box::new(opencode::OpencodeSessions),
         Box::new(pi::PiSessions),
         Box::new(cursor::CursorSessions),

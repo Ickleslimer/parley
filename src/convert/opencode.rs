@@ -42,7 +42,8 @@ pub(crate) fn write(
     if !config.commands.is_empty() {
         let mut commands = BTreeMap::new();
         for cmd in &config.commands {
-            let cmd_name = cmd.name.replace('/', ":");
+            let cmd_name = cmd.name.replace(['\\', '/'], ":");
+            let rel_path = cmd.rel_path.replace('\\', "/");
             let mut entry = BTreeMap::new();
             entry.insert(
                 "description".to_string(),
@@ -52,7 +53,7 @@ pub(crate) fn write(
                 "template".to_string(),
                 Json::Str(format!(
                     "Please read and execute the instructions in .claude/commands/{}. User arguments: $ARGUMENTS",
-                    cmd.rel_path
+                    rel_path
                 )),
             );
             commands.insert(cmd_name, Json::Object(entry));

@@ -7,6 +7,7 @@ mod copilot;
 mod cursor;
 mod gemini;
 mod goose;
+mod grok;
 mod invocation;
 mod kimi;
 mod meta;
@@ -54,7 +55,7 @@ impl Request {
     pub(crate) fn from_options(options: CliOptions, piped_input: String) -> Result<Self, String> {
         let prompt = merge_prompt(&piped_input, options.prompt.as_deref());
 
-        Ok(Self {
+        let mut request = Self {
             harness: normalize_harness(&options.harness),
             provider: options.provider,
             model: options.model,
@@ -70,7 +71,16 @@ impl Request {
             yolo: options.yolo,
             session_id: options.session_id,
             resume_id: options.resume_id,
-        })
+        };
+        crate::policy::RuntimePolicy::from_env()?.apply_request(
+            &request.harness,
+            request.yolo,
+            &mut request.permission_mode,
+            &mut request.max_turns,
+            &request.session_id,
+            &request.resume_id,
+        )?;
+        Ok(request)
     }
 }
 
@@ -135,6 +145,12 @@ const HARNESS_SPECS: &[HarnessSpec] = &[
         binary: "goose",
         shim: "goosey",
         yolo_args: &["auto"],
+    },
+    HarnessSpec {
+        name: "grok",
+        binary: "grok",
+        shim: "groky",
+        yolo_args: &["--always-approve"],
     },
     HarnessSpec {
         name: "opencode",
@@ -209,6 +225,7 @@ impl Default for HarnessFactory {
             ("cursor", cursor::new as HarnessConstructor),
             ("gemini", gemini::new as HarnessConstructor),
             ("goose", goose::new as HarnessConstructor),
+            ("grok", grok::new as HarnessConstructor),
             ("opencode", opencode::new as HarnessConstructor),
             ("copilot", copilot::new as HarnessConstructor),
             ("kimi", kimi::new as HarnessConstructor),
@@ -318,6 +335,7 @@ pub(crate) fn normalize_harness(harness: &str) -> String {
         "cu" => "cursor".to_string(),
         "g" => "gemini".to_string(),
         "go" => "goose".to_string(),
+        "gr" => "grok".to_string(),
         "oc" => "opencode".to_string(),
         "q" => "qwen".to_string(),
         "k" => "kimi".to_string(),
@@ -331,6 +349,7 @@ pub(crate) fn normalize_harness(harness: &str) -> String {
         "cursor-agent" => "cursor".to_string(),
         "open-code" => "opencode".to_string(),
         "google" | "google-gemini" => "gemini".to_string(),
+        "xai" | "grok-build" => "grok".to_string(),
         "openai" => "codex".to_string(),
         "github-copilot" => "copilot".to_string(),
         "amazonq" | "aws-q" | "amazon" => "amazon-q".to_string(),
@@ -434,6 +453,8 @@ mod tests {
     #[test]
     fn normalizes_aliases() {
         assert_eq!(normalize_harness("openai"), "codex");
+        assert_eq!(normalize_harness("xai"), "grok");
+        assert_eq!(normalize_harness("grok-build"), "grok");
         assert_eq!(normalize_harness("cursor-agent"), "cursor");
         assert_eq!(normalize_harness("aws-q"), "amazon-q");
         assert_eq!(normalize_harness("agy"), "antigravity");
@@ -452,6 +473,7 @@ mod tests {
         assert_eq!(normalize_harness("aq"), "amazon-q");
         assert_eq!(normalize_harness("mu"), "muse");
         assert_eq!(normalize_harness("p"), "pi");
+        assert_eq!(normalize_harness("gr"), "grok");
     }
 
     #[test]

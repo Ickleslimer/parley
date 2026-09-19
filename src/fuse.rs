@@ -62,11 +62,14 @@ pub(crate) fn run_cli(options: FuseOptions) -> Result<(), String> {
         return dry_run(
             &prompt,
             &panel,
-            &judge,
-            &options.judge_model,
-            &context,
-            &cwd,
-            max_context,
+            DryRunConfig {
+                judge: &judge,
+                judge_model: &options.judge_model,
+                context: &context,
+                cwd: &cwd,
+                max_context,
+                yolo: options.yolo,
+            },
         );
     }
 
@@ -104,6 +107,7 @@ pub(crate) fn run_cli(options: FuseOptions) -> Result<(), String> {
         options.judge_model,
         &cwd,
         max_context,
+        options.yolo,
     )?;
     println!("{fused}");
     Ok(())
@@ -183,6 +187,7 @@ pub(crate) fn run_judge(
     judge_model: Option<String>,
     cwd: &Path,
     max_context: usize,
+    yolo: bool,
 ) -> Result<String, String> {
     let req = AskRequest {
         harness: normalize_harness(judge),
@@ -190,7 +195,11 @@ pub(crate) fn run_judge(
         model: judge_model,
         provider: None,
         cwd: cwd.to_path_buf(),
-        yolo: true,
+        permission_mode: None,
+        max_turns: None,
+        session_id: None,
+        resume_id: None,
+        yolo,
         context: None,
         max_context_chars: max_context,
     };
@@ -233,6 +242,10 @@ fn build_requests(
                 model: None,
                 provider: None,
                 cwd: cwd.to_path_buf(),
+                permission_mode: None,
+                max_turns: None,
+                session_id: None,
+                resume_id: None,
                 yolo,
                 context: context.clone(),
                 max_context_chars: max_context,
@@ -265,16 +278,25 @@ pub(crate) fn build_judge_prompt(prompt: &str, answers: &[(String, String)]) -> 
 }
 
 /// Print every routed invocation (each panelist + the judge with placeholders).
-fn dry_run(
-    prompt: &str,
-    panel: &[String],
-    judge: &str,
-    judge_model: &Option<String>,
-    context: &Option<ContextRef>,
-    cwd: &Path,
+struct DryRunConfig<'a> {
+    judge: &'a str,
+    judge_model: &'a Option<String>,
+    context: &'a Option<ContextRef>,
+    cwd: &'a Path,
     max_context: usize,
-) -> Result<(), String> {
-    let requests = build_requests(prompt, panel, context, cwd, max_context, true);
+    yolo: bool,
+}
+
+fn dry_run(prompt: &str, panel: &[String], config: DryRunConfig<'_>) -> Result<(), String> {
+    let judge = config.judge;
+    let requests = build_requests(
+        prompt,
+        panel,
+        config.context,
+        config.cwd,
+        config.max_context,
+        config.yolo,
+    );
     for (label, req) in &requests {
         println!(
             "# panelist {label} — dry run\n{}",
@@ -288,12 +310,16 @@ fn dry_run(
     let judge_req = AskRequest {
         harness: normalize_harness(judge),
         prompt: build_judge_prompt(prompt, &placeholder),
-        model: judge_model.clone(),
+        model: config.judge_model.clone(),
         provider: None,
-        cwd: cwd.to_path_buf(),
-        yolo: true,
+        cwd: config.cwd.to_path_buf(),
+        permission_mode: None,
+        max_turns: None,
+        session_id: None,
+        resume_id: None,
+        yolo: config.yolo,
         context: None,
-        max_context_chars: max_context,
+        max_context_chars: config.max_context,
     };
     println!(
         "# judge {judge} — dry run\n{}",

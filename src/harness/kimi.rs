@@ -95,7 +95,10 @@ mod tests {
             "missing flag in {joined}"
         );
         assert!(
-            joined.contains(".kimi/mcp.json"),
+            invocation
+                .args
+                .iter()
+                .any(|arg| arg == &dir.join(".kimi").join("mcp.json").to_string_lossy()),
             "missing path in {joined}"
         );
 
@@ -131,7 +134,10 @@ mod tests {
         let invocation = build(&dir, "go");
         let joined = invocation.args.join(" ");
         assert!(
-            joined.contains(".kimi/mcp.json"),
+            invocation
+                .args
+                .iter()
+                .any(|arg| arg == &dir.join(".kimi").join("mcp.json").to_string_lossy()),
             "expected .kimi path in {joined}"
         );
 

@@ -264,39 +264,40 @@ pub(crate) fn capture_invocation_timeout(
     drop(beat_tx);
 
     let started = Instant::now();
+    let mut last_activity = started;
     let mut timed_out = false;
     // Wait at idle granularity (or a short tick when only an overall bound is
     // set), reacting to output heartbeats and process exit.
     let tick = pick_tick(timeouts);
-    loop {
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
+    let status = loop {
+        if let Ok(Some(exit_status)) = child.try_wait() {
+            break Some(exit_status);
         }
         if !timeouts.overall.is_zero() && started.elapsed() >= timeouts.overall {
             let _ = child.kill();
             timed_out = true;
-            break;
+            break child.wait().ok();
         }
         match beat_rx.recv_timeout(tick) {
-            Ok(()) => continue,
+            Ok(()) => {
+                last_activity = Instant::now();
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Readers closed: output is complete, just reap the child.
-                let _ = child.wait();
-                break;
+                break child.wait().ok();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !timeouts.idle.is_zero() && started.elapsed() >= timeouts.idle {
+                if idle_expired(last_activity, timeouts.idle) {
                     // Approximation: no heartbeat within the idle window. Good
                     // enough — a steadily-emitting child keeps resetting it.
                     let _ = child.kill();
                     timed_out = true;
-                    break;
+                    break child.wait().ok();
                 }
             }
         }
-    }
-
-    let status = child.wait().ok();
+    };
     if let Some(handle) = out_reader {
         let _ = handle.join();
     }
@@ -324,6 +325,10 @@ fn pick_tick(timeouts: Timeouts) -> Duration {
         tick = timeouts.idle;
     }
     tick
+}
+
+fn idle_expired(last_activity: Instant, idle: Duration) -> bool {
+    !idle.is_zero() && last_activity.elapsed() >= idle
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -382,6 +387,35 @@ mod tests {
         };
         let out = capture_invocation_timeout(inv("sleep", &["10"]), None, timeouts).unwrap();
         assert!(out.timed_out);
+    }
+
+    #[test]
+    fn idle_timeout_is_measured_from_last_activity() {
+        let idle = Duration::from_millis(100);
+        let stale = Instant::now() - Duration::from_millis(200);
+        assert!(idle_expired(stale, idle));
+        assert!(!idle_expired(Instant::now(), idle));
+        assert!(!idle_expired(stale, Duration::ZERO));
+    }
+
+    #[test]
+    fn output_heartbeats_reset_the_idle_watchdog() {
+        let timeouts = Timeouts {
+            overall: Duration::from_secs(3),
+            idle: Duration::from_millis(800),
+        };
+        let out = capture_invocation_timeout(
+            inv(
+                "sh",
+                &["-c", "printf a; sleep 0.45; printf b; sleep 0.45; printf c"],
+            ),
+            None,
+            timeouts,
+        )
+        .unwrap();
+        assert_eq!(out.stdout, "abc");
+        assert!(out.success);
+        assert!(!out.timed_out);
     }
 
     #[test]

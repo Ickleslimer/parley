@@ -9,9 +9,12 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::cli::{AskOptions, CliOptions};
-use crate::harness::{HarnessFactory, Invocation, Request};
+use crate::event_log::ExchangeLog;
+use crate::harness::{normalize_harness, HarnessFactory, Invocation, Request};
+use crate::policy::RuntimePolicy;
 use crate::process::{capture_invocation_timeout, Captured, Timeouts};
 use crate::session;
 
@@ -24,12 +27,17 @@ pub(crate) struct ContextRef {
 }
 
 /// A fully-resolved request to ask one agent something.
+#[derive(Clone, Debug)]
 pub(crate) struct AskRequest {
     pub harness: String,
     pub prompt: String,
     pub model: Option<String>,
     pub provider: Option<String>,
     pub cwd: PathBuf,
+    pub permission_mode: Option<String>,
+    pub max_turns: Option<String>,
+    pub session_id: Option<String>,
+    pub resume_id: Option<String>,
     pub yolo: bool,
     pub context: Option<ContextRef>,
     pub max_context_chars: usize,
@@ -38,7 +46,13 @@ pub(crate) struct AskRequest {
 /// Build the headless invocation, injecting transcript context into the prompt
 /// when requested. Separated from running so `--dry-run` can show the command.
 pub(crate) fn build(req: &AskRequest) -> Result<Invocation, String> {
-    let prompt = match &req.context {
+    let req = prepare(req)?;
+    let prompt = resolved_prompt(&req)?;
+    build_prepared(&req, prompt)
+}
+
+fn resolved_prompt(req: &AskRequest) -> Result<String, String> {
+    Ok(match &req.context {
         Some(ctx) => {
             let preamble = session::transcript_context(
                 &ctx.harness,
@@ -52,14 +66,20 @@ pub(crate) fn build(req: &AskRequest) -> Result<Invocation, String> {
             )
         }
         None => req.prompt.clone(),
-    };
+    })
+}
 
+fn build_prepared(req: &AskRequest, prompt: String) -> Result<Invocation, String> {
     let options = CliOptions {
         harness: req.harness.clone(),
         provider: req.provider.clone(),
         model: req.model.clone(),
         cwd: req.cwd.to_str().map(str::to_string),
         prompt: Some(prompt),
+        permission_mode: req.permission_mode.clone(),
+        max_turns: req.max_turns.clone(),
+        session_id: req.session_id.clone(),
+        resume_id: req.resume_id.clone(),
         yolo: req.yolo,
         ..CliOptions::default()
     };
@@ -73,8 +93,56 @@ pub(crate) fn build(req: &AskRequest) -> Result<Invocation, String> {
 /// watchdog (configurable via `PARLEY_TIMEOUT` / `PARLEY_IDLE_TIMEOUT`) kills a
 /// hung agent so a single stuck panelist can't wedge a whole `fuse`.
 pub(crate) fn run(req: &AskRequest) -> Result<Captured, String> {
-    let invocation = build(req)?;
-    capture_invocation_timeout(invocation, req.cwd.to_str(), Timeouts::from_env())
+    let req = prepare(req)?;
+    let prompt = resolved_prompt(&req)?;
+    let invocation = build_prepared(&req, prompt.clone())?;
+    let log = ExchangeLog::start(&req, &prompt)?;
+    let started = Instant::now();
+    match capture_invocation_timeout(invocation, req.cwd.to_str(), Timeouts::from_env()) {
+        Ok(out) => {
+            let duration_ms = started.elapsed().as_millis();
+            let log_result = match out.reply() {
+                Ok(reply) => log.success(&reply, duration_ms),
+                Err(error) => log.failure(
+                    if out.timed_out { "timeout" } else { "error" },
+                    &error,
+                    duration_ms,
+                ),
+            };
+            if let Err(log_error) = log_result {
+                let captured = out.reply().unwrap_or_else(|error| error);
+                return Err(format!(
+                    "event log completion failed after the agent ran; do not retry automatically: {log_error}\nCaptured result:\n{captured}"
+                ));
+            }
+            Ok(out)
+        }
+        Err(error) => {
+            let duration_ms = started.elapsed().as_millis();
+            if let Err(log_error) = log.failure("error", &error, duration_ms) {
+                return Err(format!(
+                    "agent launch failed: {error}; event log completion also failed: {log_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn prepare(req: &AskRequest) -> Result<AskRequest, String> {
+    let policy = RuntimePolicy::from_env()?;
+    let mut prepared = req.clone();
+    prepared.harness = normalize_harness(&prepared.harness);
+    prepared.cwd = policy.validate_spawn_cwd(&prepared.cwd)?;
+    policy.apply_request(
+        &prepared.harness,
+        prepared.yolo,
+        &mut prepared.permission_mode,
+        &mut prepared.max_turns,
+        &prepared.session_id,
+        &prepared.resume_id,
+    )?;
+    Ok(prepared)
 }
 
 /// `par ask` entry point: resolve options, then run (or print under dry-run).
@@ -108,6 +176,10 @@ fn resolve(options: AskOptions) -> Result<AskRequest, String> {
         model: options.model,
         provider: options.provider,
         cwd,
+        permission_mode: options.permission_mode,
+        max_turns: options.max_turns,
+        session_id: options.session_id,
+        resume_id: options.resume_id,
         yolo: options.yolo,
         context: options.context_from.as_deref().map(parse_context_spec),
         max_context_chars: options

@@ -23,6 +23,7 @@ use crate::fsx;
 use crate::fuse;
 use crate::harness::{normalize_harness, Invocation};
 use crate::json::Json;
+use crate::policy::RuntimePolicy;
 use crate::process::{capture_invocation, run_invocation};
 use crate::session;
 
@@ -59,6 +60,7 @@ pub(crate) fn dispatch(options: McpOptions) -> Result<(), String> {
 
 pub(crate) fn run(_options: McpOptions) -> Result<(), String> {
     let cwd = env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?;
+    let policy = RuntimePolicy::from_env()?;
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -70,7 +72,7 @@ pub(crate) fn run(_options: McpOptions) -> Result<(), String> {
             continue;
         }
         let response = match Json::parse(trimmed) {
-            Ok(request) => handle_request(&request, &cwd),
+            Ok(request) => handle_request_with_policy(&request, &cwd, &policy),
             Err(_) => Some(error_response(&Json::Null, -32700, "parse error")),
         };
         if let Some(response) = response {
@@ -301,7 +303,16 @@ fn argv(parts: &[&str]) -> Vec<String> {
 
 /// Handle one JSON-RPC request. Returns `None` for notifications (no `id`),
 /// which take no response.
+#[cfg(test)]
 pub(crate) fn handle_request(request: &Json, default_cwd: &Path) -> Option<Json> {
+    handle_request_with_policy(request, default_cwd, &RuntimePolicy::default())
+}
+
+fn handle_request_with_policy(
+    request: &Json,
+    default_cwd: &Path,
+    policy: &RuntimePolicy,
+) -> Option<Json> {
     let method = request.get("method").and_then(Json::as_str).unwrap_or("");
     // Notifications carry no id and expect no reply.
     let id = request.get("id")?;
@@ -309,7 +320,7 @@ pub(crate) fn handle_request(request: &Json, default_cwd: &Path) -> Option<Json>
     let result = match method {
         "initialize" => Ok(initialize_result()),
         "tools/list" => Ok(tools_list_result()),
-        "tools/call" => call_tool(request, default_cwd),
+        "tools/call" => call_tool(request, default_cwd, policy),
         "ping" => Ok(obj(vec![])),
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -349,7 +360,7 @@ fn tools_list_result() -> Json {
         ("type", Json::Str("string".to_string())),
         (
             "description",
-            Json::Str("Optional harness filter: claude, codex, opencode, cursor, gemini, pi (shorthands allowed).".to_string()),
+            Json::Str("Optional harness filter: claude, codex, grok, opencode, cursor, gemini, pi (shorthands allowed).".to_string()),
         ),
     ]);
 
@@ -412,13 +423,39 @@ fn tools_list_result() -> Json {
     };
     let ask_tool = tool(
         "ask_agent",
-        "Ask another agent (claude, codex, gemini, opencode, cursor, ...) a one-shot question headless and return its reply. Optionally seed it with a prior session's transcript via `context_from` — this is how one agent hands its conversation to another.",
+        "Ask another agent (including Grok) a headless question and return its reply. Use session_id for a new native session or resume_id to continue one. Optionally seed it with another agent's transcript via context_from.",
         obj(vec![
             ("harness", str_prop("Target agent to ask (shorthands allowed).")),
             ("prompt", str_prop("The question or task for the target agent.")),
             ("model", str_prop("Optional model override.")),
             ("provider", str_prop("Optional provider override.")),
             ("cwd", str_prop("Working directory (defaults to the server's cwd).")),
+            ("permission_mode", str_prop("Optional target permission mode.")),
+            ("session_id", str_prop("UUID for a new native session.")),
+            ("resume_id", str_prop("Existing native session id to continue.")),
+            (
+                "max_turns",
+                obj(vec![
+                    ("type", Json::Str("integer".to_string())),
+                    ("minimum", Json::Number(1.0)),
+                    ("description", Json::Str("Optional maximum agent turns.".to_string())),
+                ]),
+            ),
+            (
+                "max_context_chars",
+                obj(vec![
+                    ("type", Json::Str("integer".to_string())),
+                    ("minimum", Json::Number(1.0)),
+                    ("description", Json::Str("Maximum injected transcript characters.".to_string())),
+                ]),
+            ),
+            (
+                "yolo",
+                obj(vec![
+                    ("type", Json::Str("boolean".to_string())),
+                    ("description", Json::Str("Explicitly request permission bypass. Runtime policy may reject this.".to_string())),
+                ]),
+            ),
             (
                 "context_from",
                 obj(vec![
@@ -430,7 +467,7 @@ fn tools_list_result() -> Json {
                     (
                         "properties",
                         obj(vec![
-                            ("harness", str_prop("Source agent (claude, codex, opencode, pi).")),
+                            ("harness", str_prop("Source agent (claude, codex, grok, opencode, pi).")),
                             ("session", str_prop("Session id, or 'latest' / omitted for the newest in cwd.")),
                         ]),
                     ),
@@ -461,6 +498,13 @@ fn tools_list_result() -> Json {
             ("judge_model", str_prop("Optional model override for the judge.")),
             ("cwd", str_prop("Working directory (defaults to the server's cwd).")),
             (
+                "yolo",
+                obj(vec![
+                    ("type", Json::Str("boolean".to_string())),
+                    ("description", Json::Str("Explicitly request permission bypass for panelists and judge. Runtime policy may reject this.".to_string())),
+                ]),
+            ),
+            (
                 "context_from",
                 obj(vec![
                     ("type", Json::Str("object".to_string())),
@@ -471,7 +515,7 @@ fn tools_list_result() -> Json {
                     (
                         "properties",
                         obj(vec![
-                            ("harness", str_prop("Source agent (claude, codex, opencode, pi).")),
+                            ("harness", str_prop("Source agent (claude, codex, grok, opencode, pi).")),
                             ("session", str_prop("Session id, or 'latest' / omitted for the newest in cwd.")),
                         ]),
                     ),
@@ -488,7 +532,11 @@ fn tools_list_result() -> Json {
     )])
 }
 
-fn call_tool(request: &Json, default_cwd: &Path) -> Result<Json, (i64, String)> {
+fn call_tool(
+    request: &Json,
+    default_cwd: &Path,
+    policy: &RuntimePolicy,
+) -> Result<Json, (i64, String)> {
     let params = request
         .get("params")
         .ok_or((-32602, "missing params".to_string()))?;
@@ -518,6 +566,11 @@ fn call_tool(request: &Json, default_cwd: &Path) -> Result<Json, (i64, String)> 
             let harness = harness.ok_or((-32602, "missing harness".to_string()))?;
             let id = args.get("id").and_then(Json::as_str).unwrap_or("");
             let yolo = args.get("yolo").and_then(Json::as_bool).unwrap_or(false);
+            if yolo {
+                policy
+                    .resolve_mcp_yolo(Some(true))
+                    .map_err(|error| (-32602, error))?;
+            }
             match session::resume_command_string(harness, id, &cwd, yolo) {
                 Ok(cmd) => Ok(text_content(&cmd, false)),
                 Err(e) => Ok(text_content(&e, true)),
@@ -539,6 +592,13 @@ fn call_tool(request: &Json, default_cwd: &Path) -> Result<Json, (i64, String)> 
                         .to_string(),
                 })
             });
+            let cwd = policy
+                .validate_spawn_cwd(&cwd)
+                .map_err(|error| (-32602, error))?;
+            let yolo = policy
+                .resolve_mcp_yolo(args.get("yolo").and_then(Json::as_bool))
+                .map_err(|error| (-32602, error))?;
+            let max_turns = optional_positive_integer(args, "max_turns")?;
             let request = AskRequest {
                 harness: harness.to_string(),
                 prompt: prompt.to_string(),
@@ -548,8 +608,20 @@ fn call_tool(request: &Json, default_cwd: &Path) -> Result<Json, (i64, String)> 
                     .and_then(Json::as_str)
                     .map(str::to_string),
                 cwd: cwd.clone(),
-                // Headless capture: yolo on so the agent can't block on a prompt.
-                yolo: args.get("yolo").and_then(Json::as_bool).unwrap_or(true),
+                permission_mode: args
+                    .get("permission_mode")
+                    .and_then(Json::as_str)
+                    .map(str::to_string),
+                max_turns,
+                session_id: args
+                    .get("session_id")
+                    .and_then(Json::as_str)
+                    .map(str::to_string),
+                resume_id: args
+                    .get("resume_id")
+                    .and_then(Json::as_str)
+                    .map(str::to_string),
+                yolo,
                 context,
                 max_context_chars: args
                     .get("max_context_chars")
@@ -570,6 +642,12 @@ fn call_tool(request: &Json, default_cwd: &Path) -> Result<Json, (i64, String)> 
                 .get("prompt")
                 .and_then(Json::as_str)
                 .ok_or((-32602, "missing prompt".to_string()))?;
+            let cwd = policy
+                .validate_spawn_cwd(&cwd)
+                .map_err(|error| (-32602, error))?;
+            let yolo = policy
+                .resolve_mcp_yolo(args.get("yolo").and_then(Json::as_bool))
+                .map_err(|error| (-32602, error))?;
 
             // Panel: explicit array of agent codes, else the default trio.
             let panel_arg: Vec<String> = match args.get("panel").and_then(Json::as_array) {
@@ -618,7 +696,7 @@ fn call_tool(request: &Json, default_cwd: &Path) -> Result<Json, (i64, String)> 
                 context,
                 &cwd,
                 max_context,
-                true,
+                yolo,
             ));
             if answers.len() < 2 {
                 return Ok(text_content(
@@ -631,13 +709,34 @@ fn call_tool(request: &Json, default_cwd: &Path) -> Result<Json, (i64, String)> 
             } else {
                 format!("(skipped: {})\n\n", skipped.join(", "))
             };
-            match fuse::run_judge(prompt, &answers, &judge, judge_model, &cwd, max_context) {
+            match fuse::run_judge(
+                prompt,
+                &answers,
+                &judge,
+                judge_model,
+                &cwd,
+                max_context,
+                yolo,
+            ) {
                 Ok(fused) => Ok(text_content(&format!("{note}{fused}"), false)),
                 Err(e) => Ok(text_content(&format!("judge {judge} failed: {e}"), true)),
             }
         }
         other => Err((-32602, format!("unknown tool: {other}"))),
     }
+}
+
+fn optional_positive_integer(args: &Json, name: &str) -> Result<Option<String>, (i64, String)> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let number = value
+        .as_number()
+        .ok_or((-32602, format!("{name} must be an integer")))?;
+    if number < 1.0 || number.fract() != 0.0 {
+        return Err((-32602, format!("{name} must be a positive integer")));
+    }
+    Ok(Some((number as u64).to_string()))
 }
 
 fn arg_cwd(args: &Json, default_cwd: &Path) -> PathBuf {
@@ -718,9 +817,39 @@ fn obj(pairs: Vec<(&str, Json)>) -> Json {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn cwd() -> PathBuf {
         PathBuf::from("/tmp/nonexistent-par-test-dir")
+    }
+
+    fn temp_root() -> PathBuf {
+        env::temp_dir().join(format!(
+            "parley-mcp-policy-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn tool_request(name: &str, arguments: &str) -> Json {
+        Json::parse(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\",\"params\":{{\"name\":\"{name}\",\"arguments\":{arguments}}}}}"
+        ))
+        .unwrap()
+    }
+
+    fn json_path(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "\\\\")
+    }
+
+    fn rpc_error(response: &Json) -> &str {
+        response
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Json::as_str)
+            .expect("expected JSON-RPC error")
     }
 
     #[test]
@@ -772,6 +901,90 @@ mod tests {
         assert!(names.contains(&"resume_command"));
         assert!(names.contains(&"ask_agent"));
         assert!(names.contains(&"fuse"));
+    }
+
+    #[test]
+    fn ask_schema_exposes_grok_session_and_permission_controls() {
+        let result = tools_list_result();
+        let tools = result.get("tools").and_then(Json::as_array).unwrap();
+        let ask = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Json::as_str) == Some("ask_agent"))
+            .unwrap();
+        let properties = ask
+            .get("inputSchema")
+            .and_then(|schema| schema.get("properties"))
+            .unwrap();
+        for name in [
+            "permission_mode",
+            "max_turns",
+            "session_id",
+            "resume_id",
+            "yolo",
+        ] {
+            assert!(properties.get(name).is_some(), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn spawn_tools_reject_root_missing_and_sibling_paths() {
+        let root = temp_root();
+        let child = root.join("worker");
+        let sibling = root.with_file_name(format!(
+            "{}-sibling",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let policy = RuntimePolicy::for_test(&root, false, true);
+
+        for bad in [&root, &sibling, &root.join("missing")] {
+            let request = tool_request(
+                "ask_agent",
+                &format!(
+                    "{{\"harness\":\"grok\",\"prompt\":\"no spawn\",\"cwd\":\"{}\",\"yolo\":false}}",
+                    json_path(bad)
+                ),
+            );
+            let response = handle_request_with_policy(&request, &child, &policy).unwrap();
+            let error = rpc_error(&response);
+            assert!(
+                error.contains("outside the approved worker root")
+                    || error.contains("is unavailable"),
+                "{error}"
+            );
+        }
+
+        let fuse = tool_request(
+            "fuse",
+            &format!(
+                "{{\"prompt\":\"no spawn\",\"cwd\":\"{}\",\"yolo\":false}}",
+                json_path(&root)
+            ),
+        );
+        let response = handle_request_with_policy(&fuse, &child, &policy).unwrap();
+        assert!(rpc_error(&response).contains("outside the approved worker root"));
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(sibling).unwrap();
+    }
+
+    #[test]
+    fn hardened_mcp_policy_rejects_explicit_yolo_before_spawn() {
+        let root = temp_root();
+        let child = root.join("worker");
+        fs::create_dir_all(&child).unwrap();
+        let policy = RuntimePolicy::for_test(&root, false, true);
+        let request = tool_request(
+            "ask_agent",
+            &format!(
+                "{{\"harness\":\"grok\",\"prompt\":\"no spawn\",\"cwd\":\"{}\",\"yolo\":true}}",
+                json_path(&child)
+            ),
+        );
+        let response = handle_request_with_policy(&request, &child, &policy).unwrap();
+        assert!(rpc_error(&response).contains("permission bypass is disabled"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

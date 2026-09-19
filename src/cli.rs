@@ -56,6 +56,10 @@ pub(crate) struct AskOptions {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub cwd: Option<String>,
+    pub permission_mode: Option<String>,
+    pub max_turns: Option<String>,
+    pub session_id: Option<String>,
+    pub resume_id: Option<String>,
     pub yolo: bool,
     /// `harness[:session]` of a transcript to inject as context.
     pub context_from: Option<String>,
@@ -337,8 +341,8 @@ pub(crate) fn usage() -> &'static str {
   par install list
 
 Options:
-  --harness, -h <name>    claude, codex, cursor, gemini, goose, opencode, qwen, aider, amazon-q, copilot, kimi, antigravity, muse, pi
-                          Shorthands: cl=claude co=codex cu=cursor g=gemini go=goose
+  --harness, -h <name>    claude, codex, cursor, gemini, goose, grok, opencode, qwen, aider, amazon-q, copilot, kimi, antigravity, muse, pi
+                          Shorthands: cl=claude co=codex cu=cursor g=gemini go=goose gr=grok
                           oc=opencode q=qwen k=kimi a/ai=aider aq=amazon-q cp=copilot ag=antigravity m/mu=muse p=pi
                           Meta-harness (calls back into par, composes anywhere a harness is taken):
                           fuse = run a panel · e.g. par converse --a fuse --b claude
@@ -349,9 +353,9 @@ Options:
   --cwd <path>            Working directory for the target CLI
   --no-yolo               Yolo (permission bypass) is ON by default; this opts out for the run
   --yolo                  Explicitly enable yolo (already the default)
-  --session-id <id>       Set a specific session id (claude); lets you resume it later
+  --session-id <uuid>     Set a specific session id; lets you resume it later
   --resume-id <id|latest> Continue a prior session headlessly for a warm prompt cache
-                          (claude --resume, codex exec resume, gemini --resume; latest=most recent)
+                          (claude --resume, codex exec resume, grok --resume, gemini --resume)
   --dry-run               Print the routed command as JSON
   --                      Pass remaining flags through to the target CLI
 
@@ -404,7 +408,7 @@ Resume:
   par resume -h cl <id> --print   Print the resume command for a session id
   par resume --cwd <path>         Scope to another directory
 
-  Native listing: claude, codex, opencode, pi. Delegate resume (best-effort listing,
+  Native listing: claude, codex, grok, opencode, pi. Delegate resume (best-effort listing,
   marked ~): cursor, gemini — resume runs the native CLI's own cwd-scoped resume.
 
 Ask (agent-to-agent):
@@ -415,7 +419,11 @@ Ask (agent-to-agent):
                                   Use a specific source session id as context
   par ask -h g -p \"...\" --max-context 8000 --dry-run
                                   Cap injected context; show the command, run nothing
-  Context sources: claude, codex, opencode, pi (cursor/gemini cannot export transcripts)
+  par ask -h gr -p \"...\" --no-yolo --permission-mode auto --session-id <uuid>
+                                  Start a resumable Grok session
+  par ask -h gr -p \"...\" --no-yolo --permission-mode auto --resume-id <uuid>
+                                  Continue that Grok session headlessly
+  Context sources: claude, codex, grok, opencode, pi (cursor/gemini cannot export transcripts)
 
 Converse (multi-turn, two agents):
   par converse --a cl --b g -p \"<task>\"    Two agents take turns (default 6 turns)
@@ -451,6 +459,10 @@ MCP:
 Environment defaults:
   PARLEY_HARNESS, PARLEY_PROVIDER, PARLEY_MODEL, PARLEY_YOLO
   PARLEY_TIMEOUT, PARLEY_IDLE_TIMEOUT   captured-run watchdog seconds (0 = off)
+  PARLEY_EVENT_LOG, PARLEY_CALLER       optional append-only JSONL exchange log
+  PARLEY_ALLOWED_CWD_ROOT, PARLEY_DISABLE_YOLO, PARLEY_MCP_DEFAULT_YOLO
+  PARLEY_GROK_LOCKED_PERMISSION_MODE, PARLEY_GROK_REQUIRE_SESSION_ID
+  PARLEY_GROK_MAX_TURNS
   (legacy AGENT_ROUTER_* names still work)
 "
 }
@@ -704,6 +716,12 @@ where
             "-m" | "--model" => options.model = Some(require_value(&mut args, "--model")?),
             "--provider" => options.provider = Some(require_value(&mut args, "--provider")?),
             "--cwd" => options.cwd = Some(require_value(&mut args, "--cwd")?),
+            "--permission-mode" => {
+                options.permission_mode = Some(require_value(&mut args, "--permission-mode")?)
+            }
+            "--max-turns" => options.max_turns = Some(require_value(&mut args, "--max-turns")?),
+            "--session-id" => options.session_id = Some(require_value(&mut args, "--session-id")?),
+            "--resume-id" => options.resume_id = Some(require_value(&mut args, "--resume-id")?),
             "--context-from" | "--context" => {
                 options.context_from = Some(require_value(&mut args, "--context-from")?)
             }
@@ -725,6 +743,18 @@ where
             }
             _ if arg.starts_with("--cwd=") => {
                 options.cwd = Some(value_after_equals(&arg, "--cwd="))
+            }
+            _ if arg.starts_with("--permission-mode=") => {
+                options.permission_mode = Some(value_after_equals(&arg, "--permission-mode="))
+            }
+            _ if arg.starts_with("--max-turns=") => {
+                options.max_turns = Some(value_after_equals(&arg, "--max-turns="))
+            }
+            _ if arg.starts_with("--session-id=") => {
+                options.session_id = Some(value_after_equals(&arg, "--session-id="))
+            }
+            _ if arg.starts_with("--resume-id=") => {
+                options.resume_id = Some(value_after_equals(&arg, "--resume-id="))
             }
             _ if arg.starts_with('-') => return Err(format!("unknown ask option: {arg}")),
             // Bare text accumulates into the prompt.
@@ -1046,6 +1076,39 @@ mod tests {
         };
 
         assert_eq!(options.passthrough, vec!["--verbose"]);
+    }
+
+    #[test]
+    fn parses_grok_ask_session_controls() {
+        let action = parse_args(
+            [
+                "ask",
+                "-h",
+                "gr",
+                "-p",
+                "review",
+                "--permission-mode=auto",
+                "--max-turns",
+                "12",
+                "--session-id",
+                "01a06582-d66e-7811-b0c9-0b0266e17903",
+                "--no-yolo",
+            ]
+            .map(String::from),
+            defaults(),
+        )
+        .unwrap();
+        let CliAction::Ask(options) = action else {
+            panic!("expected ask action");
+        };
+        assert_eq!(options.harness.as_deref(), Some("gr"));
+        assert_eq!(options.permission_mode.as_deref(), Some("auto"));
+        assert_eq!(options.max_turns.as_deref(), Some("12"));
+        assert_eq!(
+            options.session_id.as_deref(),
+            Some("01a06582-d66e-7811-b0c9-0b0266e17903")
+        );
+        assert!(!options.yolo);
     }
 
     #[test]
