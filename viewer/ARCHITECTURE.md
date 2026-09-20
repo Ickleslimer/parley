@@ -46,3 +46,13 @@ All public result types serialize with camelCase names matching `src/contracts.t
 - Closing detail hides it to tray. Only the Exit action or tray Exit terminates the process.
 - Settings persist per user and include source, monitor, corner, offsets, width, height, and launch-at-login.
 
+## Frontend IPC Contract
+
+`src/ipc.ts` is the complete frontend authority boundary. The detail and widget views use only its `ViewerApi`; frontend implementation files must not call arbitrary Tauri commands. Command results use the camelCase types in `src/contracts.ts`.
+
+- `getStatus` and `getWidgetSnapshot` drive bounded live refresh.
+- `listSessions`, `listExchanges`, `search`, and `getEventContent` provide paging, local search, and exact detail retrieval.
+- `getSettings`, `saveSettings`, and `listMonitors` drive geometry settings.
+- `selectEventLog` opens the native picker; `setEventLog` applies an explicit absolute path or clears the source.
+- `setWidgetVisible`, `setLaunchAtLogin`, `showDetail`, and `exit` expose only the required lifecycle actions.
+- Content is rendered with DOM text nodes or `textContent` only. Event content must never enter `innerHTML`.
