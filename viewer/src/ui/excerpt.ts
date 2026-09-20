@@ -20,12 +20,20 @@ export interface PresentedMessage {
   eventId: string;
   eventType: MessagePreview["eventType"];
   heading: string;
+  speaker: string;
+  recipient: string;
+  initial: string;
   route: string;
   timestamp: string;
   status: string;
   excerpt: string;
   extracted: boolean;
   extractedLabel: string | null;
+}
+
+export function participantInitial(name: string): string {
+  const first = Array.from(name.trim())[0];
+  return first === undefined ? "?" : first.toUpperCase();
 }
 
 export interface PresentedExchange {
@@ -50,6 +58,9 @@ export function presentMessage(
     eventId: preview.eventId,
     eventType: preview.eventType,
     heading,
+    speaker: preview.speaker,
+    recipient: preview.recipient,
+    initial: participantInitial(preview.speaker),
     route: formatRoute(preview.speaker, preview.recipient),
     timestamp: formatTimestamp(preview.timestampMs, utc),
     status: preview.status,
