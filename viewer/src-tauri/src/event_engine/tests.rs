@@ -234,7 +234,7 @@ fn skips_malformed_and_unsupported_records() {
     metric["event_type"] = json!("metric");
     body.push_str(&metric.to_string());
     body.push('\n');
-    body.push_str("\n");
+    body.push('\n');
     log.write(body.as_bytes());
 
     let engine = watching_engine(&log);
@@ -545,7 +545,6 @@ fn shared_read_allows_writers_and_delete_access() {
     let log = TempLog::new("share");
     log.write(b"");
     let mut writer = OpenOptions::new()
-        .write(true)
         .append(true)
         .share_mode(SHARE_READ | SHARE_WRITE)
         .open(log.path())
