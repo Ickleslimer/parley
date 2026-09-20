@@ -1,6 +1,8 @@
 #[cfg(not(windows))]
 compile_error!("Parley Conversation Viewer is Windows-only");
 
+pub mod event_engine;
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
