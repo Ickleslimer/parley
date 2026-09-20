@@ -1,5 +1,9 @@
 import "./styles.css";
 
+import { viewerApi } from "./ipc";
+import { mountDetail } from "./ui/detail";
+import { mountWidget } from "./ui/widget";
+
 const app = document.querySelector<HTMLElement>("#app");
 
 if (!app) {
@@ -7,6 +11,11 @@ if (!app) {
 }
 
 const view = new URLSearchParams(window.location.search).get("view");
-app.className = view === "widget" ? "widget-shell" : "detail-shell";
-app.textContent = view === "widget" ? "Parley is starting…" : "Parley Conversation Viewer";
 
+if (view === "widget") {
+  document.title = "Parley";
+  mountWidget(app, viewerApi);
+} else {
+  document.title = "Parley Conversation Viewer";
+  mountDetail(app, viewerApi);
+}

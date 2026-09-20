@@ -1,0 +1,1161 @@
+import type {
+  EventContent,
+  ExchangeSummary,
+  MonitorInfo,
+  SearchHit,
+  SessionSummary,
+  ViewerSettings,
+  ViewerStatus,
+} from "../contracts";
+import { DEFAULT_SETTINGS } from "../contracts";
+import type { ViewerApi } from "../ipc";
+
+import { button, el, labelledControl, setText } from "./dom";
+import { exactEventBody, presentExchange, searchHitHeading } from "./excerpt";
+import {
+  formatCharacterCount,
+  formatDiagnostics,
+  formatDuration,
+  formatEventType,
+  formatRoute,
+  formatRuntimeHealth,
+  formatSourceLine,
+  formatTimestamp,
+} from "./format";
+import { degradedBanner, loadErrorLabel } from "./labels";
+import {
+  applyPageResult,
+  canGoNext,
+  canGoPrevious,
+  dataRefreshPlan,
+  pageRangeLabel,
+  requestNextPage,
+  requestPreviousPage,
+  resetPaging,
+  type PagingState,
+} from "./paging";
+import { createSingleFlightPoller, DETAIL_POLL_MS } from "./poll";
+import {
+  createSearchState,
+  isSearchActive,
+  searchCanPage,
+  searchSummary,
+  submitSearch,
+  type SearchViewState,
+} from "./search";
+
+const CORNERS: Array<ViewerSettings["corner"]> = [
+  "top-left",
+  "top-right",
+  "bottom-left",
+  "bottom-right",
+];
+
+interface DetailState {
+  status: ViewerStatus | null;
+  settings: ViewerSettings;
+  monitors: MonitorInfo[];
+  sessions: SessionSummary[];
+  sessionPaging: PagingState;
+  selectedSessionId: string | null;
+  exchanges: ExchangeSummary[];
+  exchangePaging: PagingState;
+  selectedExchangeId: string | null;
+  selectedEventId: string | null;
+  search: SearchViewState;
+  searchHits: SearchHit[];
+  event: EventContent | null;
+  eventLoading: boolean;
+  eventError: string | null;
+  loadError: string | null;
+  selectingLog: boolean;
+  savingSettings: boolean;
+  settingsDirty: boolean;
+  exiting: boolean;
+}
+
+export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => void } {
+  root.className = "detail-shell";
+  root.removeAttribute("aria-live");
+
+  const nodes = buildDetailShell();
+  root.replaceChildren(nodes.shell);
+
+  const state: DetailState = {
+    status: null,
+    settings: { ...DEFAULT_SETTINGS },
+    monitors: [],
+    sessions: [],
+    sessionPaging: resetPaging(),
+    selectedSessionId: null,
+    exchanges: [],
+    exchangePaging: resetPaging(),
+    selectedExchangeId: null,
+    selectedEventId: null,
+    search: createSearchState(),
+    searchHits: [],
+    event: null,
+    eventLoading: false,
+    eventError: null,
+    loadError: null,
+    selectingLog: false,
+    savingSettings: false,
+    settingsDirty: false,
+    exiting: false,
+  };
+
+  let alive = true;
+  let sourceEpoch = 0;
+  let sessionLoad = 0;
+  let exchangeLoad = 0;
+  let searchLoad = 0;
+
+  const paintChrome = (): void => {
+    const banner = degradedBanner(state.status);
+    nodes.banner.hidden = banner == null;
+    setText(nodes.banner, banner ?? "");
+    setText(nodes.sourceLine, state.status ? formatSourceLine(state.status) : "Connecting\u2026");
+    setText(
+      nodes.healthLine,
+      state.status ? formatRuntimeHealth(state.status) : "Tray unknown \u00b7 Underlay unknown",
+    );
+    setText(
+      nodes.diagnostics,
+      state.status
+        ? `${formatDiagnostics(state.status.diagnostics)} \u00b7 generation ${Math.trunc(state.status.generation)} \u00b7 ${Math.trunc(state.status.bytesRead)} bytes`
+        : "No diagnostics yet",
+    );
+    if (state.loadError) {
+      nodes.loadError.hidden = false;
+      setText(nodes.loadError, state.loadError);
+    } else {
+      nodes.loadError.hidden = true;
+      setText(nodes.loadError, "");
+    }
+    nodes.widgetVisible.checked = state.status?.widgetVisible === true;
+    nodes.launchAtLogin.checked = state.settings.launchAtLogin;
+    nodes.selectLog.disabled = state.selectingLog;
+    nodes.saveSettings.disabled = state.savingSettings;
+    nodes.exit.disabled = state.exiting;
+    if (!state.settingsDirty) {
+      syncSettingsForm();
+    }
+  };
+
+  const paintSessions = (): void => {
+    setText(nodes.sessionMeta, pageRangeLabel(state.sessionPaging));
+    nodes.sessionPrev.disabled = !canGoPrevious(state.sessionPaging);
+    nodes.sessionNext.disabled = !canGoNext(state.sessionPaging);
+    renderSessionList(nodes.sessionList, state.sessions, state.selectedSessionId, (sessionId) => {
+      void selectSession(sessionId);
+    });
+  };
+
+  const paintMiddle = (): void => {
+    const searching = isSearchActive(state.search.query);
+    setText(nodes.middleTitle, searching ? "Search results" : "Exchanges");
+    setText(nodes.searchMeta, searchSummary(state.search));
+    const paging = searching ? searchCanPage(state.search) : {
+      previous: canGoPrevious(state.exchangePaging),
+      next: canGoNext(state.exchangePaging),
+    };
+    nodes.middlePrev.disabled = !paging.previous || state.search.loading;
+    nodes.middleNext.disabled = !paging.next || state.search.loading;
+    if (searching) {
+      nodes.middleList.setAttribute("role", "listbox");
+      setText(
+        nodes.middleEmpty,
+        state.searchHits.length === 0 ? searchSummary(state.search) : "",
+      );
+      nodes.middleEmpty.hidden = state.searchHits.length > 0;
+      renderSearchList(nodes.middleList, state.searchHits, state.selectedEventId, (hit) => {
+        void selectSearchHit(hit);
+      });
+      return;
+    }
+    nodes.middleList.setAttribute("role", "list");
+    if (!state.selectedSessionId) {
+      setText(nodes.middleEmpty, "Select a session to load exchanges");
+      nodes.middleEmpty.hidden = false;
+      nodes.middleList.replaceChildren();
+      return;
+    }
+    if (state.exchanges.length === 0) {
+      setText(nodes.middleEmpty, "No exchanges in this session");
+      nodes.middleEmpty.hidden = false;
+      nodes.middleList.replaceChildren();
+      return;
+    }
+    nodes.middleEmpty.hidden = true;
+    setText(nodes.middleEmpty, "");
+    nodes.middleList.setAttribute("role", "list");
+    renderExchangeList(
+      nodes.middleList,
+      state.exchanges,
+      state.selectedExchangeId,
+      state.selectedEventId,
+      (exchange, eventId) => {
+        void selectExchangeMessage(exchange, eventId);
+      },
+    );
+    if (!searching) {
+      setText(nodes.searchMeta, pageRangeLabel(state.exchangePaging));
+    }
+  };
+
+  const paintEvent = (): void => {
+    if (state.eventLoading) {
+      setText(nodes.eventEmpty, "Loading exact event content\u2026");
+      nodes.eventEmpty.hidden = false;
+      nodes.eventMeta.replaceChildren();
+      setText(nodes.eventBody, "");
+      return;
+    }
+    if (state.eventError) {
+      setText(nodes.eventEmpty, state.eventError);
+      nodes.eventEmpty.hidden = false;
+      nodes.eventMeta.replaceChildren();
+      setText(nodes.eventBody, "");
+      return;
+    }
+    if (!state.event) {
+      setText(nodes.eventEmpty, "Select a request, completion, or search hit");
+      nodes.eventEmpty.hidden = false;
+      nodes.eventMeta.replaceChildren();
+      setText(nodes.eventBody, "");
+      return;
+    }
+    nodes.eventEmpty.hidden = true;
+    setText(nodes.eventEmpty, "");
+    renderEventMeta(nodes.eventMeta, state.event);
+    setText(nodes.eventBody, exactEventBody(state.event));
+  };
+
+  const paint = (): void => {
+    paintChrome();
+    paintSessions();
+    paintMiddle();
+    paintEvent();
+  };
+
+  const syncSettingsForm = (): void => {
+    fillMonitorOptions(nodes.monitor, state.monitors, state.settings.monitorId);
+    nodes.corner.value = state.settings.corner;
+    if (document.activeElement !== nodes.offsetX) {
+      nodes.offsetX.value = String(state.settings.offsetX);
+    }
+    if (document.activeElement !== nodes.offsetY) {
+      nodes.offsetY.value = String(state.settings.offsetY);
+    }
+    if (document.activeElement !== nodes.width) {
+      nodes.width.value = String(state.settings.width);
+    }
+    if (document.activeElement !== nodes.height) {
+      nodes.height.value = String(state.settings.height);
+    }
+  };
+
+  const resetLists = (): void => {
+    sourceEpoch += 1;
+    state.sessions = [];
+    state.sessionPaging = resetPaging();
+    state.selectedSessionId = null;
+    state.exchanges = [];
+    state.exchangePaging = resetPaging();
+    state.selectedExchangeId = null;
+    state.selectedEventId = null;
+    state.search = createSearchState();
+    state.searchHits = [];
+    nodes.searchInput.value = "";
+    state.event = null;
+    state.eventLoading = false;
+    state.eventError = null;
+  };
+
+  const loadSessions = async (): Promise<void> => {
+    const token = ++sessionLoad;
+    const epoch = sourceEpoch;
+    try {
+      const page = await api.listSessions(state.sessionPaging.cursor, state.sessionPaging.limit);
+      if (!alive || token !== sessionLoad || epoch !== sourceEpoch) {
+        return;
+      }
+      state.sessions = page.items;
+      state.sessionPaging = applyPageResult(state.sessionPaging, {
+        nextCursor: page.nextCursor,
+        total: page.total,
+        itemCount: page.items.length,
+      });
+    } catch {
+      if (!alive || token !== sessionLoad || epoch !== sourceEpoch) {
+        return;
+      }
+      state.loadError = loadErrorLabel("load sessions");
+    }
+  };
+
+  const loadExchanges = async (): Promise<void> => {
+    if (!state.selectedSessionId) {
+      state.exchanges = [];
+      state.exchangePaging = resetPaging();
+      return;
+    }
+    const sessionId = state.selectedSessionId;
+    const token = ++exchangeLoad;
+    const epoch = sourceEpoch;
+    try {
+      const page = await api.listExchanges(
+        sessionId,
+        state.exchangePaging.cursor,
+        state.exchangePaging.limit,
+      );
+      if (
+        !alive ||
+        token !== exchangeLoad ||
+        epoch !== sourceEpoch ||
+        state.selectedSessionId !== sessionId
+      ) {
+        return;
+      }
+      state.exchanges = page.items;
+      state.exchangePaging = applyPageResult(state.exchangePaging, {
+        nextCursor: page.nextCursor,
+        total: page.total,
+        itemCount: page.items.length,
+      });
+    } catch {
+      if (!alive || token !== exchangeLoad || epoch !== sourceEpoch) {
+        return;
+      }
+      state.loadError = loadErrorLabel("load exchanges");
+    }
+  };
+
+  const loadSearch = async (): Promise<void> => {
+    if (!isSearchActive(state.search.query)) {
+      state.searchHits = [];
+      state.search.loading = false;
+      return;
+    }
+    const query = state.search.query;
+    const token = ++searchLoad;
+    const epoch = sourceEpoch;
+    state.search.loading = true;
+    state.search.error = null;
+    paintMiddle();
+    try {
+      const page = await api.search(query, state.search.paging.cursor, state.search.paging.limit);
+      if (!alive || token !== searchLoad || epoch !== sourceEpoch || state.search.query !== query) {
+        return;
+      }
+      state.searchHits = page.items;
+      state.search.total = page.total;
+      state.search.paging = applyPageResult(state.search.paging, {
+        nextCursor: page.nextCursor,
+        total: page.total,
+        itemCount: page.items.length,
+      });
+      state.search.loading = false;
+      state.search.error = null;
+    } catch {
+      if (!alive || token !== searchLoad || epoch !== sourceEpoch) {
+        return;
+      }
+      state.search.loading = false;
+      state.search.error = loadErrorLabel("search event content");
+      state.searchHits = [];
+    }
+  };
+
+  const loadEvent = async (eventId: string): Promise<void> => {
+    state.selectedEventId = eventId;
+    state.eventLoading = true;
+    state.eventError = null;
+    paintEvent();
+    paintMiddle();
+    try {
+      const content = await api.getEventContent(eventId);
+      if (!alive || state.selectedEventId !== eventId) {
+        return;
+      }
+      state.event = content;
+      state.eventLoading = false;
+      state.eventError = content ? null : "Event content is unavailable";
+    } catch {
+      if (!alive || state.selectedEventId !== eventId) {
+        return;
+      }
+      state.event = null;
+      state.eventLoading = false;
+      state.eventError = loadErrorLabel("load event content");
+    }
+    paintEvent();
+  };
+
+  const selectSession = async (sessionId: string): Promise<void> => {
+    state.selectedSessionId = sessionId;
+    state.exchangePaging = resetPaging();
+    state.selectedExchangeId = null;
+    if (!isSearchActive(state.search.query)) {
+      state.selectedEventId = null;
+      state.event = null;
+      state.eventError = null;
+    }
+    await loadExchanges();
+    paint();
+  };
+
+  const selectExchangeMessage = async (
+    exchange: ExchangeSummary,
+    eventId: string,
+  ): Promise<void> => {
+    state.selectedSessionId = exchange.sessionId;
+    state.selectedExchangeId = exchange.exchangeId;
+    await loadEvent(eventId);
+    paint();
+  };
+
+  const selectSearchHit = async (hit: SearchHit): Promise<void> => {
+    state.selectedSessionId = hit.sessionId;
+    state.selectedExchangeId = hit.exchangeId;
+    await loadEvent(hit.eventId);
+    paint();
+  };
+
+  const applyStatus = async (
+    status: ViewerStatus,
+    reload: "reset" | "refresh" | "none",
+  ): Promise<"reset" | "refresh" | "none"> => {
+    const previous = state.status;
+    state.status = status;
+    state.loadError = null;
+    const plan = reload === "none" ? dataRefreshPlan(previous, status) : reload;
+    if (plan === "reset") {
+      resetLists();
+      await loadSessions();
+    } else if (plan === "refresh") {
+      await loadSessions();
+      await loadExchanges();
+      if (isSearchActive(state.search.query)) {
+        await loadSearch();
+      }
+    }
+    return plan;
+  };
+
+  const bootstrap = async (): Promise<void> => {
+    try {
+      const [status, settings, monitors] = await Promise.all([
+        api.getStatus(),
+        api.getSettings(),
+        api.listMonitors(),
+      ]);
+      if (!alive) {
+        return;
+      }
+      state.settings = settings;
+      state.monitors = monitors;
+      await applyStatus(status, "reset");
+    } catch {
+      if (!alive) {
+        return;
+      }
+      state.loadError = loadErrorLabel("load viewer status");
+    }
+    paint();
+  };
+
+  nodes.searchForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const next = submitSearch(state.search, nodes.searchInput.value);
+    state.search = next;
+    state.searchHits = [];
+    if (!isSearchActive(next.query)) {
+      paintMiddle();
+      return;
+    }
+    void loadSearch().then(() => {
+      if (alive) {
+        paintMiddle();
+      }
+    });
+  });
+
+  nodes.sessionPrev.addEventListener("click", () => {
+    const next = requestPreviousPage(state.sessionPaging);
+    if (!next) {
+      return;
+    }
+    state.sessionPaging = next;
+    void loadSessions().then(() => alive && paintSessions());
+  });
+  nodes.sessionNext.addEventListener("click", () => {
+    const next = requestNextPage(state.sessionPaging);
+    if (!next) {
+      return;
+    }
+    state.sessionPaging = next;
+    void loadSessions().then(() => alive && paintSessions());
+  });
+  nodes.middlePrev.addEventListener("click", () => {
+    if (isSearchActive(state.search.query)) {
+      const next = requestPreviousPage(state.search.paging);
+      if (!next) {
+        return;
+      }
+      state.search.paging = next;
+      void loadSearch().then(() => alive && paintMiddle());
+      return;
+    }
+    const next = requestPreviousPage(state.exchangePaging);
+    if (!next) {
+      return;
+    }
+    state.exchangePaging = next;
+    void loadExchanges().then(() => alive && paintMiddle());
+  });
+  nodes.middleNext.addEventListener("click", () => {
+    if (isSearchActive(state.search.query)) {
+      const next = requestNextPage(state.search.paging);
+      if (!next) {
+        return;
+      }
+      state.search.paging = next;
+      void loadSearch().then(() => alive && paintMiddle());
+      return;
+    }
+    const next = requestNextPage(state.exchangePaging);
+    if (!next) {
+      return;
+    }
+    state.exchangePaging = next;
+    void loadExchanges().then(() => alive && paintMiddle());
+  });
+
+  nodes.selectLog.addEventListener("click", () => {
+    if (state.selectingLog) {
+      return;
+    }
+    state.selectingLog = true;
+    paintChrome();
+    void (async () => {
+      try {
+        const status = await api.selectEventLog();
+        if (!alive) {
+          return;
+        }
+        const settings = await api.getSettings();
+        if (!alive) {
+          return;
+        }
+        state.settings = settings;
+        state.settingsDirty = false;
+        await applyStatus(status, "reset");
+      } catch {
+        if (alive) {
+          state.loadError = loadErrorLabel("select an event log");
+        }
+      } finally {
+        state.selectingLog = false;
+        if (alive) {
+          paint();
+        }
+      }
+    })();
+  });
+
+  nodes.widgetVisible.addEventListener("change", () => {
+    const visible = nodes.widgetVisible.checked;
+    void (async () => {
+      try {
+        const status = await api.setWidgetVisible(visible);
+        if (!alive) {
+          return;
+        }
+        state.status = status;
+      } catch {
+        if (alive) {
+          state.loadError = loadErrorLabel("update widget visibility");
+        }
+      }
+      if (alive) {
+        paintChrome();
+      }
+    })();
+  });
+
+  nodes.launchAtLogin.addEventListener("change", () => {
+    const enabled = nodes.launchAtLogin.checked;
+    void (async () => {
+      try {
+        const settings = await api.setLaunchAtLogin(enabled);
+        if (!alive) {
+          return;
+        }
+        state.settings = settings;
+      } catch {
+        if (alive) {
+          state.loadError = loadErrorLabel("update launch at login");
+        }
+      }
+      if (alive) {
+        paintChrome();
+      }
+    })();
+  });
+
+  nodes.settingsForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const parsed = readSettingsForm(state.settings, nodes);
+    if (!parsed) {
+      state.loadError = "Placement values must be finite numbers";
+      paintChrome();
+      return;
+    }
+    state.savingSettings = true;
+    paintChrome();
+    void (async () => {
+      try {
+        const settings = await api.saveSettings(parsed);
+        if (!alive) {
+          return;
+        }
+        state.settings = settings;
+        state.settingsDirty = false;
+        state.loadError = null;
+      } catch {
+        if (alive) {
+          state.loadError = loadErrorLabel("save settings");
+        }
+      } finally {
+        state.savingSettings = false;
+        if (alive) {
+          paintChrome();
+        }
+      }
+    })();
+  });
+  nodes.settingsForm.addEventListener("input", () => {
+    state.settingsDirty = true;
+  });
+
+  nodes.exit.addEventListener("click", () => {
+    if (state.exiting) {
+      return;
+    }
+    state.exiting = true;
+    paintChrome();
+    void api.exit().catch(() => {
+      if (!alive) {
+        return;
+      }
+      state.exiting = false;
+      state.loadError = loadErrorLabel("exit");
+      paintChrome();
+    });
+  });
+
+  const poller = createSingleFlightPoller(async () => {
+    try {
+      const status = await api.getStatus();
+      if (!alive) {
+        return;
+      }
+      const plan = await applyStatus(status, "none");
+      if (!alive) {
+        return;
+      }
+      if (plan === "none") {
+        paintChrome();
+      } else {
+        paint();
+      }
+      return;
+    } catch {
+      if (!alive) {
+        return;
+      }
+      state.loadError = loadErrorLabel("refresh viewer status");
+    }
+    paintChrome();
+  }, DETAIL_POLL_MS);
+
+  paint();
+  void bootstrap().then(() => {
+    if (alive) {
+      poller.start();
+    }
+  });
+
+  const stop = (): void => {
+    alive = false;
+    poller.stop();
+  };
+  window.addEventListener("pagehide", stop);
+  return { stop };
+}
+
+function buildDetailShell() {
+  const logo = el("img", {
+    className: "detail-logo",
+    attrs: { src: "/parley-icon.ico", alt: "Parley", width: "28", height: "28" },
+  });
+  const title = el("h1", { className: "detail-title", text: "Parley Conversation Viewer" });
+  const sourceLine = el("p", { className: "detail-source", id: "source-status" });
+  const healthLine = el("p", { className: "detail-health" });
+  const selectLog = button("Select Log", "action", () => undefined, {
+    "aria-describedby": "source-status",
+  });
+  const widgetVisible = el("input", {
+    attrs: { type: "checkbox" },
+  });
+  widgetVisible.id = "widget-visible";
+  const launchAtLogin = el("input", {
+    attrs: { type: "checkbox" },
+  });
+  launchAtLogin.id = "launch-at-login";
+  const exit = button("Exit", "action action-exit", () => undefined, {
+    "aria-label": "Exit Parley Conversation Viewer",
+  });
+  const actions = el("div", {
+    className: "detail-actions",
+    children: [
+      selectLog,
+      labelledControl("Widget visible", widgetVisible, "field field-check"),
+      labelledControl("Launch at login", launchAtLogin, "field field-check"),
+      exit,
+    ],
+  });
+  const header = el("header", {
+    className: "detail-header",
+    children: [
+      el("div", { className: "detail-brand", children: [logo, title] }),
+      el("div", { className: "detail-status", children: [sourceLine, healthLine] }),
+      actions,
+    ],
+  });
+  const banner = el("p", {
+    className: "detail-banner",
+    attrs: { role: "alert" },
+  });
+  banner.hidden = true;
+  const loadError = el("p", { className: "detail-load-error", attrs: { role: "status" } });
+  loadError.hidden = true;
+
+  const sessionList = el("ul", {
+    className: "record-list",
+    attrs: { role: "listbox", "aria-label": "Sessions" },
+  });
+  const sessionMeta = el("p", { className: "pager-meta" });
+  const sessionPrev = button("Previous", "pager-btn", () => undefined);
+  const sessionNext = button("Next", "pager-btn", () => undefined);
+  const sessionPanel = el("section", {
+    className: "panel",
+    children: [
+      el("h2", { text: "Sessions" }),
+      el("div", { className: "panel-body", children: [sessionList] }),
+      el("div", {
+        className: "pager",
+        children: [sessionPrev, sessionMeta, sessionNext],
+      }),
+    ],
+  });
+
+  const middleTitle = el("h2", { text: "Exchanges" });
+  const searchInput = el("input", {
+    attrs: {
+      type: "search",
+      name: "query",
+      placeholder: "Search exact content",
+      "aria-label": "Search exact event content",
+      autocomplete: "off",
+      spellcheck: "false",
+    },
+  });
+  const searchSubmit = el("button", {
+    className: "action",
+    text: "Search",
+    attrs: { type: "submit" },
+  });
+  const searchForm = el("form", {
+    className: "search-form",
+    children: [searchInput, searchSubmit],
+  });
+  const searchMeta = el("p", { className: "pager-meta" });
+  const middleList = el("ul", {
+    className: "record-list",
+    attrs: { role: "listbox", "aria-label": "Exchanges and search results" },
+  });
+  const middleEmpty = el("p", { className: "panel-empty" });
+  const middlePrev = button("Previous", "pager-btn", () => undefined);
+  const middleNext = button("Next", "pager-btn", () => undefined);
+  const middlePanel = el("section", {
+    className: "panel",
+    children: [
+      middleTitle,
+      searchForm,
+      el("div", { className: "panel-body", children: [middleEmpty, middleList] }),
+      el("div", { className: "pager", children: [middlePrev, searchMeta, middleNext] }),
+    ],
+  });
+
+  const eventMeta = el("dl", { className: "event-meta" });
+  const eventEmpty = el("p", { className: "panel-empty" });
+  const eventBody = el("pre", {
+    className: "event-body",
+    attrs: { tabindex: "0", "aria-label": "Exact event content" },
+  });
+  const eventPanel = el("section", {
+    className: "panel panel-event",
+    children: [
+      el("h2", { text: "Event" }),
+      eventEmpty,
+      eventMeta,
+      eventBody,
+    ],
+  });
+
+  const diagnostics = el("p", { className: "diagnostics-text" });
+  const diagnosticsPanel = el("section", {
+    className: "panel",
+    children: [el("h2", { text: "Diagnostics" }), diagnostics],
+  });
+
+  const monitor = el("select", { attrs: { id: "monitor", "aria-label": "Monitor" } });
+  const corner = el("select", { attrs: { id: "corner", "aria-label": "Corner" } });
+  for (const value of CORNERS) {
+    corner.append(el("option", { text: value, attrs: { value } }));
+  }
+  const offsetX = numberInput("offset-x", "Offset X");
+  const offsetY = numberInput("offset-y", "Offset Y");
+  const width = numberInput("width", "Width");
+  const height = numberInput("height", "Height");
+  const saveSettings = el("button", {
+    className: "action",
+    text: "Save placement",
+    attrs: { type: "submit" },
+  });
+  const settingsForm = el("form", {
+    className: "settings-form",
+    children: [
+      labelledControl("Monitor", monitor),
+      labelledControl("Corner", corner),
+      labelledControl("Offset X", offsetX),
+      labelledControl("Offset Y", offsetY),
+      labelledControl("Width", width),
+      labelledControl("Height", height),
+      saveSettings,
+    ],
+  });
+  const settingsPanel = el("section", {
+    className: "panel",
+    children: [el("h2", { text: "Widget placement" }), settingsForm],
+  });
+
+  const main = el("div", {
+    className: "detail-main",
+    children: [sessionPanel, middlePanel, eventPanel],
+  });
+  const footer = el("div", {
+    className: "detail-footer",
+    children: [diagnosticsPanel, settingsPanel],
+  });
+  const shell = el("div", {
+    className: "detail-layout",
+    children: [header, banner, loadError, main, footer],
+  });
+
+  return {
+    shell,
+    banner,
+    loadError,
+    sourceLine,
+    healthLine,
+    selectLog,
+    widgetVisible,
+    launchAtLogin,
+    exit,
+    sessionList,
+    sessionMeta,
+    sessionPrev,
+    sessionNext,
+    middleTitle,
+    searchForm,
+    searchInput,
+    searchMeta,
+    middleList,
+    middleEmpty,
+    middlePrev,
+    middleNext,
+    eventMeta,
+    eventEmpty,
+    eventBody,
+    diagnostics,
+    monitor,
+    corner,
+    offsetX,
+    offsetY,
+    width,
+    height,
+    saveSettings,
+    settingsForm,
+  };
+}
+
+function numberInput(id: string, label: string): HTMLInputElement {
+  return el("input", {
+    attrs: {
+      id,
+      type: "number",
+      "aria-label": label,
+    },
+  });
+}
+
+function fillMonitorOptions(
+  select: HTMLSelectElement,
+  monitors: MonitorInfo[],
+  selectedId: string | null,
+): void {
+  const current = document.activeElement === select ? select.value : selectedId ?? "";
+  select.replaceChildren(el("option", { text: "Default monitor", attrs: { value: "" } }));
+  for (const monitor of monitors) {
+    const label = monitor.primary ? `${monitor.name} (primary)` : monitor.name;
+    select.append(el("option", { text: label, attrs: { value: monitor.id } }));
+  }
+  select.value = current;
+  if (select.value !== current) {
+    select.value = "";
+  }
+}
+
+function readSettingsForm(
+  current: ViewerSettings,
+  nodes: {
+    monitor: HTMLSelectElement;
+    corner: HTMLSelectElement;
+    offsetX: HTMLInputElement;
+    offsetY: HTMLInputElement;
+    width: HTMLInputElement;
+    height: HTMLInputElement;
+  },
+): ViewerSettings | null {
+  const offsetX = Number(nodes.offsetX.value);
+  const offsetY = Number(nodes.offsetY.value);
+  const width = Number(nodes.width.value);
+  const height = Number(nodes.height.value);
+  if (![offsetX, offsetY, width, height].every(Number.isFinite)) {
+    return null;
+  }
+  const corner = CORNERS.find((item) => item === nodes.corner.value) ?? current.corner;
+  return {
+    ...current,
+    monitorId: nodes.monitor.value === "" ? null : nodes.monitor.value,
+    corner,
+    offsetX,
+    offsetY,
+    width,
+    height,
+  };
+}
+
+function renderSessionList(
+  list: HTMLUListElement,
+  sessions: SessionSummary[],
+  selectedId: string | null,
+  onSelect: (sessionId: string) => void,
+): void {
+  const restoreFocus = list.contains(document.activeElement);
+  list.replaceChildren();
+  for (const session of sessions) {
+    const selected = session.sessionId === selectedId;
+    const item = el("li", {
+      className: selected ? "record selected" : "record",
+      attrs: {
+        role: "option",
+        tabindex: selected || (selectedId == null && session === sessions[0]) ? "0" : "-1",
+        "aria-selected": selected ? "true" : "false",
+      },
+    });
+    const excerpt = el("p", { className: "record-excerpt", text: session.latestExcerpt });
+    item.append(
+      el("p", { className: "record-title", text: session.sessionId }),
+      el("p", {
+        className: "record-meta",
+        text: `${formatRoute(session.latestSource, session.latestTarget)} \u00b7 ${session.exchangeCount} \u00b7 ${formatTimestamp(session.latestTimestampMs)}`,
+      }),
+      excerpt,
+    );
+    if (session.excerptExtracted) {
+      item.append(el("p", { className: "record-flag", text: "Extracted task" }));
+    }
+    item.addEventListener("click", () => onSelect(session.sessionId));
+    item.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        onSelect(session.sessionId);
+      }
+    });
+    list.append(item);
+  }
+  bindListKeys(list);
+  if (restoreFocus) {
+    focusSelected(list);
+  }
+}
+
+function renderExchangeList(
+  list: HTMLUListElement,
+  exchanges: ExchangeSummary[],
+  selectedExchangeId: string | null,
+  selectedEventId: string | null,
+  onSelect: (exchange: ExchangeSummary, eventId: string) => void,
+): void {
+  const restoreFocus = list.contains(document.activeElement);
+  list.replaceChildren();
+  for (const exchange of exchanges) {
+    const presented = presentExchange(exchange);
+    const selected = exchange.exchangeId === selectedExchangeId;
+    const item = el("li", {
+      className: selected ? "record selected" : "record",
+    });
+    item.append(
+      el("p", {
+        className: "record-title",
+        text: formatTimestamp(exchange.timestampMs),
+      }),
+    );
+    const request = presented.request;
+    if (request) {
+      const requestBtn = button(
+        `${request.heading}${request.extractedLabel ? ` \u00b7 ${request.extractedLabel}` : ""} \u00b7 ${request.route}`,
+        selectedEventId === request.eventId ? "record-link selected" : "record-link",
+        () => onSelect(exchange, request.eventId),
+      );
+      item.append(requestBtn, el("p", { className: "record-excerpt", text: request.excerpt }));
+    }
+    const completion = presented.completion;
+    if (completion) {
+      const completionBtn = button(
+        `${completion.heading} \u00b7 ${completion.route}`,
+        selectedEventId === completion.eventId ? "record-link selected" : "record-link",
+        () => onSelect(exchange, completion.eventId),
+      );
+      item.append(
+        completionBtn,
+        el("p", { className: "record-excerpt", text: completion.excerpt }),
+      );
+    } else if (presented.pendingLabel) {
+      item.append(el("p", { className: "record-flag", text: presented.pendingLabel }));
+    }
+    list.append(item);
+  }
+  if (restoreFocus) {
+    const selected = list.querySelector<HTMLElement>(".record.selected .record-link, .record.selected");
+    selected?.focus();
+  }
+}
+
+function renderSearchList(
+  list: HTMLUListElement,
+  hits: SearchHit[],
+  selectedEventId: string | null,
+  onSelect: (hit: SearchHit) => void,
+): void {
+  const restoreFocus = list.contains(document.activeElement);
+  list.replaceChildren();
+  for (const hit of hits) {
+    const selected = hit.eventId === selectedEventId;
+    const item = el("li", {
+      className: selected ? "record selected" : "record",
+      attrs: {
+        role: "option",
+        tabindex: selected ? "0" : "-1",
+        "aria-selected": selected ? "true" : "false",
+      },
+    });
+    item.append(
+      el("p", {
+        className: "record-title",
+        text: `${searchHitHeading(hit.eventType)} \u00b7 ${formatTimestamp(hit.timestampMs)}`,
+      }),
+      el("p", {
+        className: "record-meta",
+        text: `${hit.sessionId} \u00b7 match offset ${Math.trunc(hit.matchOffset)}`,
+      }),
+      el("p", { className: "record-excerpt", text: hit.excerpt }),
+    );
+    item.addEventListener("click", () => onSelect(hit));
+    item.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        onSelect(hit);
+      }
+    });
+    list.append(item);
+  }
+  bindListKeys(list);
+  if (restoreFocus) {
+    focusSelected(list);
+  }
+}
+
+function renderEventMeta(dl: HTMLDListElement, event: EventContent): void {
+  dl.replaceChildren();
+  const rows: Array<[string, string]> = [
+    ["Type", formatEventType(event.eventType)],
+    ["Route", formatRoute(event.speaker, event.recipient)],
+    ["Timestamp", formatTimestamp(event.timestampMs)],
+    ["Status", event.status],
+    ["Duration", formatDuration(event.durationMs)],
+    ["Session", event.sessionId],
+    ["Exchange", event.exchangeId],
+    ["Event", event.eventId],
+    ["Length", formatCharacterCount(Array.from(exactEventBody(event)).length)],
+  ];
+  if (event.error) {
+    rows.push(["Parley execution error", event.error]);
+  }
+  for (const [label, value] of rows) {
+    dl.append(el("dt", { text: label }), el("dd", { text: value }));
+  }
+}
+
+function bindListKeys(list: HTMLUListElement): void {
+  const options = () => Array.from(list.querySelectorAll<HTMLElement>('[role="option"]'));
+  list.onkeydown = (event: KeyboardEvent) => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Home" && event.key !== "End") {
+      return;
+    }
+    const items = options();
+    if (items.length === 0) {
+      return;
+    }
+    const currentIndex = items.findIndex((item) => item === document.activeElement || item.contains(document.activeElement));
+    let nextIndex = currentIndex < 0 ? 0 : currentIndex;
+    if (event.key === "ArrowDown") {
+      nextIndex = Math.min(items.length - 1, currentIndex + 1);
+    } else if (event.key === "ArrowUp") {
+      nextIndex = Math.max(0, currentIndex < 0 ? 0 : currentIndex - 1);
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else {
+      nextIndex = items.length - 1;
+    }
+    const next = items[nextIndex];
+    if (!next) {
+      return;
+    }
+    event.preventDefault();
+    for (const item of items) {
+      item.tabIndex = -1;
+    }
+    next.tabIndex = 0;
+    next.focus();
+  };
+}
+
+function focusSelected(list: HTMLUListElement): void {
+  const selected = list.querySelector<HTMLElement>('[aria-selected="true"]');
+  (selected ?? list.querySelector<HTMLElement>('[role="option"]'))?.focus();
+}
