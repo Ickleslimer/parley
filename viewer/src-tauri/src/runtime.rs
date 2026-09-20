@@ -108,6 +108,7 @@ impl AppState {
         let updated = SettingsFile {
             viewer: next.clone(),
             autostart_initialized: current.autostart_initialized,
+            settings_version: current.settings_version,
         };
         save_settings(&self.settings_path, &updated)?;
         *self.lock_settings() = updated;

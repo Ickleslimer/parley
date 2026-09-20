@@ -129,8 +129,7 @@ export const DEFAULT_SETTINGS: ViewerSettings = {
   corner: "bottom-right",
   offsetX: 24,
   offsetY: 24,
-  width: 440,
-  height: 260,
+  width: 560,
+  height: 360,
   launchAtLogin: false,
 };
-

@@ -14,6 +14,11 @@ const MIN_WIDTH: f64 = 320.0;
 const MIN_HEIGHT: f64 = 180.0;
 const MAX_DIMENSION: f64 = 16_384.0;
 const MAX_OFFSET: f64 = 16_384.0;
+const DEFAULT_WIDTH: f64 = 560.0;
+const DEFAULT_HEIGHT: f64 = 360.0;
+const LEGACY_DEFAULT_WIDTH: f64 = 440.0;
+const LEGACY_DEFAULT_HEIGHT: f64 = 260.0;
+const CURRENT_SETTINGS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -45,8 +50,8 @@ impl Default for ViewerSettings {
             corner: Corner::BottomRight,
             offset_x: 24.0,
             offset_y: 24.0,
-            width: 440.0,
-            height: 260.0,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
             launch_at_login: false,
         }
     }
@@ -70,19 +75,45 @@ impl ViewerSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SettingsFile {
     #[serde(flatten)]
     pub viewer: ViewerSettings,
+    #[serde(default)]
     pub autostart_initialized: bool,
+    #[serde(default = "legacy_settings_version")]
+    pub settings_version: u32,
+}
+
+impl Default for SettingsFile {
+    fn default() -> Self {
+        Self {
+            viewer: ViewerSettings::default(),
+            autostart_initialized: false,
+            settings_version: CURRENT_SETTINGS_VERSION,
+        }
+    }
 }
 
 impl SettingsFile {
     pub fn sanitized(mut self) -> Self {
+        if self.settings_version < CURRENT_SETTINGS_VERSION {
+            if self.viewer.width == LEGACY_DEFAULT_WIDTH
+                && self.viewer.height == LEGACY_DEFAULT_HEIGHT
+            {
+                self.viewer.width = DEFAULT_WIDTH;
+                self.viewer.height = DEFAULT_HEIGHT;
+            }
+            self.settings_version = CURRENT_SETTINGS_VERSION;
+        }
         self.viewer = self.viewer.sanitized();
         self
     }
+}
+
+fn legacy_settings_version() -> u32 {
+    0
 }
 
 pub fn validate_source_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
@@ -197,6 +228,49 @@ mod tests {
         assert_eq!(settings.offset_y, 24.0);
         assert_eq!(settings.width, MIN_WIDTH);
         assert_eq!(settings.height, MAX_DIMENSION);
+    }
+
+    #[test]
+    fn migrates_the_legacy_default_size_without_moving_the_widget() {
+        let settings = serde_json::from_str::<SettingsFile>(
+            r#"{
+                "selectedLog": "C:\\logs\\events.jsonl",
+                "monitorId": null,
+                "corner": "top-right",
+                "offsetX": 28.0,
+                "offsetY": 24.0,
+                "width": 440.0,
+                "height": 260.0,
+                "launchAtLogin": true,
+                "autostartInitialized": true
+            }"#,
+        )
+        .expect("legacy settings should parse")
+        .sanitized();
+
+        assert_eq!(settings.settings_version, CURRENT_SETTINGS_VERSION);
+        assert_eq!(settings.viewer.corner, Corner::TopRight);
+        assert_eq!(settings.viewer.offset_x, 28.0);
+        assert_eq!(settings.viewer.offset_y, 24.0);
+        assert_eq!(settings.viewer.width, DEFAULT_WIDTH);
+        assert_eq!(settings.viewer.height, DEFAULT_HEIGHT);
+    }
+
+    #[test]
+    fn preserves_an_explicit_legacy_size_after_migration() {
+        let settings = SettingsFile {
+            viewer: ViewerSettings {
+                width: LEGACY_DEFAULT_WIDTH,
+                height: LEGACY_DEFAULT_HEIGHT,
+                ..ViewerSettings::default()
+            },
+            settings_version: CURRENT_SETTINGS_VERSION,
+            ..SettingsFile::default()
+        }
+        .sanitized();
+
+        assert_eq!(settings.viewer.width, LEGACY_DEFAULT_WIDTH);
+        assert_eq!(settings.viewer.height, LEGACY_DEFAULT_HEIGHT);
     }
 
     #[test]
