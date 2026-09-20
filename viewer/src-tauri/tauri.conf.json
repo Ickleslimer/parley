@@ -1,0 +1,68 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Parley Conversation Viewer",
+  "version": "0.1.0",
+  "identifier": "com.ickleslimer.parley-viewer",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' asset: http://asset.localhost; connect-src ipc: http://ipc.localhost"
+    },
+    "windows": [
+      {
+        "label": "widget",
+        "title": "Parley",
+        "url": "index.html?view=widget",
+        "width": 440,
+        "height": 260,
+        "minWidth": 320,
+        "minHeight": 180,
+        "decorations": false,
+        "transparent": false,
+        "resizable": false,
+        "focus": false,
+        "focusable": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "backgroundColor": "#11141c"
+      },
+      {
+        "label": "detail",
+        "title": "Parley Conversation Viewer",
+        "url": "index.html?view=detail",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 840,
+        "minHeight": 560,
+        "center": true,
+        "decorations": true,
+        "transparent": false,
+        "resizable": true,
+        "alwaysOnTop": false,
+        "visible": false,
+        "backgroundColor": "#11141c"
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Ickleslimer",
+    "shortDescription": "Exact local Parley conversation viewer",
+    "longDescription": "A local Windows desktop-underlay widget and transcript browser for Parley JSONL event logs.",
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "startMenuFolder": "Parley",
+        "installerHooks": "windows/hooks.nsh"
+      }
+    }
+  }
+}
