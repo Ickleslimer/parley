@@ -192,6 +192,7 @@ par -h k -p "drain the queue"
 | `-h`, `--harness <name>` | Target agent. Defaults to `claude`. Accepts short codes. |
 | `--provider <name>` | Provider namespace, when the agent uses provider-qualified models or env config. |
 | `-m`, `--model <name>` | Model name. |
+| `--reasoning-effort <level>` | Grok reasoning effort: `low`, `medium`, `high`, or `xhigh` (`--effort` alias). |
 | `--agent <name>` | Agent/persona/profile, where supported. |
 | `--output-format <fmt>` | Output mode (e.g. `json`), where supported. |
 | `--input-format <fmt>` | Claude-compatible input format. |
@@ -400,15 +401,15 @@ A selector is either a list index (`par resume 2`) or a raw session id (`par res
 par ask -h g -p "critique this approach in 3 bullets"        # ask gemini, print its reply
 par ask -h g -p "what did we decide?" --context-from cl      # seed with your latest claude session here
 par ask -h cl -p "continue this" --context-from co:<id>      # use a specific source session id
-par ask -h gr -p "implement this" --session-id <uuid> --permission-mode auto --no-yolo
-par ask -h gr -p "review only" --resume-id <uuid> --permission-mode auto --no-yolo
+par ask -h gr -p "implement this" --session-id <uuid> --permission-mode auto --reasoning-effort xhigh --no-yolo
+par ask -h gr -p "review only" --resume-id <uuid> --permission-mode auto --reasoning-effort xhigh --no-yolo
 par ask -h g -p "..." --max-context 8000                     # cap injected context (default 12000 chars)
 par ask -h g -p "..." --dry-run                              # show the routed command + final prompt, run nothing
 ```
 
 `--context-from` takes `harness[:session]`; omit the session (or use `latest`) for the newest in the directory. **Context sources:** `claude`, `codex`, `grok`, `opencode`, `pi` (full transcripts). `cursor` / `gemini` can't export transcripts, so they can't be context *sources* — they can still be asked.
 
-Notes: calls are one-shot unless the target supports `--session-id` / `--resume-id`; these two options are mutually exclusive, and Grok requires a UUID for a new session. Yolo remains on by default for legacy use, so combine Grok permission modes with `--no-yolo`. Long injected transcripts are truncated to the most recent turns within the budget.
+Notes: calls are one-shot unless the target supports `--session-id` / `--resume-id`; these two options are mutually exclusive, and Grok requires a UUID for a new session. Grok reasoning accepts `low`, `medium`, `high`, or `xhigh`. Yolo remains on by default for legacy use, so combine Grok permission modes with `--no-yolo`. Long injected transcripts are truncated to the most recent turns within the budget.
 
 ## Converse — two agents, multi-turn
 
@@ -436,7 +437,7 @@ Each turn spawns a full agent process, so cost and latency scale with `--turns`.
 **Tools:**
 
 - **`fuse {prompt, panel?, judge?, judge_model?, cwd?, context_from?: {harness, session?}}`** — the collective-intelligence tool. Sends `prompt` to every agent in `panel` (default `claude,codex,gemini`) **in parallel**, then a judge agent (`judge`, default `claude`) synthesizes one answer — consensus as high-confidence, contradictions resolved, gaps filled, blind spots flagged — and returns it as text. `context_from` seeds every panelist with a prior session. Needs ≥2 panelists; ones whose CLI isn't installed are skipped with a note. (Same engine as the `par fuse` command.)
-- `ask_agent {harness, prompt, model?, provider?, permission_mode?, max_turns?, session_id?, resume_id?, yolo?, cwd?, context_from?: {harness, session?}}` — run another agent headless and return its reply, optionally seeded with a transcript or attached to a native session. The runtime policy can lock permissions, cap turns, require sessions, reject yolo, and constrain cwd.
+- `ask_agent {harness, prompt, model?, reasoning_effort?, provider?, permission_mode?, max_turns?, session_id?, resume_id?, yolo?, cwd?, context_from?: {harness, session?}}` — run another agent headless and return its reply, optionally seeded with a transcript or attached to a native session. Grok reasoning accepts `low`, `medium`, `high`, or `xhigh`. The runtime policy can lock model, reasoning, permissions, cap turns, require sessions, reject yolo, and constrain cwd.
 - `list_sessions {cwd?, harness?}` — resumable sessions for a directory, newest first.
 - `get_last_session {cwd?, harness?}` — the most recent session plus a ready-to-run resume command.
 - `resume_command {harness, id, cwd?, yolo?}` — build the native resume command for a session id (text; never spawns an interactive agent).
@@ -497,7 +498,7 @@ Then, from any registered agent: *"use par to pick up my last claude session her
 
 **Codex** — `codex exec`. `--output-format json|stream-json` → `--json`. Provider is preserved in `PARLEY_PROVIDER` (Codex receives the plain model name). Yolo → `--dangerously-bypass-approvals-and-sandbox` for routed runs; the `codexy` shim uses `codex --yolo`.
 
-**Grok** — `grok --no-auto-update --single`. Captured calls default to `--output-format plain`; `--model`, `--permission-mode`, `--max-turns`, `--session-id`, and `--resume` / `--continue` map natively. Yolo → `--always-approve`. Native sessions are discovered under `%USERPROFILE%\.grok\sessions` on Windows (or `~/.grok/sessions` elsewhere).
+**Grok** — `grok --no-auto-update --single`. Captured calls default to `--output-format plain`; `--model`, `--reasoning-effort`, `--permission-mode`, `--max-turns`, `--session-id`, and `--resume` / `--continue` map natively. Yolo → `--always-approve`. Native sessions are discovered under `%USERPROFILE%\.grok\sessions` on Windows (or `~/.grok/sessions` elsewhere).
 
 **Cursor** — `cursor-agent -p`. Plain `--model`; `--output-format` when accepted. Yolo → `--force` (required for print-mode file writes).
 
@@ -644,7 +645,7 @@ A Homebrew tap can follow once artifact names are stable.
 
 **Yolo (permission bypass) is on by default** — each run adds the agent's bypass flag unless you pass `--no-yolo` or set `PARLEY_YOLO=false`. This favors hands-off automation over sandboxing; opt out for untrusted prompts or sensitive directories. Use `--dry-run` to validate automation that may include secrets before running it.
 
-**Hardened MCP profiles** — `PARLEY_MCP_DEFAULT_YOLO=false` changes only MCP's legacy default, while `PARLEY_DISABLE_YOLO=true` rejects explicit bypass requests. `PARLEY_ALLOWED_CWD_ROOT` canonicalizes every spawn-capable MCP cwd and permits only existing descendants, never the root itself. For Grok, `PARLEY_GROK_LOCKED_PERMISSION_MODE`, `PARLEY_GROK_REQUIRE_SESSION_ID`, and `PARLEY_GROK_MAX_TURNS` lock the mode, require a native session, and set/cap turns. A locked Grok mode also injects non-overridable deny rules for web/MCP tools, dangerous Git operations, deletion, nested shells, downloads, and package managers; caller-supplied allow rules are not part of `ask_agent`.
+**Hardened MCP profiles** — `PARLEY_MCP_DEFAULT_YOLO=false` changes only MCP's legacy default, while `PARLEY_DISABLE_YOLO=true` rejects explicit bypass requests. `PARLEY_ALLOWED_CWD_ROOT` canonicalizes every spawn-capable MCP cwd and permits only existing descendants, never the root itself. For Grok, `PARLEY_GROK_LOCKED_MODEL`, `PARLEY_GROK_LOCKED_REASONING_EFFORT`, `PARLEY_GROK_LOCKED_PERMISSION_MODE`, `PARLEY_GROK_REQUIRE_SESSION_ID`, and `PARLEY_GROK_MAX_TURNS` lock model, reasoning, and permissions, require a native session, and set/cap turns. Structured or passthrough attempts to override locked model/reasoning are rejected. A locked Grok mode also injects non-overridable deny rules for web/MCP tools, dangerous Git operations, deletion, nested shells, downloads, and package managers; caller-supplied allow rules are not part of `ask_agent`.
 
 **Event log** — when `PARLEY_EVENT_LOG` is set, every captured ask appends and flushes one schema-v1 JSON object for the request and one for the response/error. The fields are `schema_version`, `event_type`, `event_id`, `exchange_id`, `timestamp_ms`, `source`, `target`, `cwd`, `session_id`, `session_action`, `content`, `status`, `duration_ms`, and `error`. Prompt and reply content is verbatim and is not redacted, so protect the file accordingly. No separate environment dump, credential field, raw tool payload, or command-argument list is added. A request-log failure prevents launch; a completion-log failure returns a non-retriable error containing the captured result.
 

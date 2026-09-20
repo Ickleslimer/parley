@@ -428,6 +428,25 @@ fn tools_list_result() -> Json {
             ("harness", str_prop("Target agent to ask (shorthands allowed).")),
             ("prompt", str_prop("The question or task for the target agent.")),
             ("model", str_prop("Optional model override.")),
+            (
+                "reasoning_effort",
+                obj(vec![
+                    ("type", Json::Str("string".to_string())),
+                    (
+                        "enum",
+                        Json::Array(
+                            ["low", "medium", "high", "xhigh"]
+                                .into_iter()
+                                .map(|value| Json::Str(value.to_string()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "description",
+                        Json::Str("Optional Grok reasoning effort.".to_string()),
+                    ),
+                ]),
+            ),
             ("provider", str_prop("Optional provider override.")),
             ("cwd", str_prop("Working directory (defaults to the server's cwd).")),
             ("permission_mode", str_prop("Optional target permission mode.")),
@@ -603,6 +622,10 @@ fn call_tool(
                 harness: harness.to_string(),
                 prompt: prompt.to_string(),
                 model: args.get("model").and_then(Json::as_str).map(str::to_string),
+                reasoning_effort: args
+                    .get("reasoning_effort")
+                    .and_then(Json::as_str)
+                    .map(str::to_string),
                 provider: args
                     .get("provider")
                     .and_then(Json::as_str)
@@ -917,6 +940,7 @@ mod tests {
             .unwrap();
         for name in [
             "permission_mode",
+            "reasoning_effort",
             "max_turns",
             "session_id",
             "resume_id",
@@ -924,6 +948,17 @@ mod tests {
         ] {
             assert!(properties.get(name).is_some(), "missing {name}");
         }
+        assert_eq!(
+            properties
+                .get("reasoning_effort")
+                .and_then(|property| property.get("enum"))
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Json::as_str)
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh"]
+        );
     }
 
     #[test]

@@ -32,6 +32,9 @@ fn build_args(request: &Request, denies: &[String]) -> Vec<String> {
     if let Some(model) = plain_model(request) {
         args.extend(["--model".to_string(), model]);
     }
+    if let Some(effort) = &request.reasoning_effort {
+        args.extend(["--reasoning-effort".to_string(), effort.clone()]);
+    }
     if let Some(mode) = &request.permission_mode {
         args.extend(["--permission-mode".to_string(), mode.clone()]);
     }
@@ -66,6 +69,7 @@ mod tests {
             harness: "grok".to_string(),
             provider: None,
             model: None,
+            reasoning_effort: None,
             output_format: None,
             input_format: None,
             permission_mode: None,
@@ -86,6 +90,7 @@ mod tests {
         let mut req = request();
         req.prompt = Some("review this".to_string());
         req.model = Some("grok-code".to_string());
+        req.reasoning_effort = Some("xhigh".to_string());
         req.permission_mode = Some("auto".to_string());
         req.max_turns = Some("30".to_string());
         req.session_id = Some("01a06582-d66e-7811-b0c9-0b0266e17903".to_string());
@@ -100,6 +105,8 @@ mod tests {
                 "plain",
                 "--model",
                 "grok-code",
+                "--reasoning-effort",
+                "xhigh",
                 "--permission-mode",
                 "auto",
                 "--max-turns",
@@ -118,10 +125,10 @@ mod tests {
         req.prompt = Some("continue".to_string());
         req.resume_id = Some("latest".to_string());
         req.yolo = true;
-        req.passthrough = vec!["--reasoning-effort".to_string(), "high".to_string()];
+        req.passthrough = vec!["--verbose".to_string()];
         let args = build_args(&req, &[]);
         assert!(args.iter().any(|arg| arg == "--continue"));
         assert!(args.iter().any(|arg| arg == "--always-approve"));
-        assert!(args.ends_with(&["--reasoning-effort".to_string(), "high".to_string()]));
+        assert!(args.ends_with(&["--verbose".to_string()]));
     }
 }

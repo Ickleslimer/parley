@@ -37,6 +37,7 @@ pub(crate) struct Request {
     pub harness: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub output_format: Option<String>,
     pub input_format: Option<String>,
     pub permission_mode: Option<String>,
@@ -59,6 +60,7 @@ impl Request {
             harness: normalize_harness(&options.harness),
             provider: options.provider,
             model: options.model,
+            reasoning_effort: options.reasoning_effort,
             output_format: options.output_format,
             input_format: options.input_format,
             permission_mode: options.permission_mode,
@@ -72,14 +74,17 @@ impl Request {
             session_id: options.session_id,
             resume_id: options.resume_id,
         };
-        crate::policy::RuntimePolicy::from_env()?.apply_request(
-            &request.harness,
-            request.yolo,
-            &mut request.permission_mode,
-            &mut request.max_turns,
-            &request.session_id,
-            &request.resume_id,
-        )?;
+        crate::policy::RuntimePolicy::from_env()?.apply_request(crate::policy::PolicyRequest {
+            harness: &request.harness,
+            yolo: request.yolo,
+            model: &mut request.model,
+            reasoning_effort: &mut request.reasoning_effort,
+            permission_mode: &mut request.permission_mode,
+            max_turns: &mut request.max_turns,
+            session_id: request.session_id.as_deref(),
+            resume_id: request.resume_id.as_deref(),
+            passthrough: &request.passthrough,
+        })?;
         Ok(request)
     }
 }

@@ -14,7 +14,7 @@ use std::time::Instant;
 use crate::cli::{AskOptions, CliOptions};
 use crate::event_log::ExchangeLog;
 use crate::harness::{normalize_harness, HarnessFactory, Invocation, Request};
-use crate::policy::RuntimePolicy;
+use crate::policy::{PolicyRequest, RuntimePolicy};
 use crate::process::{capture_invocation_timeout, Captured, Timeouts};
 use crate::session;
 
@@ -32,6 +32,7 @@ pub(crate) struct AskRequest {
     pub harness: String,
     pub prompt: String,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub provider: Option<String>,
     pub cwd: PathBuf,
     pub permission_mode: Option<String>,
@@ -74,6 +75,7 @@ fn build_prepared(req: &AskRequest, prompt: String) -> Result<Invocation, String
         harness: req.harness.clone(),
         provider: req.provider.clone(),
         model: req.model.clone(),
+        reasoning_effort: req.reasoning_effort.clone(),
         cwd: req.cwd.to_str().map(str::to_string),
         prompt: Some(prompt),
         permission_mode: req.permission_mode.clone(),
@@ -134,14 +136,17 @@ fn prepare(req: &AskRequest) -> Result<AskRequest, String> {
     let mut prepared = req.clone();
     prepared.harness = normalize_harness(&prepared.harness);
     prepared.cwd = policy.validate_spawn_cwd(&prepared.cwd)?;
-    policy.apply_request(
-        &prepared.harness,
-        prepared.yolo,
-        &mut prepared.permission_mode,
-        &mut prepared.max_turns,
-        &prepared.session_id,
-        &prepared.resume_id,
-    )?;
+    policy.apply_request(PolicyRequest {
+        harness: &prepared.harness,
+        yolo: prepared.yolo,
+        model: &mut prepared.model,
+        reasoning_effort: &mut prepared.reasoning_effort,
+        permission_mode: &mut prepared.permission_mode,
+        max_turns: &mut prepared.max_turns,
+        session_id: prepared.session_id.as_deref(),
+        resume_id: prepared.resume_id.as_deref(),
+        passthrough: &[],
+    })?;
     Ok(prepared)
 }
 
@@ -174,6 +179,7 @@ fn resolve(options: AskOptions) -> Result<AskRequest, String> {
         harness: options.harness.ok_or("ask requires a target agent")?,
         prompt: options.prompt.ok_or("ask requires a prompt")?,
         model: options.model,
+        reasoning_effort: options.reasoning_effort,
         provider: options.provider,
         cwd,
         permission_mode: options.permission_mode,

@@ -97,6 +97,7 @@ pub(crate) fn run_cli(options: ConverseOptions) -> Result<(), String> {
             harness: speaker.harness.clone(),
             prompt,
             model: speaker.model.clone(),
+            reasoning_effort: None,
             provider: None,
             cwd: cwd.clone(),
             permission_mode: None,

@@ -8,6 +8,7 @@ pub(crate) struct CliOptions {
     pub harness: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub output_format: Option<String>,
     pub input_format: Option<String>,
     pub permission_mode: Option<String>,
@@ -54,6 +55,7 @@ pub(crate) struct AskOptions {
     pub harness: Option<String>,
     pub prompt: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub provider: Option<String>,
     pub cwd: Option<String>,
     pub permission_mode: Option<String>,
@@ -265,6 +267,9 @@ where
             "--harness" => options.harness = require_value(&mut args, "--harness")?,
             "--provider" => options.provider = Some(require_value(&mut args, "--provider")?),
             "--model" | "-m" => options.model = Some(require_value(&mut args, "--model")?),
+            "--reasoning-effort" | "--effort" => {
+                options.reasoning_effort = Some(require_value(&mut args, "--reasoning-effort")?)
+            }
             "--cwd" => options.cwd = Some(require_value(&mut args, "--cwd")?),
             "--output-format" => {
                 options.output_format = Some(require_value(&mut args, "--output-format")?)
@@ -290,6 +295,12 @@ where
             }
             _ if arg.starts_with("--model=") => {
                 options.model = Some(value_after_equals(&arg, "--model="));
+            }
+            _ if arg.starts_with("--reasoning-effort=") => {
+                options.reasoning_effort = Some(value_after_equals(&arg, "--reasoning-effort="));
+            }
+            _ if arg.starts_with("--effort=") => {
+                options.reasoning_effort = Some(value_after_equals(&arg, "--effort="));
             }
             _ if arg.starts_with("--cwd=") => {
                 options.cwd = Some(value_after_equals(&arg, "--cwd="));
@@ -348,6 +359,7 @@ Options:
                           fuse = run a panel · e.g. par converse --a fuse --b claude
   --provider <name>       Provider namespace when the target CLI supports one
   --model, -m <name>      Model name to pass through
+  --reasoning-effort <n>  Grok reasoning: low, medium, high, or xhigh (--effort alias)
   --agent <name>          Agent/persona name for harnesses that support it
   --output-format <fmt>   text, json, stream-json when supported by target
   --cwd <path>            Working directory for the target CLI
@@ -419,10 +431,10 @@ Ask (agent-to-agent):
                                   Use a specific source session id as context
   par ask -h g -p \"...\" --max-context 8000 --dry-run
                                   Cap injected context; show the command, run nothing
-  par ask -h gr -p \"...\" --no-yolo --permission-mode auto --session-id <uuid>
-                                  Start a resumable Grok session
-  par ask -h gr -p \"...\" --no-yolo --permission-mode auto --resume-id <uuid>
-                                  Continue that Grok session headlessly
+  par ask -h gr -p \"...\" --no-yolo --permission-mode auto --reasoning-effort xhigh --session-id <uuid>
+                                   Start a resumable Grok session
+  par ask -h gr -p \"...\" --no-yolo --permission-mode auto --reasoning-effort xhigh --resume-id <uuid>
+                                   Continue that Grok session headlessly
   Context sources: claude, codex, grok, opencode, pi (cursor/gemini cannot export transcripts)
 
 Converse (multi-turn, two agents):
@@ -714,6 +726,9 @@ where
             "--harness" => options.harness = Some(require_value(&mut args, "--harness")?),
             "-p" | "--prompt" => options.prompt = Some(require_value(&mut args, "--prompt")?),
             "-m" | "--model" => options.model = Some(require_value(&mut args, "--model")?),
+            "--reasoning-effort" | "--effort" => {
+                options.reasoning_effort = Some(require_value(&mut args, "--reasoning-effort")?)
+            }
             "--provider" => options.provider = Some(require_value(&mut args, "--provider")?),
             "--cwd" => options.cwd = Some(require_value(&mut args, "--cwd")?),
             "--permission-mode" => {
@@ -737,6 +752,12 @@ where
             "--dry-run" => options.dry_run = true,
             _ if arg.starts_with("--harness=") => {
                 options.harness = Some(value_after_equals(&arg, "--harness="))
+            }
+            _ if arg.starts_with("--reasoning-effort=") => {
+                options.reasoning_effort = Some(value_after_equals(&arg, "--reasoning-effort="))
+            }
+            _ if arg.starts_with("--effort=") => {
+                options.reasoning_effort = Some(value_after_equals(&arg, "--effort="))
             }
             _ if arg.starts_with("--context-from=") => {
                 options.context_from = Some(value_after_equals(&arg, "--context-from="))
@@ -1079,6 +1100,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_grok_reasoning_effort_for_routed_runs() {
+        let action = parse_args(
+            [
+                "--harness",
+                "grok",
+                "-p",
+                "review",
+                "--reasoning-effort=high",
+            ]
+            .map(String::from),
+            defaults(),
+        )
+        .unwrap();
+
+        let CliAction::Run(options) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn parses_grok_ask_session_controls() {
         let action = parse_args(
             [
@@ -1088,6 +1130,8 @@ mod tests {
                 "-p",
                 "review",
                 "--permission-mode=auto",
+                "--effort",
+                "XHIGH",
                 "--max-turns",
                 "12",
                 "--session-id",
@@ -1103,6 +1147,7 @@ mod tests {
         };
         assert_eq!(options.harness.as_deref(), Some("gr"));
         assert_eq!(options.permission_mode.as_deref(), Some("auto"));
+        assert_eq!(options.reasoning_effort.as_deref(), Some("XHIGH"));
         assert_eq!(options.max_turns.as_deref(), Some("12"));
         assert_eq!(
             options.session_id.as_deref(),

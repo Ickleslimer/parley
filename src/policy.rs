@@ -118,10 +118,24 @@ pub(crate) struct RuntimePolicy {
     allowed_cwd_root: Option<PathBuf>,
     mcp_default_yolo: bool,
     disable_yolo: bool,
+    grok_locked_model: Option<String>,
+    grok_locked_reasoning_effort: Option<String>,
     grok_locked_permission_mode: Option<String>,
     grok_require_session_id: bool,
     grok_max_turns: Option<u64>,
     grok_denies: Vec<String>,
+}
+
+pub(crate) struct PolicyRequest<'a> {
+    pub harness: &'a str,
+    pub yolo: bool,
+    pub model: &'a mut Option<String>,
+    pub reasoning_effort: &'a mut Option<String>,
+    pub permission_mode: &'a mut Option<String>,
+    pub max_turns: &'a mut Option<String>,
+    pub session_id: Option<&'a str>,
+    pub resume_id: Option<&'a str>,
+    pub passthrough: &'a [String],
 }
 
 impl Default for RuntimePolicy {
@@ -130,6 +144,8 @@ impl Default for RuntimePolicy {
             allowed_cwd_root: None,
             mcp_default_yolo: true,
             disable_yolo: false,
+            grok_locked_model: None,
+            grok_locked_reasoning_effort: None,
             grok_locked_permission_mode: None,
             grok_require_session_id: false,
             grok_max_turns: None,
@@ -173,6 +189,10 @@ impl RuntimePolicy {
             Err(error) => return Err(format!("read PARLEY_GROK_MAX_TURNS: {error}")),
         };
 
+        let grok_locked_model = env_nonempty("PARLEY_GROK_LOCKED_MODEL");
+        let grok_locked_reasoning_effort = env_nonempty("PARLEY_GROK_LOCKED_REASONING_EFFORT")
+            .map(|value| normalize_reasoning_effort(&value))
+            .transpose()?;
         let grok_locked_permission_mode = env_nonempty("PARLEY_GROK_LOCKED_PERMISSION_MODE");
         let grok_denies = if grok_locked_permission_mode.is_some() {
             hardened_grok_denies()
@@ -184,6 +204,8 @@ impl RuntimePolicy {
             allowed_cwd_root,
             mcp_default_yolo: env_bool("PARLEY_MCP_DEFAULT_YOLO")?.unwrap_or(true),
             disable_yolo: env_bool("PARLEY_DISABLE_YOLO")?.unwrap_or(false),
+            grok_locked_model,
+            grok_locked_reasoning_effort,
             grok_locked_permission_mode,
             grok_require_session_id: env_bool("PARLEY_GROK_REQUIRE_SESSION_ID")?.unwrap_or(false),
             grok_max_turns,
@@ -199,20 +221,36 @@ impl RuntimePolicy {
         Ok(yolo)
     }
 
-    pub(crate) fn apply_request(
-        &self,
-        harness: &str,
-        yolo: bool,
-        permission_mode: &mut Option<String>,
-        max_turns: &mut Option<String>,
-        session_id: &Option<String>,
-        resume_id: &Option<String>,
-    ) -> Result<(), String> {
+    pub(crate) fn apply_request(&self, request: PolicyRequest<'_>) -> Result<(), String> {
+        let PolicyRequest {
+            harness,
+            yolo,
+            model,
+            reasoning_effort,
+            permission_mode,
+            max_turns,
+            session_id,
+            resume_id,
+            passthrough,
+        } = request;
         if self.disable_yolo && (yolo || permission_mode.as_deref() == Some("bypassPermissions")) {
             return Err("permission bypass is disabled by PARLEY_DISABLE_YOLO".to_string());
         }
         if harness != "grok" {
+            if reasoning_effort.is_some() {
+                return Err("--reasoning-effort is only supported for Grok".to_string());
+            }
             return Ok(());
+        }
+
+        if let Some(flag) = grok_passthrough_control(passthrough) {
+            return Err(format!(
+                "Grok model and reasoning controls must use structured Parley options, not passthrough: {flag}"
+            ));
+        }
+
+        if let Some(requested) = reasoning_effort.as_deref() {
+            *reasoning_effort = Some(normalize_reasoning_effort(requested)?);
         }
 
         if session_id.is_some() && resume_id.is_some() {
@@ -225,6 +263,27 @@ impl RuntimePolicy {
             if !is_uuid(id) {
                 return Err(format!("--session-id must be a UUID, got {id}"));
             }
+        }
+
+        if let Some(locked) = &self.grok_locked_model {
+            if let Some(requested) = model.as_deref() {
+                if requested != locked {
+                    return Err(format!(
+                        "Grok model is locked to {locked}; requested {requested}"
+                    ));
+                }
+            }
+            *model = Some(locked.clone());
+        }
+        if let Some(locked) = &self.grok_locked_reasoning_effort {
+            if let Some(requested) = reasoning_effort.as_deref() {
+                if requested != locked {
+                    return Err(format!(
+                        "Grok reasoning effort is locked to {locked}; requested {requested}"
+                    ));
+                }
+            }
+            *reasoning_effort = Some(locked.clone());
         }
 
         if let Some(locked) = &self.grok_locked_permission_mode {
@@ -333,6 +392,32 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn normalize_reasoning_effort(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "low" | "medium" | "high" | "xhigh" => Ok(normalized),
+        _ => Err(format!(
+            "Grok reasoning effort must be low, medium, high, or xhigh, got {value}"
+        )),
+    }
+}
+
+fn grok_passthrough_control(args: &[String]) -> Option<&str> {
+    args.iter().find_map(|arg| {
+        matches!(
+            arg.as_str(),
+            "-m" | "--model" | "--effort" | "--reasoning-effort"
+        )
+        .then_some(arg.as_str())
+        .or_else(|| {
+            ["--model=", "--effort=", "--reasoning-effort="]
+                .iter()
+                .any(|prefix| arg.starts_with(prefix))
+                .then_some(arg.as_str())
+        })
+    })
+}
+
 fn hardened_grok_denies() -> Vec<String> {
     HARDENED_GROK_DENIES
         .iter()
@@ -402,41 +487,52 @@ mod tests {
     #[test]
     fn rejects_conflicting_session_and_permission_options() {
         let policy = RuntimePolicy::default();
+        let mut model = None;
+        let mut effort = None;
         let mut mode = Some("auto".to_string());
         let mut turns = None;
         assert!(policy
-            .apply_request(
-                "grok",
-                true,
-                &mut mode,
-                &mut turns,
-                &Some("01a06582-d66e-7811-b0c9-0b0266e17903".to_string()),
-                &None,
-            )
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: true,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903"),
+                resume_id: None,
+                passthrough: &[],
+            })
             .is_err());
 
         let mut mode = None;
         assert!(policy
-            .apply_request(
-                "grok",
-                false,
-                &mut mode,
-                &mut turns,
-                &Some("01a06582-d66e-7811-b0c9-0b0266e17903".to_string()),
-                &Some("01a06582-d66e-7811-b0c9-0b0266e17904".to_string()),
-            )
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903"),
+                resume_id: Some("01a06582-d66e-7811-b0c9-0b0266e17904"),
+                passthrough: &[],
+            })
             .unwrap_err()
             .contains("mutually exclusive"));
 
         assert!(policy
-            .apply_request(
-                "grok",
-                false,
-                &mut mode,
-                &mut turns,
-                &Some("not-a-uuid".to_string()),
-                &None,
-            )
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: Some("not-a-uuid"),
+                resume_id: None,
+                passthrough: &[],
+            })
             .unwrap_err()
             .contains("must be a UUID"));
     }
@@ -471,6 +567,8 @@ mod tests {
     #[test]
     fn locked_grok_policy_injects_defaults_and_caps_turns() {
         let policy = RuntimePolicy {
+            grok_locked_model: Some("grok-4.6".to_string()),
+            grok_locked_reasoning_effort: Some("xhigh".to_string()),
             grok_locked_permission_mode: Some("auto".to_string()),
             grok_require_session_id: true,
             grok_max_turns: Some(30),
@@ -478,39 +576,187 @@ mod tests {
             ..RuntimePolicy::default()
         };
         let id = Some("01a06582-d66e-7811-b0c9-0b0266e17903".to_string());
+        let mut model = None;
+        let mut effort = None;
         let mut mode = None;
         let mut turns = None;
         policy
-            .apply_request("grok", false, &mut mode, &mut turns, &id, &None)
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: id.as_deref(),
+                resume_id: None,
+                passthrough: &[],
+            })
             .unwrap();
+        assert_eq!(model.as_deref(), Some("grok-4.6"));
+        assert_eq!(effort.as_deref(), Some("xhigh"));
         assert_eq!(mode.as_deref(), Some("auto"));
         assert_eq!(turns.as_deref(), Some("30"));
 
         let mut mode = Some("auto".to_string());
         let mut turns = Some("12".to_string());
         policy
-            .apply_request("grok", false, &mut mode, &mut turns, &id, &None)
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: id.as_deref(),
+                resume_id: None,
+                passthrough: &[],
+            })
             .unwrap();
         assert_eq!(turns.as_deref(), Some("12"));
 
         let mut turns = Some("31".to_string());
         assert!(policy
-            .apply_request("grok", false, &mut mode, &mut turns, &id, &None)
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: id.as_deref(),
+                resume_id: None,
+                passthrough: &[],
+            })
             .unwrap_err()
             .contains("capped at 30"));
 
         let mut wrong_mode = Some("default".to_string());
         let mut turns = None;
         assert!(policy
-            .apply_request("grok", false, &mut wrong_mode, &mut turns, &id, &None,)
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut wrong_mode,
+                max_turns: &mut turns,
+                session_id: id.as_deref(),
+                resume_id: None,
+                passthrough: &[],
+            })
             .unwrap_err()
             .contains("locked to auto"));
 
         let mut mode = None;
         assert!(policy
-            .apply_request("grok", false, &mut mode, &mut turns, &None, &None)
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: None,
+                resume_id: None,
+                passthrough: &[],
+            })
             .unwrap_err()
             .contains("require session_id or resume_id"));
+    }
+
+    #[test]
+    fn locked_grok_policy_rejects_model_effort_and_passthrough_overrides() {
+        let policy = RuntimePolicy {
+            grok_locked_model: Some("grok-4.6".to_string()),
+            grok_locked_reasoning_effort: Some("xhigh".to_string()),
+            ..RuntimePolicy::default()
+        };
+        let mut model = Some("grok-4.5".to_string());
+        let mut effort = Some("xhigh".to_string());
+        let mut mode = None;
+        let mut turns = None;
+        assert!(policy
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: None,
+                resume_id: None,
+                passthrough: &[],
+            })
+            .unwrap_err()
+            .contains("model is locked"));
+
+        let mut model = Some("grok-4.6".to_string());
+        let mut effort = Some("HIGH".to_string());
+        assert!(policy
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: None,
+                resume_id: None,
+                passthrough: &[],
+            })
+            .unwrap_err()
+            .contains("reasoning effort is locked"));
+
+        for passthrough in [
+            vec!["--model".to_string(), "grok-4.5".to_string()],
+            vec!["-m".to_string(), "grok-4.5".to_string()],
+            vec!["--effort=low".to_string()],
+            vec!["--reasoning-effort".to_string(), "high".to_string()],
+        ] {
+            let mut model = Some("grok-4.6".to_string());
+            let mut effort = Some("xhigh".to_string());
+            assert!(policy
+                .apply_request(PolicyRequest {
+                    harness: "grok",
+                    yolo: false,
+                    model: &mut model,
+                    reasoning_effort: &mut effort,
+                    permission_mode: &mut mode,
+                    max_turns: &mut turns,
+                    session_id: None,
+                    resume_id: None,
+                    passthrough: &passthrough,
+                })
+                .unwrap_err()
+                .contains("not passthrough"));
+        }
+    }
+
+    #[test]
+    fn validates_reasoning_effort_and_rejects_other_harnesses() {
+        assert_eq!(normalize_reasoning_effort(" XHIGH ").unwrap(), "xhigh");
+        assert!(normalize_reasoning_effort("maximum").is_err());
+
+        let policy = RuntimePolicy::default();
+        let mut model = None;
+        let mut effort = Some("high".to_string());
+        let mut mode = None;
+        let mut turns = None;
+        assert!(policy
+            .apply_request(PolicyRequest {
+                harness: "claude",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: None,
+                resume_id: None,
+                passthrough: &[],
+            })
+            .unwrap_err()
+            .contains("only supported for Grok"));
     }
 
     #[test]
@@ -540,10 +786,22 @@ mod tests {
         assert!(policy.resolve_mcp_yolo(None).is_err());
         assert!(!policy.resolve_mcp_yolo(Some(false)).unwrap());
 
+        let mut model = None;
+        let mut effort = None;
         let mut mode = Some("bypassPermissions".to_string());
         let mut turns = None;
         assert!(policy
-            .apply_request("grok", false, &mut mode, &mut turns, &None, &None)
+            .apply_request(PolicyRequest {
+                harness: "grok",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: None,
+                resume_id: None,
+                passthrough: &[],
+            })
             .unwrap_err()
             .contains("permission bypass is disabled"));
     }
@@ -551,17 +809,22 @@ mod tests {
     #[test]
     fn legacy_harnesses_keep_non_uuid_session_semantics() {
         let policy = RuntimePolicy::default();
+        let mut model = None;
+        let mut effort = None;
         let mut mode = None;
         let mut turns = None;
         policy
-            .apply_request(
-                "claude",
-                false,
-                &mut mode,
-                &mut turns,
-                &Some("legacy-session-name".to_string()),
-                &Some("legacy-resume-name".to_string()),
-            )
+            .apply_request(PolicyRequest {
+                harness: "claude",
+                yolo: false,
+                model: &mut model,
+                reasoning_effort: &mut effort,
+                permission_mode: &mut mode,
+                max_turns: &mut turns,
+                session_id: Some("legacy-session-name"),
+                resume_id: Some("legacy-resume-name"),
+                passthrough: &[],
+            })
             .unwrap();
     }
 }
