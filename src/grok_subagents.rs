@@ -129,10 +129,24 @@ impl GuardedSubagentLaunch {
         }))
     }
 
-    pub(crate) fn configure_invocation(&self, invocation: &mut Invocation) -> Result<(), String> {
+    pub(crate) fn parent_profile_contents(&self) -> String {
+        parent_agent_profile()
+    }
+
+    pub(crate) fn configure_invocation(
+        &self,
+        invocation: &mut Invocation,
+        parent_profile: &Path,
+    ) -> Result<(), String> {
         if !invocation.command.eq_ignore_ascii_case("grok") {
             return Err("guarded subagents are supported only for Grok".to_string());
         }
+        if !parent_profile.is_absolute() {
+            return Err("guarded parent profile path must be absolute".to_string());
+        }
+        let parent_profile = parent_profile
+            .to_str()
+            .ok_or_else(|| "guarded parent profile path is not valid Unicode".to_string())?;
         for argument in &invocation.args {
             let lower = argument.to_ascii_lowercase();
             if matches!(
@@ -158,7 +172,7 @@ impl GuardedSubagentLaunch {
             "--agents".to_string(),
             agent_definitions_json(),
             "--agent".to_string(),
-            PARENT_NAME.to_string(),
+            parent_profile.to_string(),
             "--tools".to_string(),
             PARENT_TOOLS.to_string(),
             "--disallowed-tools".to_string(),
@@ -318,7 +332,6 @@ pub(crate) fn append_parent_contract(prompt: &mut String, plan: &LanePlan) {
 
 fn agent_definitions_json() -> String {
     let mut definitions = BTreeMap::new();
-    definitions.insert(PARENT_NAME.to_string(), parent_agent_definition());
     definitions.insert(
         WRITER_NAME.to_string(),
         agent_definition(
@@ -338,51 +351,32 @@ fn agent_definitions_json() -> String {
     Json::Object(definitions).to_compact_string()
 }
 
-fn parent_agent_definition() -> Json {
-    let mut definition = BTreeMap::new();
-    definition.insert("agentsMd".to_string(), Json::Bool(false));
-    definition.insert(
-        "description".to_string(),
-        Json::Str("Guarded Two Chairs parent".to_string()),
+fn parent_agent_profile() -> String {
+    let mut profile = format!(
+        "---\nname: {PARENT_NAME}\ndescription: Guarded Two Chairs parent\npromptMode: extend\n"
     );
-    definition.insert("discoverSkills".to_string(), Json::Bool(false));
-    definition.insert(
-        "disallowedTools".to_string(),
-        Json::Array(
-            PARENT_DENIES
-                .split(',')
-                .map(|tool| Json::Str(tool.to_string()))
-                .collect(),
-        ),
+    profile.push_str("tools:\n");
+    for tool in [
+        "read_file",
+        "list_dir",
+        "grep",
+        "search_replace",
+        "write",
+        "task",
+        "Agent(two-chairs-writer,two-chairs-reviewer)",
+        "get_command_or_subagent_output",
+        "wait_commands_or_subagents",
+    ] {
+        profile.push_str(&format!("  - \"{tool}\"\n"));
+    }
+    profile.push_str("disallowedTools:\n");
+    for tool in PARENT_DENIES.split(',') {
+        profile.push_str(&format!("  - \"{tool}\"\n"));
+    }
+    profile.push_str(
+        "agentsMd: false\ndiscoverSkills: false\ninheritSkills: false\ninjectDefaultTools: false\nmcpInheritance: none\nmodel: inherit\n---\nYou are the guarded Two Chairs parent. Work only inside the current lane contract. Spawn only the explicitly granted two-chairs-writer or two-chairs-reviewer children, always with the exact required subagent_type, cwd, and isolation:none. Independently review every child result and report all child IDs, grants, changes, tests, failures, and denials.\n",
     );
-    definition.insert("inheritSkills".to_string(), Json::Bool(false));
-    definition.insert("injectDefaultTools".to_string(), Json::Bool(false));
-    definition.insert("mcpInheritance".to_string(), Json::Str("none".to_string()));
-    definition.insert("model".to_string(), Json::Str("inherit".to_string()));
-    definition.insert(
-        "prompt".to_string(),
-        Json::Str("You are the guarded Two Chairs parent. Work only inside the current lane contract. Spawn only the explicitly granted two-chairs-writer or two-chairs-reviewer children, always with the exact required subagent_type, cwd, and isolation:none. Independently review every child result and report all child IDs, grants, changes, tests, failures, and denials.".to_string()),
-    );
-    definition.insert(
-        "tools".to_string(),
-        Json::Array(
-            [
-                "read_file",
-                "list_dir",
-                "grep",
-                "search_replace",
-                "write",
-                "task",
-                "Agent(two-chairs-writer,two-chairs-reviewer)",
-                "get_command_or_subagent_output",
-                "wait_commands_or_subagents",
-            ]
-            .into_iter()
-            .map(|tool| Json::Str(tool.to_string()))
-            .collect(),
-        ),
-    );
-    Json::Object(definition)
+    profile
 }
 
 fn agent_definition(description: &str, capability: &str, tools: &[&str]) -> Json {
@@ -545,17 +539,7 @@ mod tests {
     #[test]
     fn agent_definitions_are_closed_and_inherit_the_model() {
         let value = Json::parse(&agent_definitions_json()).unwrap();
-        let parent = value.get(PARENT_NAME).unwrap();
-        let parent_tools = parent.get("tools").and_then(Json::as_array).unwrap();
-        assert!(parent_tools
-            .iter()
-            .any(|tool| tool.as_str() == Some("task")));
-        assert!(parent_tools
-            .iter()
-            .any(|tool| { tool.as_str() == Some("Agent(two-chairs-writer,two-chairs-reviewer)") }));
-        assert!(!parent_tools
-            .iter()
-            .any(|tool| tool.as_str() == Some("run_terminal_cmd")));
+        assert!(value.get(PARENT_NAME).is_none());
         let writer = value.get(WRITER_NAME).unwrap();
         assert_eq!(
             writer.get("capabilityMode").and_then(Json::as_str),
@@ -579,6 +563,20 @@ mod tests {
     }
 
     #[test]
+    fn parent_profile_is_file_selectable_and_closes_authority() {
+        let profile = launch().parent_profile_contents();
+        assert!(profile.starts_with("---\nname: two-chairs-parent\n"));
+        assert!(profile.contains("  - \"task\"\n"));
+        assert!(profile.contains("  - \"Agent(two-chairs-writer,two-chairs-reviewer)\"\n"));
+        assert!(profile.contains("  - \"run_terminal_cmd\"\n"));
+        assert!(profile.contains("injectDefaultTools: false\n"));
+        assert!(profile.contains("mcpInheritance: none\n"));
+        assert!(profile.contains("model: inherit\n"));
+        assert!(!profile.contains("permissionMode:"));
+        assert!(!profile.contains("bypassPermissions"));
+    }
+
+    #[test]
     fn invocation_receives_immutable_catalog_and_environment() {
         let mut invocation = Invocation::new(
             "grok",
@@ -588,7 +586,9 @@ mod tests {
                 "task".to_string(),
             ],
         );
-        launch().configure_invocation(&mut invocation).unwrap();
+        launch()
+            .configure_invocation(&mut invocation, Path::new(r"C:\Temp\parent.md"))
+            .unwrap();
         assert!(invocation
             .args
             .iter()
@@ -596,7 +596,7 @@ mod tests {
         assert!(invocation
             .args
             .windows(2)
-            .any(|arguments| arguments == ["--agent", PARENT_NAME]));
+            .any(|arguments| arguments == ["--agent", r"C:\Temp\parent.md"]));
         assert!(invocation
             .args
             .iter()
@@ -617,7 +617,17 @@ mod tests {
     #[test]
     fn invocation_rejects_preexisting_authority_switches() {
         let mut invocation = Invocation::new("grok", vec!["--tools=all".to_string()]);
-        assert!(launch().configure_invocation(&mut invocation).is_err());
+        assert!(launch()
+            .configure_invocation(&mut invocation, Path::new(r"C:\Temp\parent.md"))
+            .is_err());
+    }
+
+    #[test]
+    fn invocation_rejects_relative_parent_profiles() {
+        let mut invocation = Invocation::new("grok", vec!["--no-auto-update".to_string()]);
+        assert!(launch()
+            .configure_invocation(&mut invocation, Path::new("parent.md"))
+            .is_err());
     }
 
     #[test]
@@ -634,7 +644,9 @@ mod tests {
             }],
         });
         let mut invocation = Invocation::new("grok", vec!["--no-auto-update".to_string()]);
-        launch.configure_invocation(&mut invocation).unwrap();
+        launch
+            .configure_invocation(&mut invocation, Path::new(r"C:\Temp\parent.md"))
+            .unwrap();
         assert!(invocation
             .args
             .iter()

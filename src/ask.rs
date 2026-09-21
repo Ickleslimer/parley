@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 use crate::cli::{AskOptions, CliOptions};
 use crate::context::{
-    cleanup_stale_prompt_files, resolve_codex_rollout, resolve_codex_sessions_root, CodexHomeEnv,
-    ContextBounds, ContextKey, ContextMode, ContextPlan, ContextRecovery, JournalStore, PlanKind,
-    PromptFile, ResolvedSource, StateDirEnv,
+    cleanup_stale_agent_profile_files, cleanup_stale_prompt_files, resolve_codex_rollout,
+    resolve_codex_sessions_root, AgentProfileFile, CodexHomeEnv, ContextBounds, ContextKey,
+    ContextMode, ContextPlan, ContextRecovery, JournalStore, PlanKind, PromptFile, ResolvedSource,
+    StateDirEnv,
 };
 use crate::event_log::{EventReceipt, ExchangeLog, ExchangeReceipt};
 use crate::grok_subagents::GuardedSubagentLaunch;
@@ -168,6 +169,33 @@ impl StatefulPrompt {
 struct ResolvedPrompt {
     text: String,
     stateful: Option<StatefulPrompt>,
+}
+
+#[derive(Default)]
+struct InvocationFiles {
+    prompt: Option<PromptFile>,
+    agent_profile: Option<AgentProfileFile>,
+}
+
+impl InvocationFiles {
+    fn cleanup(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Some(prompt) = self.prompt.take() {
+            if let Err(error) = prompt.cleanup() {
+                errors.push(error.to_string());
+            }
+        }
+        if let Some(agent_profile) = self.agent_profile.take() {
+            if let Err(error) = agent_profile.cleanup() {
+                errors.push(error.to_string());
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
 }
 
 impl AskFailure {
@@ -462,48 +490,119 @@ pub(crate) fn run_prepared_with_receipt_controlled(
             ));
         }
     };
+    let timeouts = Timeouts::from_env();
+    let mut invocation_files = InvocationFiles::default();
     if let Some(guarded_launch) = guarded_launch {
-        if let Err(error) = guarded_launch.configure_invocation(&mut invocation) {
+        let max_age = timeouts.overall.saturating_add(Duration::from_secs(300));
+        if let Err(error) = cleanup_stale_agent_profile_files(max_age) {
             return Err(preflight_failure(
                 req,
                 &resolved.text,
                 exchange_id,
                 "lane_preflight_error",
-                &format!("guarded lane invocation failed; agent was not started: {error}"),
+                &format!("guarded parent-profile cleanup failed; agent was not started: {error}"),
             ));
         }
-    }
-    let timeouts = Timeouts::from_env();
-    let mut prompt_file = None;
-    if should_use_prompt_file(req, &invocation, resolved.stateful.is_some()) {
-        let max_age = timeouts.overall.saturating_add(Duration::from_secs(300));
-        if let Err(error) = cleanup_stale_prompt_files(max_age) {
-            return Err(preflight_failure(
-                req,
-                &resolved.text,
-                exchange_id,
-                "prompt_file_error",
-                &format!("prompt-file cleanup failed; agent was not started: {error}"),
-            ));
-        }
-        let file = match PromptFile::create(&resolved.text) {
-            Ok(file) => file,
+        let profile = match AgentProfileFile::create(&guarded_launch.parent_profile_contents()) {
+            Ok(profile) => profile,
             Err(error) => {
                 return Err(preflight_failure(
                     req,
                     &resolved.text,
                     exchange_id,
-                    "prompt_file_error",
-                    &format!("prompt-file creation failed; agent was not started: {error}"),
+                    "lane_preflight_error",
+                    &format!(
+                        "guarded parent-profile creation failed; agent was not started: {error}"
+                    ),
                 ));
             }
         };
-        let path = match file.path().to_str() {
+        invocation_files.agent_profile = Some(profile);
+        let profile_path = match invocation_files
+            .agent_profile
+            .as_ref()
+            .and_then(|profile| profile.path().to_str())
+        {
             Some(path) => path.to_string(),
             None => {
-                let cleanup_error = file.cleanup().err().map(|error| error.to_string());
-                let suffix = cleanup_error
-                    .map(|error| format!("; prompt cleanup also failed: {error}"))
+                let suffix = invocation_files
+                    .cleanup()
+                    .err()
+                    .map(|error| format!("; temporary-file cleanup also failed: {error}"))
+                    .unwrap_or_default();
+                return Err(preflight_failure(
+                    req,
+                    &resolved.text,
+                    exchange_id,
+                    "lane_preflight_error",
+                    &format!(
+                        "guarded parent-profile path is not valid Unicode; agent was not started{suffix}"
+                    ),
+                ));
+            }
+        };
+        if let Err(error) = guarded_launch
+            .configure_invocation(&mut invocation, PathBuf::from(profile_path).as_path())
+        {
+            let suffix = invocation_files
+                .cleanup()
+                .err()
+                .map(|cleanup| format!("; temporary-file cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(preflight_failure(
+                req,
+                &resolved.text,
+                exchange_id,
+                "lane_preflight_error",
+                &format!("guarded lane invocation failed; agent was not started: {error}{suffix}"),
+            ));
+        }
+    }
+    if should_use_prompt_file(req, &invocation, resolved.stateful.is_some()) {
+        let max_age = timeouts.overall.saturating_add(Duration::from_secs(300));
+        if let Err(error) = cleanup_stale_prompt_files(max_age) {
+            let suffix = invocation_files
+                .cleanup()
+                .err()
+                .map(|cleanup| format!("; temporary-file cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(preflight_failure(
+                req,
+                &resolved.text,
+                exchange_id,
+                "prompt_file_error",
+                &format!("prompt-file cleanup failed; agent was not started: {error}{suffix}"),
+            ));
+        }
+        let file = match PromptFile::create(&resolved.text) {
+            Ok(file) => file,
+            Err(error) => {
+                let suffix = invocation_files
+                    .cleanup()
+                    .err()
+                    .map(|cleanup| format!("; temporary-file cleanup also failed: {cleanup}"))
+                    .unwrap_or_default();
+                return Err(preflight_failure(
+                    req,
+                    &resolved.text,
+                    exchange_id,
+                    "prompt_file_error",
+                    &format!("prompt-file creation failed; agent was not started: {error}{suffix}"),
+                ));
+            }
+        };
+        invocation_files.prompt = Some(file);
+        let path = match invocation_files
+            .prompt
+            .as_ref()
+            .and_then(|file| file.path().to_str())
+        {
+            Some(path) => path.to_string(),
+            None => {
+                let suffix = invocation_files
+                    .cleanup()
+                    .err()
+                    .map(|error| format!("; temporary-file cleanup also failed: {error}"))
                     .unwrap_or_default();
                 return Err(preflight_failure(
                     req,
@@ -517,9 +616,10 @@ pub(crate) fn run_prepared_with_receipt_controlled(
             }
         };
         if let Err(error) = invocation.replace_single_prompt_with_file(&path) {
-            let cleanup_error = file.cleanup().err().map(|error| error.to_string());
-            let suffix = cleanup_error
-                .map(|error| format!("; prompt cleanup also failed: {error}"))
+            let suffix = invocation_files
+                .cleanup()
+                .err()
+                .map(|error| format!("; temporary-file cleanup also failed: {error}"))
                 .unwrap_or_default();
             return Err(preflight_failure(
                 req,
@@ -529,14 +629,13 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                 &format!("prompt-file transport failed; agent was not started: {error}{suffix}"),
             ));
         }
-        prompt_file = Some(file);
     }
     let log = match ExchangeLog::start_with_exchange_id(req, &resolved.text, exchange_id.clone()) {
         Ok(log) => log,
         Err(error) => {
-            let suffix = cleanup_prompt_file(&mut prompt_file)
+            let suffix = cleanup_invocation_files(&mut invocation_files)
                 .err()
-                .map(|cleanup| format!("; prompt cleanup also failed: {cleanup}"))
+                .map(|cleanup| format!("; temporary-file cleanup also failed: {cleanup}"))
                 .unwrap_or_default();
             return Err(AskFailure::new(format!(
                 "request event logging failed; agent was not started: {error}{suffix}"
@@ -545,9 +644,9 @@ pub(crate) fn run_prepared_with_receipt_controlled(
     };
     if let Some(stateful) = &resolved.stateful {
         if let Err(error) = stateful.start(&exchange_id) {
-            let suffix = cleanup_prompt_file(&mut prompt_file)
+            let suffix = cleanup_invocation_files(&mut invocation_files)
                 .err()
-                .map(|cleanup| format!("; prompt cleanup also failed: {cleanup}"))
+                .map(|cleanup| format!("; temporary-file cleanup also failed: {cleanup}"))
                 .unwrap_or_default();
             return Err(failure_after_request(
                 &log,
@@ -563,7 +662,7 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                 .stateful
                 .as_ref()
                 .and_then(|stateful| stateful.abort(&exchange_id).err());
-            let cleanup = cleanup_prompt_file(&mut prompt_file).err();
+            let cleanup = cleanup_invocation_files(&mut invocation_files).err();
             return Err(failure_after_request(
                 &log,
                 "health_preflight_error",
@@ -583,7 +682,7 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                     .stateful
                     .as_ref()
                     .and_then(|stateful| stateful.abort(&exchange_id).err());
-                let cleanup = cleanup_prompt_file(&mut prompt_file).err();
+                let cleanup = cleanup_invocation_files(&mut invocation_files).err();
                 return Err(failure_after_request(
                     &log,
                     "lane_state_error",
@@ -604,7 +703,7 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                 .stateful
                 .as_ref()
                 .and_then(|stateful| stateful.abort(&exchange_id).err());
-            let cleanup = cleanup_prompt_file(&mut prompt_file).err();
+            let cleanup = cleanup_invocation_files(&mut invocation_files).err();
             return Err(failure_after_request(
                 &log,
                 "health_preflight_error",
@@ -660,13 +759,13 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                 ),
             };
             if let Some(Err(context_error)) = context_result {
-                let cleanup_error = cleanup_prompt_file(&mut prompt_file).err();
+                let cleanup_error = cleanup_invocation_files(&mut invocation_files).err();
                 let captured = reply_result.clone().unwrap_or_else(|error| error);
                 return match log_result {
                     Ok(completion) => {
                         let receipt = log.exchange_receipt(completion);
                         let suffix = cleanup_error
-                            .map(|error| format!("; prompt cleanup also failed: {error}"))
+                            .map(|error| format!("; temporary-file cleanup also failed: {error}"))
                             .unwrap_or_default();
                         let lane_suffix = lane_error_suffix(&lane_result);
                         Err(AskFailure::after_completion(
@@ -680,7 +779,7 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                     }
                     Err(log_error) => {
                         let suffix = cleanup_error
-                            .map(|error| format!("; prompt cleanup also failed: {error}"))
+                            .map(|error| format!("; temporary-file cleanup also failed: {error}"))
                             .unwrap_or_default();
                         let lane_suffix = lane_error_suffix(&lane_result);
                         Err(AskFailure::new(format!(
@@ -703,9 +802,9 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                     let health_suffix = health_error
                         .map(|error| format!("; health reporting also failed: {error}"))
                         .unwrap_or_default();
-                    let cleanup_suffix = cleanup_prompt_file(&mut prompt_file)
+                    let cleanup_suffix = cleanup_invocation_files(&mut invocation_files)
                         .err()
-                        .map(|error| format!("; prompt cleanup also failed: {error}"))
+                        .map(|error| format!("; temporary-file cleanup also failed: {error}"))
                         .unwrap_or_default();
                     let lane_suffix = lane_error_suffix(&lane_result);
                     return Err(AskFailure::new(format!(
@@ -735,9 +834,9 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                     return Err(AskFailure::after_completion(
                         format!(
                             "health completion logging failed after Grok ran; do not retry automatically: {health_error}{}{lane_suffix}\nCaptured result:\n{captured}",
-                            cleanup_prompt_file(&mut prompt_file)
+                            cleanup_invocation_files(&mut invocation_files)
                                 .err()
-                                .map(|error| format!("; prompt cleanup also failed: {error}"))
+                                .map(|error| format!("; temporary-file cleanup also failed: {error}"))
                                 .unwrap_or_default()
                         ),
                         receipt,
@@ -753,12 +852,12 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                     let _ = reporter.footer_missing(&receipt);
                 }
             }
-            if let Err(error) = cleanup_prompt_file(&mut prompt_file) {
+            if let Err(error) = cleanup_invocation_files(&mut invocation_files) {
                 let captured = reply_result.unwrap_or_else(|error| error);
                 let lane_suffix = lane_error_suffix(&lane_result);
                 return Err(AskFailure::after_completion(
                     format!(
-                        "prompt-file cleanup failed after the agent ran; do not retry automatically: {error}{lane_suffix}\nCaptured result:\n{captured}"
+                        "temporary-file cleanup failed after the agent ran; do not retry automatically: {error}{lane_suffix}\nCaptured result:\n{captured}"
                     ),
                     receipt,
                 )
@@ -788,7 +887,7 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                 .stateful
                 .as_ref()
                 .and_then(|stateful| stateful.abort(&exchange_id).err());
-            let cleanup_error = cleanup_prompt_file(&mut prompt_file).err();
+            let cleanup_error = cleanup_invocation_files(&mut invocation_files).err();
             let error = append_lane_cleanup(
                 join_preflight_errors(&error, abort_error, cleanup_error),
                 lane_cleanup,
@@ -844,11 +943,8 @@ fn failure_after_request(log: &ExchangeLog, status: &str, error: &str) -> AskFai
     }
 }
 
-fn cleanup_prompt_file(file: &mut Option<PromptFile>) -> Result<(), String> {
-    match file.take() {
-        Some(file) => file.cleanup().map_err(|error| error.to_string()),
-        None => Ok(()),
-    }
+fn cleanup_invocation_files(files: &mut InvocationFiles) -> Result<(), String> {
+    files.cleanup()
 }
 
 fn consume_grants(grants: &mut Option<GrantSet>) -> Result<(), String> {
@@ -883,7 +979,7 @@ fn join_preflight_errors(
         message.push_str(&format!("; context rollback also failed: {error}"));
     }
     if let Some(error) = cleanup_error {
-        message.push_str(&format!("; prompt cleanup also failed: {error}"));
+        message.push_str(&format!("; temporary-file cleanup also failed: {error}"));
     }
     message
 }

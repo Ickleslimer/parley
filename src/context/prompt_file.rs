@@ -8,28 +8,33 @@ use super::error::{ContextError, ErrorKind};
 use super::journal::{resolve_state_root, StateDirEnv};
 use super::winfile::refuse_reparse_chain;
 
-const PREFIX: &str = "parley-prompt-";
+const PROMPT_DIRECTORY: &str = "prompt-temp";
+const PROMPT_PREFIX: &str = "parley-prompt-";
+const AGENT_PROFILE_DIRECTORY: &str = "agent-profile-temp";
+const AGENT_PROFILE_PREFIX: &str = "parley-agent-profile-";
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
-pub(crate) struct PromptFile {
+struct OwnedTempFile {
     path: PathBuf,
 }
 
-impl PromptFile {
-    pub(crate) fn create(contents: &str) -> Result<Self, ContextError> {
-        let root = resolve_state_root(&StateDirEnv::from_process())?;
-        Self::create_at(&root, contents)
-    }
-
-    fn create_at(root: &Path, contents: &str) -> Result<Self, ContextError> {
+impl OwnedTempFile {
+    fn create_at(
+        root: &Path,
+        directory_name: &str,
+        prefix: &str,
+        extension: &str,
+        contents: &str,
+        label: &str,
+    ) -> Result<Self, ContextError> {
         if !root.is_absolute() {
             return Err(ContextError::new(
                 ErrorKind::Io,
                 format!("context state root must be absolute: {}", root.display()),
             ));
         }
-        let directory = root.join("prompt-temp");
+        let directory = root.join(directory_name);
         refuse_reparse_chain(root)?;
         ensure_directory(root)?;
         ensure_directory(&directory)?;
@@ -37,7 +42,7 @@ impl PromptFile {
 
         for _ in 0..32 {
             let name = format!(
-                "{PREFIX}{}-{}-{}.txt",
+                "{prefix}{}-{}-{}.{extension}",
                 std::process::id(),
                 timestamp_ms(),
                 COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -49,37 +54,125 @@ impl PromptFile {
                     file.write_all(contents.as_bytes())
                         .and_then(|_| file.flush())
                         .and_then(|_| file.sync_all())
-                        .map_err(|error| io_error("write prompt file", &path, error))?;
+                        .map_err(|error| io_error(&format!("write {label}"), &path, error))?;
                     return Ok(Self { path });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(io_error("create prompt file", &path, error)),
+                Err(error) => {
+                    return Err(io_error(&format!("create {label}"), &path, error));
+                }
             }
         }
         Err(ContextError::new(
             ErrorKind::Io,
-            "could not allocate a unique prompt file",
+            format!("could not allocate a unique {label}"),
         ))
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn cleanup(self) -> Result<(), ContextError> {
+    fn cleanup(self, label: &str) -> Result<(), ContextError> {
         refuse_reparse_chain(&self.path)?;
         fs::remove_file(&self.path)
-            .map_err(|error| io_error("remove prompt file", &self.path, error))
+            .map_err(|error| io_error(&format!("remove {label}"), &self.path, error))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PromptFile(OwnedTempFile);
+
+impl PromptFile {
+    pub(crate) fn create(contents: &str) -> Result<Self, ContextError> {
+        let root = resolve_state_root(&StateDirEnv::from_process())?;
+        Self::create_at(&root, contents)
+    }
+
+    fn create_at(root: &Path, contents: &str) -> Result<Self, ContextError> {
+        OwnedTempFile::create_at(
+            root,
+            PROMPT_DIRECTORY,
+            PROMPT_PREFIX,
+            "txt",
+            contents,
+            "prompt file",
+        )
+        .map(Self)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    pub(crate) fn cleanup(self) -> Result<(), ContextError> {
+        self.0.cleanup("prompt file")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentProfileFile(OwnedTempFile);
+
+impl AgentProfileFile {
+    pub(crate) fn create(contents: &str) -> Result<Self, ContextError> {
+        let root = resolve_state_root(&StateDirEnv::from_process())?;
+        Self::create_at(&root, contents)
+    }
+
+    fn create_at(root: &Path, contents: &str) -> Result<Self, ContextError> {
+        OwnedTempFile::create_at(
+            root,
+            AGENT_PROFILE_DIRECTORY,
+            AGENT_PROFILE_PREFIX,
+            "md",
+            contents,
+            "agent profile file",
+        )
+        .map(Self)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    pub(crate) fn cleanup(self) -> Result<(), ContextError> {
+        self.0.cleanup("agent profile file")
     }
 }
 
 pub(crate) fn cleanup_stale_prompt_files(max_age: Duration) -> Result<(), ContextError> {
     let root = resolve_state_root(&StateDirEnv::from_process())?;
-    cleanup_stale_prompt_files_at(&root, max_age)
+    cleanup_stale_owned_files_at(
+        &root,
+        PROMPT_DIRECTORY,
+        PROMPT_PREFIX,
+        ".txt",
+        max_age,
+        "prompt",
+    )
 }
 
-fn cleanup_stale_prompt_files_at(root: &Path, max_age: Duration) -> Result<(), ContextError> {
-    let directory = root.join("prompt-temp");
+pub(crate) fn cleanup_stale_agent_profile_files(max_age: Duration) -> Result<(), ContextError> {
+    let root = resolve_state_root(&StateDirEnv::from_process())?;
+    cleanup_stale_owned_files_at(
+        &root,
+        AGENT_PROFILE_DIRECTORY,
+        AGENT_PROFILE_PREFIX,
+        ".md",
+        max_age,
+        "agent profile",
+    )
+}
+
+fn cleanup_stale_owned_files_at(
+    root: &Path,
+    directory_name: &str,
+    prefix: &str,
+    suffix: &str,
+    max_age: Duration,
+    label: &str,
+) -> Result<(), ContextError> {
+    let directory = root.join(directory_name);
     if !directory.exists() {
         return Ok(());
     }
@@ -94,20 +187,20 @@ fn cleanup_stale_prompt_files_at(root: &Path, max_age: Duration) -> Result<(), C
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !name.starts_with(PREFIX) || !name.ends_with(".txt") {
+        if !name.starts_with(prefix) || !name.ends_with(suffix) {
             continue;
         }
         let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| io_error("inspect stale prompt file", &path, error))?;
+            .map_err(|error| io_error(&format!("inspect stale {label} file"), &path, error))?;
         if is_reparse(&metadata) || !metadata.is_file() {
             continue;
         }
         let modified = metadata
             .modified()
-            .map_err(|error| io_error("inspect prompt file timestamp", &path, error))?;
+            .map_err(|error| io_error(&format!("inspect {label} file timestamp"), &path, error))?;
         if now.duration_since(modified).unwrap_or_default() > max_age {
             fs::remove_file(&path)
-                .map_err(|error| io_error("remove stale prompt file", &path, error))?;
+                .map_err(|error| io_error(&format!("remove stale {label} file"), &path, error))?;
         }
     }
     Ok(())
@@ -193,11 +286,19 @@ mod tests {
         let root = root("stale");
         let owned = PromptFile::create_at(&root, "stale").unwrap();
         let owned_path = owned.path().to_path_buf();
-        let directory = root.join("prompt-temp");
+        let directory = root.join(PROMPT_DIRECTORY);
         let unrelated = directory.join("keep-me.txt");
         fs::write(&unrelated, "evidence").unwrap();
         std::thread::sleep(Duration::from_millis(2));
-        cleanup_stale_prompt_files_at(&root, Duration::ZERO).unwrap();
+        cleanup_stale_owned_files_at(
+            &root,
+            PROMPT_DIRECTORY,
+            PROMPT_PREFIX,
+            ".txt",
+            Duration::ZERO,
+            "prompt",
+        )
+        .unwrap();
         assert!(!owned_path.exists());
         assert_eq!(fs::read_to_string(&unrelated).unwrap(), "evidence");
         fs::remove_dir_all(root).unwrap();
@@ -207,5 +308,55 @@ mod tests {
     fn rejects_relative_state_roots() {
         let error = PromptFile::create_at(Path::new("relative-state"), "prompt").unwrap_err();
         assert!(error.to_string().contains("must be absolute"));
+    }
+
+    #[test]
+    fn agent_profiles_use_an_isolated_owned_namespace() {
+        let root = root("agent-profile");
+        let profile = AgentProfileFile::create_at(&root, "---\nname: test\n---\n").unwrap();
+        let profile_path = profile.path().to_path_buf();
+        assert_eq!(
+            profile_path.parent().unwrap(),
+            root.join(AGENT_PROFILE_DIRECTORY)
+        );
+        assert!(profile_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(AGENT_PROFILE_PREFIX));
+        assert_eq!(
+            fs::read_to_string(&profile_path).unwrap(),
+            "---\nname: test\n---\n"
+        );
+        profile.cleanup().unwrap();
+        assert!(!profile_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_profile_cleanup_does_not_remove_prompt_or_unrelated_files() {
+        let root = root("agent-profile-stale");
+        let profile = AgentProfileFile::create_at(&root, "profile").unwrap();
+        let profile_path = profile.path().to_path_buf();
+        let prompt = PromptFile::create_at(&root, "prompt").unwrap();
+        let prompt_path = prompt.path().to_path_buf();
+        let directory = root.join(AGENT_PROFILE_DIRECTORY);
+        let unrelated = directory.join("keep-me.md");
+        fs::write(&unrelated, "evidence").unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        cleanup_stale_owned_files_at(
+            &root,
+            AGENT_PROFILE_DIRECTORY,
+            AGENT_PROFILE_PREFIX,
+            ".md",
+            Duration::ZERO,
+            "agent profile",
+        )
+        .unwrap();
+        assert!(!profile_path.exists());
+        assert!(prompt_path.exists());
+        assert_eq!(fs::read_to_string(&unrelated).unwrap(), "evidence");
+        prompt.cleanup().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }

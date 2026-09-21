@@ -16,7 +16,9 @@ mod winfile;
 
 pub(crate) use journal::{ContextKey, JournalStore, StateDirEnv};
 pub(crate) use plan::{ContextBounds, ContextPlan, PlanKind};
-pub(crate) use prompt_file::{cleanup_stale_prompt_files, PromptFile};
+pub(crate) use prompt_file::{
+    cleanup_stale_agent_profile_files, cleanup_stale_prompt_files, AgentProfileFile, PromptFile,
+};
 pub(crate) use root::{
     resolve_codex_rollout, resolve_codex_sessions_root, CodexHomeEnv, ResolvedSource,
 };
