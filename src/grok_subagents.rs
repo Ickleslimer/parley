@@ -12,6 +12,7 @@ use crate::lane_grants::{
 };
 use crate::policy::RuntimePolicy;
 
+const PARENT_NAME: &str = "two-chairs-parent";
 const WRITER_NAME: &str = "two-chairs-writer";
 const REVIEWER_NAME: &str = "two-chairs-reviewer";
 const PARENT_TOOLS: &str = "read_file,list_dir,grep,search_replace,write,task,get_command_or_subagent_output,wait_commands_or_subagents";
@@ -156,6 +157,8 @@ impl GuardedSubagentLaunch {
         let mut immutable_arguments = vec![
             "--agents".to_string(),
             agent_definitions_json(),
+            "--agent".to_string(),
+            PARENT_NAME.to_string(),
             "--tools".to_string(),
             PARENT_TOOLS.to_string(),
             "--disallowed-tools".to_string(),
@@ -315,6 +318,7 @@ pub(crate) fn append_parent_contract(prompt: &mut String, plan: &LanePlan) {
 
 fn agent_definitions_json() -> String {
     let mut definitions = BTreeMap::new();
+    definitions.insert(PARENT_NAME.to_string(), parent_agent_definition());
     definitions.insert(
         WRITER_NAME.to_string(),
         agent_definition(
@@ -332,6 +336,53 @@ fn agent_definitions_json() -> String {
         ),
     );
     Json::Object(definitions).to_compact_string()
+}
+
+fn parent_agent_definition() -> Json {
+    let mut definition = BTreeMap::new();
+    definition.insert("agentsMd".to_string(), Json::Bool(false));
+    definition.insert(
+        "description".to_string(),
+        Json::Str("Guarded Two Chairs parent".to_string()),
+    );
+    definition.insert("discoverSkills".to_string(), Json::Bool(false));
+    definition.insert(
+        "disallowedTools".to_string(),
+        Json::Array(
+            PARENT_DENIES
+                .split(',')
+                .map(|tool| Json::Str(tool.to_string()))
+                .collect(),
+        ),
+    );
+    definition.insert("inheritSkills".to_string(), Json::Bool(false));
+    definition.insert("injectDefaultTools".to_string(), Json::Bool(false));
+    definition.insert("mcpInheritance".to_string(), Json::Str("none".to_string()));
+    definition.insert("model".to_string(), Json::Str("inherit".to_string()));
+    definition.insert(
+        "prompt".to_string(),
+        Json::Str("You are the guarded Two Chairs parent. Work only inside the current lane contract. Spawn only the explicitly granted two-chairs-writer or two-chairs-reviewer children, always with the exact required subagent_type, cwd, and isolation:none. Independently review every child result and report all child IDs, grants, changes, tests, failures, and denials.".to_string()),
+    );
+    definition.insert(
+        "tools".to_string(),
+        Json::Array(
+            [
+                "read_file",
+                "list_dir",
+                "grep",
+                "search_replace",
+                "write",
+                "task",
+                "Agent(two-chairs-writer,two-chairs-reviewer)",
+                "get_command_or_subagent_output",
+                "wait_commands_or_subagents",
+            ]
+            .into_iter()
+            .map(|tool| Json::Str(tool.to_string()))
+            .collect(),
+        ),
+    );
+    Json::Object(definition)
 }
 
 fn agent_definition(description: &str, capability: &str, tools: &[&str]) -> Json {
@@ -494,6 +545,17 @@ mod tests {
     #[test]
     fn agent_definitions_are_closed_and_inherit_the_model() {
         let value = Json::parse(&agent_definitions_json()).unwrap();
+        let parent = value.get(PARENT_NAME).unwrap();
+        let parent_tools = parent.get("tools").and_then(Json::as_array).unwrap();
+        assert!(parent_tools
+            .iter()
+            .any(|tool| tool.as_str() == Some("task")));
+        assert!(parent_tools
+            .iter()
+            .any(|tool| { tool.as_str() == Some("Agent(two-chairs-writer,two-chairs-reviewer)") }));
+        assert!(!parent_tools
+            .iter()
+            .any(|tool| tool.as_str() == Some("run_terminal_cmd")));
         let writer = value.get(WRITER_NAME).unwrap();
         assert_eq!(
             writer.get("capabilityMode").and_then(Json::as_str),
@@ -531,6 +593,10 @@ mod tests {
             .args
             .iter()
             .any(|argument| argument == "--agents"));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|arguments| arguments == ["--agent", PARENT_NAME]));
         assert!(invocation
             .args
             .iter()
