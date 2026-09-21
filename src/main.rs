@@ -21,6 +21,7 @@ mod mcp;
 mod model;
 mod policy;
 mod process;
+mod profile_namespace;
 mod session;
 mod sha256;
 mod signals;

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ask::AskRequest;
 use crate::context::refuse_reparse_chain;
+use crate::profile_namespace;
 use crate::signals::fnv1a_64;
 
 pub(crate) struct ExecutionLease {
@@ -21,7 +22,7 @@ impl ExecutionLease {
         if req.harness != "grok" {
             return Ok(Self { _files: Vec::new() });
         }
-        let caller = env::var("PARLEY_CALLER").unwrap_or_else(|_| "default".to_string());
+        let profile_namespace = profile_namespace::from_env()?;
         let session = req
             .session_id
             .as_deref()
@@ -38,7 +39,7 @@ impl ExecutionLease {
         acquire(
             &root,
             vec![
-                LockKey::new("profile", &caller),
+                LockKey::new("profile", &profile_namespace),
                 LockKey::new("session", session),
                 LockKey::new("worktree", &path_key(&canonical_cwd)),
             ],

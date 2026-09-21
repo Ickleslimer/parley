@@ -23,6 +23,7 @@ use crate::json::Json;
 use crate::lane_plan;
 use crate::policy::RuntimePolicy;
 use crate::process::CancellationToken;
+use crate::profile_namespace;
 
 #[derive(Clone)]
 pub(crate) struct JobRuntime {
@@ -103,11 +104,11 @@ impl JobRuntime {
                     .to_string(),
             );
         }
-        let caller = env::var("PARLEY_CALLER").unwrap_or_else(|_| "parley".to_string());
+        let profile_namespace = profile_namespace::from_env()?;
         let store = Arc::new(
             JobStore::open(&JobStateEnv {
                 job_state_dir: Some(state_root.clone()),
-                caller: Some(caller.clone()),
+                caller: Some(profile_namespace.clone()),
                 localappdata: env::var_os("LOCALAPPDATA").map(PathBuf::from),
             })
             .map_err(|error| error.to_string())?,
@@ -115,7 +116,7 @@ impl JobRuntime {
         store
             .recover_startup()
             .map_err(|error| format!("recover asynchronous jobs: {error}"))?;
-        let escrow_dir = state_root.join("escrow").join(caller);
+        let escrow_dir = state_root.join("escrow").join(profile_namespace);
         Ok(Self {
             inner: Some(Arc::new(RuntimeInner {
                 store,
