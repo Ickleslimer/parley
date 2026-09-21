@@ -1,7 +1,7 @@
 use parley_health::command::{analyze_command, HealthBinary};
 use parley_health::scope::{
-    canonical_contains, normalize_windows_path, paths_equivalent, query_matches_installed,
-    worktrees_from_common_dir, ExecutableIdentity,
+    canonical_contains, canonical_contains_existing, normalize_windows_path, paths_equivalent,
+    query_matches_installed, worktrees_from_common_dir, ExecutableIdentity,
 };
 
 mod common;
@@ -14,6 +14,15 @@ fn component_boundary_matching_rejects_sibling_prefixes() {
     assert!(!canonical_contains(r"C:\proj", r"C:\proj-evil"));
     assert!(!canonical_contains(r"C:\proj", r"C:\project"));
     assert!(!canonical_contains(r"C:\proj", r"C:\pro"));
+}
+
+#[test]
+fn existing_scope_check_rejects_missing_candidates() {
+    let home = common::TempHome::new("missing-scope");
+    assert!(!canonical_contains_existing(
+        &home.paths.root.to_string_lossy(),
+        &home.paths.root.join("missing").to_string_lossy()
+    ));
 }
 
 #[test]

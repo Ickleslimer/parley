@@ -130,6 +130,19 @@ pub fn replace_file(source: &Path, destination: &Path) -> Result<(), HealthError
 }
 
 pub fn file_identity(path: &Path) -> io::Result<FileIdentity> {
+    #[cfg(windows)]
+    let file = if path.is_dir() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        apply_share_mode(&mut options);
+        options.open(path)?
+    } else {
+        open_shared_read(path)?
+    };
+    #[cfg(not(windows))]
     let file = open_shared_read(path)?;
     identity_from_file(&file)
 }

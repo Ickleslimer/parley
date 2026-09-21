@@ -3,6 +3,7 @@ pub mod command;
 pub mod hook;
 pub mod inbox;
 pub mod instance;
+pub mod integration;
 pub mod journal;
 pub mod model;
 pub mod paths;

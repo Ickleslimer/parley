@@ -251,7 +251,7 @@ pub fn parse_tool_command(
 pub fn is_shell_tool(tool_name: &str) -> bool {
     matches!(
         tool_name.to_ascii_lowercase().as_str(),
-        "bash" | "shell" | "powershell" | "pwsh" | "cmd" | "terminal"
+        "bash" | "shell" | "powershell" | "pwsh" | "cmd" | "terminal" | "run_terminal_command"
     )
 }
 

@@ -19,15 +19,22 @@ use std::path::{Path, PathBuf};
 
 use crate::ask::{self, AskRequest, ContextRef};
 use crate::cli::{McpMode, McpOptions};
+use crate::event_log::ExchangeReceipt;
 use crate::fsx;
 use crate::fuse;
 use crate::harness::{normalize_harness, Invocation};
+use crate::health_report::HealthReporter;
 use crate::json::Json;
 use crate::policy::RuntimePolicy;
 use crate::process::{capture_invocation, run_invocation};
 use crate::session;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+struct HandledResponse {
+    json: Json,
+    delivery: Option<ExchangeReceipt>,
+}
 
 /// Route a `par mcp ...` invocation to the right handler.
 pub(crate) fn dispatch(options: McpOptions) -> Result<(), String> {
@@ -61,6 +68,7 @@ pub(crate) fn dispatch(options: McpOptions) -> Result<(), String> {
 pub(crate) fn run(_options: McpOptions) -> Result<(), String> {
     let cwd = env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?;
     let policy = RuntimePolicy::from_env()?;
+    let reporter = HealthReporter::from_env()?;
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -72,17 +80,65 @@ pub(crate) fn run(_options: McpOptions) -> Result<(), String> {
             continue;
         }
         let response = match Json::parse(trimmed) {
-            Ok(request) => handle_request_with_policy(&request, &cwd, &policy),
-            Err(_) => Some(error_response(&Json::Null, -32700, "parse error")),
+            Ok(request) => handle_request_with_receipt(&request, &cwd, &policy),
+            Err(_) => Some(HandledResponse {
+                json: error_response(&Json::Null, -32700, "parse error"),
+                delivery: None,
+            }),
         };
         if let Some(response) = response {
-            writeln!(out, "{}", response.to_compact_string())
-                .map_err(|e| format!("stdout write error: {e}"))?;
-            out.flush()
-                .map_err(|e| format!("stdout flush error: {e}"))?;
+            write_mcp_response(&mut out, &response, &reporter)?;
         }
     }
     Ok(())
+}
+
+fn write_mcp_response(
+    out: &mut impl Write,
+    response: &HandledResponse,
+    reporter: &HealthReporter,
+) -> Result<(), String> {
+    let mut payload = response.json.to_compact_string().into_bytes();
+    payload.push(b'\n');
+    if let Err(error) = out.write_all(&payload) {
+        return Err(stdout_delivery_error(
+            "write",
+            error,
+            response.delivery.as_ref(),
+            reporter,
+        ));
+    }
+    if let Err(error) = out.flush() {
+        return Err(stdout_delivery_error(
+            "flush",
+            error,
+            response.delivery.as_ref(),
+            reporter,
+        ));
+    }
+    Ok(())
+}
+
+fn stdout_delivery_error(
+    stage: &str,
+    error: io::Error,
+    receipt: Option<&ExchangeReceipt>,
+    reporter: &HealthReporter,
+) -> String {
+    let base = format!("stdout {stage} error: {error}");
+    let Some(receipt) = receipt else {
+        return base;
+    };
+    match reporter.mcp_stdout_undelivered(receipt) {
+        Ok(()) => format!(
+            "{base}; recorded mcp_stdout_undelivered for response event {} exchange {}",
+            receipt.completion.event_id, receipt.completion.exchange_id
+        ),
+        Err(report_error) => format!(
+            "{base}; failed to record mcp_stdout_undelivered: {report_error}; response event {} exchange {} remains in the event log",
+            receipt.completion.event_id, receipt.completion.exchange_id
+        ),
+    }
 }
 
 /// Register `par mcp` as an MCP server inside a harness. For harnesses with a
@@ -308,26 +364,39 @@ pub(crate) fn handle_request(request: &Json, default_cwd: &Path) -> Option<Json>
     handle_request_with_policy(request, default_cwd, &RuntimePolicy::default())
 }
 
+#[cfg(test)]
 fn handle_request_with_policy(
     request: &Json,
     default_cwd: &Path,
     policy: &RuntimePolicy,
 ) -> Option<Json> {
+    handle_request_with_receipt(request, default_cwd, policy).map(|response| response.json)
+}
+
+fn handle_request_with_receipt(
+    request: &Json,
+    default_cwd: &Path,
+    policy: &RuntimePolicy,
+) -> Option<HandledResponse> {
     let method = request.get("method").and_then(Json::as_str).unwrap_or("");
     // Notifications carry no id and expect no reply.
     let id = request.get("id")?;
+    let mut delivery = None;
 
     let result = match method {
         "initialize" => Ok(initialize_result()),
         "tools/list" => Ok(tools_list_result()),
-        "tools/call" => call_tool(request, default_cwd, policy),
+        "tools/call" => call_tool(request, default_cwd, policy, &mut delivery),
         "ping" => Ok(obj(vec![])),
         other => Err((-32601, format!("method not found: {other}"))),
     };
 
-    Some(match result {
-        Ok(value) => success_response(id, value),
-        Err((code, message)) => error_response(id, code, &message),
+    Some(HandledResponse {
+        json: match result {
+            Ok(value) => success_response(id, value),
+            Err((code, message)) => error_response(id, code, &message),
+        },
+        delivery,
     })
 }
 
@@ -555,6 +624,7 @@ fn call_tool(
     request: &Json,
     default_cwd: &Path,
     policy: &RuntimePolicy,
+    delivery: &mut Option<ExchangeReceipt>,
 ) -> Result<Json, (i64, String)> {
     let params = request
         .get("params")
@@ -652,12 +722,25 @@ fn call_tool(
                     .map(|n| n as usize)
                     .unwrap_or(session::DEFAULT_CONTEXT_CHARS),
             };
-            match ask::run(&request) {
-                Ok(out) => match out.reply() {
-                    Ok(reply) => Ok(text_content(&reply, false)),
+            match ask::run_with_receipt(&request) {
+                Ok(outcome) => match outcome.captured.reply() {
+                    Ok(reply) => {
+                        if is_logged_grok_response(&outcome.receipt) {
+                            *delivery = Some(outcome.receipt);
+                        }
+                        Ok(text_content(&reply, false))
+                    }
                     Err(msg) => Ok(text_content(&format!("{harness} failed: {msg}"), true)),
                 },
-                Err(e) => Ok(text_content(&e, true)),
+                Err(failure) => {
+                    if let Some(receipt) = failure
+                        .receipt
+                        .filter(|receipt| is_logged_grok_response(receipt))
+                    {
+                        *delivery = Some(*receipt);
+                    }
+                    Ok(text_content(&failure.message, true))
+                }
             }
         }
         "fuse" => {
@@ -747,6 +830,15 @@ fn call_tool(
         }
         other => Err((-32602, format!("unknown tool: {other}"))),
     }
+}
+
+fn is_logged_grok_response(receipt: &ExchangeReceipt) -> bool {
+    receipt.target == "grok"
+        && receipt.request.logged
+        && receipt.request.event_type == "request"
+        && receipt.completion.logged
+        && receipt.completion.event_type == "response"
+        && receipt.request.exchange_id == receipt.completion.exchange_id
 }
 
 fn optional_positive_integer(args: &Json, name: &str) -> Result<Option<String>, (i64, String)> {
@@ -839,10 +931,37 @@ fn obj(pairs: Vec<(&str, Json)>) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_log::EventReceipt;
+    use std::io::ErrorKind;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    enum FailureStage {
+        Write,
+        Flush,
+    }
+
+    struct FailingWriter {
+        stage: FailureStage,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            match self.stage {
+                FailureStage::Write => Err(io::Error::new(ErrorKind::BrokenPipe, "closed")),
+                FailureStage::Flush => Ok(buffer.len()),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            match self.stage {
+                FailureStage::Write => Ok(()),
+                FailureStage::Flush => Err(io::Error::new(ErrorKind::BrokenPipe, "closed")),
+            }
+        }
+    }
 
     fn cwd() -> PathBuf {
         PathBuf::from("/tmp/nonexistent-par-test-dir")
@@ -873,6 +992,63 @@ mod tests {
             .and_then(|error| error.get("message"))
             .and_then(Json::as_str)
             .expect("expected JSON-RPC error")
+    }
+
+    fn delivery_receipt() -> ExchangeReceipt {
+        let event = |event_type: &str, event_id: &str| EventReceipt {
+            event_id: event_id.to_string(),
+            exchange_id: "exchange-delivery-1".to_string(),
+            timestamp_ms: 42,
+            event_type: event_type.to_string(),
+            session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903".to_string()),
+            logged: true,
+        };
+        ExchangeReceipt {
+            request: event("request", "event-request-1"),
+            completion: event("response", "event-response-1"),
+            target: "grok".to_string(),
+        }
+    }
+
+    #[test]
+    fn stdout_write_and_flush_failures_report_exact_undelivered_response_once() {
+        for (label, stage) in [
+            ("write", FailureStage::Write),
+            ("flush", FailureStage::Flush),
+        ] {
+            let inbox = temp_root().join(label);
+            let reporter = HealthReporter::at(inbox.clone());
+            let response = HandledResponse {
+                json: success_response(&Json::Number(1.0), text_content("exact reply", false)),
+                delivery: Some(delivery_receipt()),
+            };
+            let error =
+                write_mcp_response(&mut FailingWriter { stage }, &response, &reporter).unwrap_err();
+            assert!(error.contains(&format!("stdout {label} error")));
+            assert!(error.contains("event-response-1"));
+            assert!(error.contains("exchange-delivery-1"));
+
+            let files = fs::read_dir(&inbox)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+            assert_eq!(files.len(), 1);
+            let record = Json::parse(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+            assert_eq!(
+                record.get("class").and_then(Json::as_str),
+                Some("mcp_stdout_undelivered")
+            );
+            assert_eq!(
+                record.get("event_id").and_then(Json::as_str),
+                Some("event-response-1")
+            );
+            assert_eq!(
+                record.get("exchange_id").and_then(Json::as_str),
+                Some("exchange-delivery-1")
+            );
+            fs::remove_dir_all(inbox.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]

@@ -12,12 +12,12 @@ impl Harness for GrokHarness {
         let policy = RuntimePolicy::from_env()?;
         Ok(Invocation::new(
             "grok",
-            build_args(request, policy.grok_denies()),
+            build_args(request, policy.grok_denies(), policy.grok_allows()),
         ))
     }
 }
 
-fn build_args(request: &Request, denies: &[String]) -> Vec<String> {
+fn build_args(request: &Request, denies: &[String], allows: &[String]) -> Vec<String> {
     let mut args = vec!["--no-auto-update".to_string()];
     if let Some(prompt) = &request.prompt {
         args.extend(["--single".to_string(), prompt.clone()]);
@@ -57,6 +57,9 @@ fn build_args(request: &Request, denies: &[String]) -> Vec<String> {
     for rule in denies {
         args.extend(["--deny".to_string(), rule.clone()]);
     }
+    for rule in allows {
+        args.extend(["--allow".to_string(), rule.clone()]);
+    }
     add_passthrough(args, request)
 }
 
@@ -94,7 +97,11 @@ mod tests {
         req.permission_mode = Some("auto".to_string());
         req.max_turns = Some("30".to_string());
         req.session_id = Some("01a06582-d66e-7811-b0c9-0b0266e17903".to_string());
-        let args = build_args(&req, &["WebSearch".to_string()]);
+        let args = build_args(
+            &req,
+            &["WebSearch".to_string()],
+            &["Bash(*parley-health-query.exe*)".to_string()],
+        );
         assert_eq!(
             args,
             vec![
@@ -115,6 +122,8 @@ mod tests {
                 "01a06582-d66e-7811-b0c9-0b0266e17903",
                 "--deny",
                 "WebSearch",
+                "--allow",
+                "Bash(*parley-health-query.exe*)",
             ]
         );
     }
@@ -126,7 +135,7 @@ mod tests {
         req.resume_id = Some("latest".to_string());
         req.yolo = true;
         req.passthrough = vec!["--verbose".to_string()];
-        let args = build_args(&req, &[]);
+        let args = build_args(&req, &[], &[]);
         assert!(args.iter().any(|arg| arg == "--continue"));
         assert!(args.iter().any(|arg| arg == "--always-approve"));
         assert!(args.ends_with(&["--verbose".to_string()]));

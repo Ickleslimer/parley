@@ -6,8 +6,10 @@ use crate::inbox::{self, InboxReadError};
 use crate::journal;
 use crate::model::{codex_record, durable_state, ApplyOutcome, HealthModel};
 use crate::paths::HealthPaths;
-use crate::sampler::CodexSampler;
-use crate::schema::{now_ms, HealthError, HealthRecord, INBOX_BATCH, POLL_MS, SCHEMA_VERSION};
+use crate::sampler::{AppServerSampler, CodexSampler};
+use crate::schema::{
+    now_ms, HealthError, HealthRecord, CODEX_SAMPLE_MS, INBOX_BATCH, POLL_MS, SCHEMA_VERSION,
+};
 use crate::scope::{ScopeFile, ScopeUpdate};
 use crate::snapshot;
 use crate::sound::{SilentSound, Sound, SoundKind};
@@ -85,15 +87,29 @@ impl Supervisor {
         scope.save(&self.paths.scope())
     }
 
+    pub fn refresh_scope_cache(&mut self) -> Result<(), HealthError> {
+        let mut scope = ScopeFile::load(&self.paths.scope())?;
+        scope.refresh_cached_roots();
+        scope.save(&self.paths.scope())
+    }
+
     pub fn poll_sampler(
         &mut self,
         sampler: &dyn CodexSampler,
         now_ms: u64,
     ) -> Result<TickOutcome, HealthError> {
         let mut outcome = TickOutcome::default();
-        if let Some(sample) = sampler.sample().map_err(HealthError::msg)? {
-            let record = codex_record(sample, format!("codex-sample-{now_ms}"));
-            self.apply_live(record, now_ms, &mut outcome)?;
+        match sampler.sample() {
+            Ok(Some(sample)) => {
+                let record = codex_record(sample, format!("codex-sample-{now_ms}"));
+                self.apply_live(record, now_ms, &mut outcome)?;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.model.diagnostics.codex_sample_failures += 1;
+                self.model.diagnostics.last_codex_sample_failure_ms = Some(now_ms);
+                self.persist(now_ms)?;
+            }
         }
         Ok(outcome)
     }
@@ -212,13 +228,25 @@ pub fn run_forever() -> Result<(), HealthError> {
     let _guard = crate::instance::acquire(r"Local\ParleyHealthSupervisor")?;
     let paths = HealthPaths::from_env();
     let mut supervisor = Supervisor::open(paths)?;
+    let sampler = AppServerSampler::new();
+    let mut next_sample_ms = 0;
+    let mut next_scope_refresh_ms = 0;
     #[cfg(windows)]
     {
         supervisor.set_sound(Box::new(crate::sound::WindowsSound::from_install()));
         install_shutdown_handler()?;
     }
     while !shutdown_requested() {
-        let _ = supervisor.tick(now_ms());
+        let current_ms = now_ms();
+        if current_ms >= next_sample_ms {
+            let _ = supervisor.poll_sampler(&sampler, current_ms);
+            next_sample_ms = current_ms.saturating_add(CODEX_SAMPLE_MS);
+        }
+        if current_ms >= next_scope_refresh_ms {
+            let _ = supervisor.refresh_scope_cache();
+            next_scope_refresh_ms = current_ms.saturating_add(CODEX_SAMPLE_MS);
+        }
+        let _ = supervisor.tick(current_ms);
         wait_poll();
     }
     Ok(())

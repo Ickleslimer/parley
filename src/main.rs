@@ -7,6 +7,7 @@ mod event_log;
 mod fsx;
 mod fuse;
 mod harness;
+mod health_report;
 mod installer;
 mod json;
 mod mcp;

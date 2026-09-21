@@ -17,6 +17,7 @@ pub const INBOX_BATCH: usize = 32;
 pub const SNAPSHOT_RETRY_COUNT: u32 = 5;
 pub const SNAPSHOT_RETRY_MS: u64 = 20;
 pub const POLL_MS: u64 = 250;
+pub const CODEX_SAMPLE_MS: u64 = 60_000;
 pub const MAX_ID_LEN: usize = 128;
 pub const MAX_CODE_LEN: usize = 80;
 pub const MAX_PLAN_LEN: usize = 64;
@@ -113,9 +114,11 @@ impl Source {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxKind {
+    RequestStarted,
     CodexSample,
     GrokStopFailure,
     ParleyObservation,
+    PolicyDiagnostic,
     Acknowledge,
     Mute,
     TestSound,
@@ -187,6 +190,8 @@ pub struct HealthRecord {
     pub last_sound_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_sound: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_code: Option<String>,
 }
 
 impl HealthRecord {
@@ -218,6 +223,7 @@ impl HealthRecord {
             sounded_incident_id: None,
             last_sound_ms: None,
             test_sound: None,
+            diagnostic_code: None,
         }
     }
 }
@@ -278,6 +284,10 @@ pub struct QueryDiagnostics {
     pub quarantined_inbox: u64,
     pub malformed_inbox: u64,
     pub sound_failures: u64,
+    pub footer_missing: u64,
+    pub codex_sample_failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_codex_sample_failure_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

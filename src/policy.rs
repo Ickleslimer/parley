@@ -124,6 +124,9 @@ pub(crate) struct RuntimePolicy {
     grok_require_session_id: bool,
     grok_max_turns: Option<u64>,
     grok_denies: Vec<String>,
+    grok_allows: Vec<String>,
+    grok_health_query_exe: Option<PathBuf>,
+    grok_require_handoff_footer: bool,
 }
 
 pub(crate) struct PolicyRequest<'a> {
@@ -150,6 +153,9 @@ impl Default for RuntimePolicy {
             grok_require_session_id: false,
             grok_max_turns: None,
             grok_denies: Vec::new(),
+            grok_allows: Vec::new(),
+            grok_health_query_exe: None,
+            grok_require_handoff_footer: false,
         }
     }
 }
@@ -194,11 +200,55 @@ impl RuntimePolicy {
             .map(|value| normalize_reasoning_effort(&value))
             .transpose()?;
         let grok_locked_permission_mode = env_nonempty("PARLEY_GROK_LOCKED_PERMISSION_MODE");
-        let grok_denies = if grok_locked_permission_mode.is_some() {
+        let mut grok_denies = if grok_locked_permission_mode.is_some() {
             hardened_grok_denies()
         } else {
             Vec::new()
         };
+        let grok_health_query_exe = match env_nonempty("PARLEY_GROK_HEALTH_QUERY_EXE") {
+            Some(value) => {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() || !path.is_file() {
+                    return Err(format!(
+                        "PARLEY_GROK_HEALTH_QUERY_EXE is not an existing absolute file: {}",
+                        path.display()
+                    ));
+                }
+                Some(fs::canonicalize(&path).map_err(|error| {
+                    format!(
+                        "canonicalize PARLEY_GROK_HEALTH_QUERY_EXE {}: {error}",
+                        path.display()
+                    )
+                })?)
+            }
+            None => None,
+        };
+        let grok_require_handoff_footer =
+            env_bool("PARLEY_GROK_REQUIRE_HANDOFF_FOOTER")?.unwrap_or(false);
+        if grok_require_handoff_footer && grok_health_query_exe.is_none() {
+            return Err(
+                "PARLEY_GROK_REQUIRE_HANDOFF_FOOTER requires PARLEY_GROK_HEALTH_QUERY_EXE"
+                    .to_string(),
+            );
+        }
+        let mut grok_allows = Vec::new();
+        if let Some(query) = &grok_health_query_exe {
+            if grok_locked_permission_mode.is_none() {
+                return Err(
+                    "PARLEY_GROK_HEALTH_QUERY_EXE requires PARLEY_GROK_LOCKED_PERMISSION_MODE"
+                        .to_string(),
+                );
+            }
+            let query_text = query.to_string_lossy();
+            grok_allows.push(format!("Bash(*{query_text}*)"));
+            if let Some(parent) = query.parent() {
+                for writer in ["parley-health-supervisor.exe", "parley-health-hook.exe"] {
+                    grok_denies.push(format!("Bash(*{}*)", parent.join(writer).to_string_lossy()));
+                }
+            }
+            grok_denies.push("Bash(*parley-health-supervisor.exe*)".to_string());
+            grok_denies.push("Bash(*parley-health-hook.exe*)".to_string());
+        }
 
         Ok(Self {
             allowed_cwd_root,
@@ -210,6 +260,9 @@ impl RuntimePolicy {
             grok_require_session_id: env_bool("PARLEY_GROK_REQUIRE_SESSION_ID")?.unwrap_or(false),
             grok_max_turns,
             grok_denies,
+            grok_allows,
+            grok_health_query_exe,
+            grok_require_handoff_footer,
         })
     }
 
@@ -354,6 +407,30 @@ impl RuntimePolicy {
 
     pub(crate) fn grok_denies(&self) -> &[String] {
         &self.grok_denies
+    }
+
+    pub(crate) fn grok_allows(&self) -> &[String] {
+        &self.grok_allows
+    }
+
+    pub(crate) fn requires_handoff_footer(&self) -> bool {
+        self.grok_require_handoff_footer
+    }
+
+    pub(crate) fn apply_handoff_contract(&self, harness: &str, prompt: &mut String) {
+        if harness != "grok" || !self.grok_require_handoff_footer {
+            return;
+        }
+        let Some(query) = &self.grok_health_query_exe else {
+            return;
+        };
+        prompt.push_str("\n\nTWO CHAIRS LOCKED RESPONSE CONTRACT\n");
+        prompt.push_str("Keep the normal final response self-contained. Immediately before finishing, invoke exactly this read-only command with no arguments, wrappers, redirects, or chaining:\n");
+        prompt.push_str(&format!("& \"{}\"\n", query.display()));
+        prompt.push_str("End the response with this exact field block, copying only current evidence from the query JSON:\n");
+        prompt.push_str("TWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: <usage_sample|quota_exhausted|unavailable>\nincident_id: <id|none>\nas_of_ms: <integer|unknown>\n");
+        prompt.push_str("Include event_id and exchange_id only when present. End with: continuity: not_authorized\n");
+        prompt.push_str("Stale or unavailable evidence never means the peer is down. Do not retry the query or authorize continuation.\n");
     }
 
     #[cfg(test)]

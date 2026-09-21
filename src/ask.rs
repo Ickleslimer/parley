@@ -12,8 +12,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::cli::{AskOptions, CliOptions};
-use crate::event_log::ExchangeLog;
+use crate::event_log::{ExchangeLog, ExchangeReceipt};
 use crate::harness::{normalize_harness, HarnessFactory, Invocation, Request};
+use crate::health_report::HealthReporter;
 use crate::policy::{PolicyRequest, RuntimePolicy};
 use crate::process::{capture_invocation_timeout, Captured, Timeouts};
 use crate::session;
@@ -42,6 +43,44 @@ pub(crate) struct AskRequest {
     pub yolo: bool,
     pub context: Option<ContextRef>,
     pub max_context_chars: usize,
+}
+
+pub(crate) struct AskOutcome {
+    pub(crate) captured: Captured,
+    pub(crate) receipt: ExchangeReceipt,
+}
+
+pub(crate) struct AskFailure {
+    pub(crate) message: String,
+    pub(crate) receipt: Option<Box<ExchangeReceipt>>,
+}
+
+impl AskFailure {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            receipt: None,
+        }
+    }
+
+    fn after_completion(message: impl Into<String>, receipt: ExchangeReceipt) -> Self {
+        Self {
+            message: message.into(),
+            receipt: Some(Box::new(receipt)),
+        }
+    }
+}
+
+impl From<String> for AskFailure {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for AskFailure {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
 }
 
 /// Build the headless invocation, injecting transcript context into the prompt
@@ -95,40 +134,128 @@ fn build_prepared(req: &AskRequest, prompt: String) -> Result<Invocation, String
 /// watchdog (configurable via `PARLEY_TIMEOUT` / `PARLEY_IDLE_TIMEOUT`) kills a
 /// hung agent so a single stuck panelist can't wedge a whole `fuse`.
 pub(crate) fn run(req: &AskRequest) -> Result<Captured, String> {
+    run_with_receipt(req)
+        .map(|outcome| outcome.captured)
+        .map_err(|failure| failure.message)
+}
+
+pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailure> {
     let req = prepare(req)?;
     let prompt = resolved_prompt(&req)?;
     let invocation = build_prepared(&req, prompt.clone())?;
     let log = ExchangeLog::start(&req, &prompt)?;
+    let reporter = HealthReporter::from_env()?;
+    if req.harness == "grok" {
+        if let Err(error) = reporter.request_started(log.request_receipt()) {
+            let _ = log.failure("health_preflight_error", &error, 0);
+            return Err(AskFailure::new(format!(
+                "health request logging failed before Grok launch; agent was not started: {error}"
+            )));
+        }
+    }
     let started = Instant::now();
     match capture_invocation_timeout(invocation, req.cwd.to_str(), Timeouts::from_env()) {
         Ok(out) => {
             let duration_ms = started.elapsed().as_millis();
-            let log_result = match out.reply() {
-                Ok(reply) => log.success(&reply, duration_ms),
+            let reply_result = out.reply();
+            let log_result = match &reply_result {
+                Ok(reply) => log.success(reply, duration_ms),
                 Err(error) => log.failure(
                     if out.timed_out { "timeout" } else { "error" },
-                    &error,
+                    error,
                     duration_ms,
                 ),
             };
-            if let Err(log_error) = log_result {
-                let captured = out.reply().unwrap_or_else(|error| error);
-                return Err(format!(
-                    "event log completion failed after the agent ran; do not retry automatically: {log_error}\nCaptured result:\n{captured}"
-                ));
+            let completion = match log_result {
+                Ok(receipt) => receipt,
+                Err(log_error) => {
+                    let health_error = if req.harness == "grok" {
+                        reporter.logging_failure(log.request_receipt()).err()
+                    } else {
+                        None
+                    };
+                    let captured = reply_result.unwrap_or_else(|error| error);
+                    let health_suffix = health_error
+                        .map(|error| format!("; health reporting also failed: {error}"))
+                        .unwrap_or_default();
+                    return Err(AskFailure::new(format!(
+                        "event log completion failed after the agent ran; do not retry automatically: {log_error}{health_suffix}\nCaptured result:\n{captured}"
+                    )));
+                }
+            };
+            let receipt = log.exchange_receipt(completion);
+            if req.harness == "grok" {
+                let health_result = if reply_result.is_ok() {
+                    reporter.grok_success(&receipt)
+                } else {
+                    reporter.turn_failure(
+                        &receipt,
+                        if out.timed_out {
+                            "watchdog_killed"
+                        } else {
+                            "turn_error"
+                        },
+                    )
+                };
+                if let Err(health_error) = health_result {
+                    let captured = reply_result.unwrap_or_else(|error| error);
+                    return Err(AskFailure::after_completion(
+                        format!(
+                            "health completion logging failed after Grok ran; do not retry automatically: {health_error}\nCaptured result:\n{captured}"
+                        ),
+                        receipt,
+                    ));
+                }
+                if RuntimePolicy::from_env()?.requires_handoff_footer()
+                    && reply_result
+                        .as_deref()
+                        .is_ok_and(|reply| !has_handoff_footer(reply))
+                {
+                    let _ = reporter.footer_missing(&receipt);
+                }
             }
-            Ok(out)
+            Ok(AskOutcome {
+                captured: out,
+                receipt,
+            })
         }
         Err(error) => {
             let duration_ms = started.elapsed().as_millis();
-            if let Err(log_error) = log.failure("error", &error, duration_ms) {
-                return Err(format!(
-                    "agent launch failed: {error}; event log completion also failed: {log_error}"
-                ));
+            let completion = match log.failure("error", &error, duration_ms) {
+                Ok(receipt) => receipt,
+                Err(log_error) => {
+                    return Err(AskFailure::new(format!(
+                        "agent launch failed: {error}; event log completion also failed: {log_error}"
+                    )));
+                }
+            };
+            if req.harness == "grok" {
+                let receipt = log.exchange_receipt(completion);
+                if let Err(health_error) = reporter.turn_failure(&receipt, "turn_error") {
+                    return Err(AskFailure::after_completion(
+                        format!(
+                            "agent launch failed: {error}; health completion also failed: {health_error}"
+                        ),
+                        receipt,
+                    ));
+                }
             }
-            Err(error)
+            Err(AskFailure::new(error))
         }
     }
+}
+
+fn has_handoff_footer(reply: &str) -> bool {
+    [
+        "TWO_CHAIRS_HANDOFF",
+        "peer:",
+        "evidence_class:",
+        "incident_id:",
+        "as_of_ms:",
+        "continuity: not_authorized",
+    ]
+    .iter()
+    .all(|field| reply.contains(field))
 }
 
 fn prepare(req: &AskRequest) -> Result<AskRequest, String> {
@@ -147,6 +274,7 @@ fn prepare(req: &AskRequest) -> Result<AskRequest, String> {
         resume_id: prepared.resume_id.as_deref(),
         passthrough: &[],
     })?;
+    policy.apply_handoff_contract(&prepared.harness, &mut prepared.prompt);
     Ok(prepared)
 }
 
@@ -224,5 +352,14 @@ mod tests {
         let c = parse_context_spec("co:abc-123");
         assert_eq!(c.harness, "co");
         assert_eq!(c.session, "abc-123");
+    }
+
+    #[test]
+    fn handoff_footer_requires_every_locked_field() {
+        let complete = "TWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: usage_sample\nincident_id: null\nas_of_ms: 42\ncontinuity: not_authorized";
+        assert!(has_handoff_footer(complete));
+        assert!(!has_handoff_footer(
+            "TWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: unavailable\nincident_id: null\nas_of_ms: 42"
+        ));
     }
 }

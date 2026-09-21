@@ -22,15 +22,33 @@ pub(crate) struct ExchangeLog {
     cwd: String,
     session_id: Option<String>,
     session_action: Option<String>,
+    request_receipt: EventReceipt,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EventReceipt {
+    pub(crate) event_id: String,
+    pub(crate) exchange_id: String,
+    pub(crate) timestamp_ms: u128,
+    pub(crate) event_type: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) logged: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExchangeReceipt {
+    pub(crate) request: EventReceipt,
+    pub(crate) completion: EventReceipt,
+    pub(crate) target: String,
 }
 
 impl ExchangeLog {
     pub(crate) fn start(req: &AskRequest, prompt: &str) -> Result<Self, String> {
         let path = env::var_os("PARLEY_EVENT_LOG").map(PathBuf::from);
         let exchange_id = new_id("exchange");
-        let log = Self {
+        let mut log = Self {
             path,
-            exchange_id,
+            exchange_id: exchange_id.clone(),
             source: env::var("PARLEY_CALLER").unwrap_or_else(|_| "parley".to_string()),
             target: req.harness.clone(),
             cwd: req.cwd.to_string_lossy().to_string(),
@@ -42,12 +60,20 @@ impl ExchangeLog {
             } else {
                 None
             },
+            request_receipt: EventReceipt {
+                event_id: String::new(),
+                exchange_id: exchange_id.clone(),
+                timestamp_ms: 0,
+                event_type: "request".to_string(),
+                session_id: req.session_id.clone().or_else(|| req.resume_id.clone()),
+                logged: false,
+            },
         };
-        log.write("request", Some(prompt), "started", None, None)?;
+        log.request_receipt = log.write("request", Some(prompt), "started", None, None)?;
         Ok(log)
     }
 
-    pub(crate) fn success(&self, reply: &str, duration_ms: u128) -> Result<(), String> {
+    pub(crate) fn success(&self, reply: &str, duration_ms: u128) -> Result<EventReceipt, String> {
         self.write("response", Some(reply), "ok", Some(duration_ms), None)
     }
 
@@ -56,8 +82,20 @@ impl ExchangeLog {
         status: &str,
         error: &str,
         duration_ms: u128,
-    ) -> Result<(), String> {
+    ) -> Result<EventReceipt, String> {
         self.write("error", None, status, Some(duration_ms), Some(error))
+    }
+
+    pub(crate) fn request_receipt(&self) -> &EventReceipt {
+        &self.request_receipt
+    }
+
+    pub(crate) fn exchange_receipt(&self, completion: EventReceipt) -> ExchangeReceipt {
+        ExchangeReceipt {
+            request: self.request_receipt.clone(),
+            completion,
+            target: self.target.clone(),
+        }
     }
 
     fn write(
@@ -67,21 +105,31 @@ impl ExchangeLog {
         status: &str,
         duration_ms: Option<u128>,
         error: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<EventReceipt, String> {
+        let event_id = new_id("event");
+        let event_timestamp_ms = timestamp_ms();
+        let receipt = EventReceipt {
+            event_id: event_id.clone(),
+            exchange_id: self.exchange_id.clone(),
+            timestamp_ms: event_timestamp_ms,
+            event_type: event_type.to_string(),
+            session_id: self.session_id.clone(),
+            logged: self.path.is_some(),
+        };
         let Some(path) = &self.path else {
-            return Ok(());
+            return Ok(receipt);
         };
         let mut map = BTreeMap::new();
         map.insert("schema_version".to_string(), Json::Number(1.0));
         map.insert("event_type".to_string(), Json::Str(event_type.to_string()));
-        map.insert("event_id".to_string(), Json::Str(new_id("event")));
+        map.insert("event_id".to_string(), Json::Str(event_id));
         map.insert(
             "exchange_id".to_string(),
             Json::Str(self.exchange_id.clone()),
         );
         map.insert(
             "timestamp_ms".to_string(),
-            Json::Number(timestamp_ms() as f64),
+            Json::Number(event_timestamp_ms as f64),
         );
         map.insert("source".to_string(), Json::Str(self.source.clone()));
         map.insert("target".to_string(), Json::Str(self.target.clone()));
@@ -116,7 +164,8 @@ impl ExchangeLog {
                 .map(|value| Json::Str(value.to_string()))
                 .unwrap_or(Json::Null),
         );
-        append_line(path, &Json::Object(map).to_compact_string())
+        append_line(path, &Json::Object(map).to_compact_string())?;
+        Ok(receipt)
     }
 }
 
@@ -176,6 +225,14 @@ mod tests {
             cwd: "C:\\worker".to_string(),
             session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903".to_string()),
             session_action: Some("new".to_string()),
+            request_receipt: EventReceipt {
+                event_id: "request-event-1".to_string(),
+                exchange_id: "exchange-1".to_string(),
+                timestamp_ms: 1,
+                event_type: "request".to_string(),
+                session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903".to_string()),
+                logged: true,
+            },
         }
     }
 

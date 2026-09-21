@@ -69,9 +69,11 @@ impl HealthModel {
         record.schema_version = SCHEMA_VERSION;
         record.recorded_ms = Some(now_ms);
         let mut outcome = match record.kind {
+            InboxKind::RequestStarted => ApplyOutcome::default(),
             InboxKind::CodexSample => self.apply_codex(&mut record, now_ms),
             InboxKind::GrokStopFailure => self.apply_grok(&mut record, now_ms),
             InboxKind::ParleyObservation => self.apply_parley(&mut record, now_ms),
+            InboxKind::PolicyDiagnostic => self.apply_policy_diagnostic(&mut record),
             InboxKind::Acknowledge => self.apply_ack(&mut record, now_ms),
             InboxKind::Mute => self.apply_mute(&mut record),
             InboxKind::TestSound => self.apply_test_sound(&mut record, now_ms, replay),
@@ -302,6 +304,14 @@ impl HealthModel {
             record.last_sound_ms = Some(now_ms);
         }
         outcome
+    }
+
+    fn apply_policy_diagnostic(&mut self, record: &mut HealthRecord) -> ApplyOutcome {
+        record.source = record.source.or(Some(Source::Parley));
+        if record.diagnostic_code.as_deref() == Some("handoff_footer_missing") {
+            self.diagnostics.footer_missing += 1;
+        }
+        ApplyOutcome::default()
     }
 
     fn open_or_attach(

@@ -12,6 +12,8 @@ pub struct ScopeFile {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_common_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir_identity: Option<ExecutableIdentity>,
     #[serde(default)]
     pub main_root: String,
     #[serde(default)]
@@ -66,6 +68,7 @@ impl ScopeFile {
         Self {
             schema_version: SCHEMA_VERSION,
             git_common_dir: None,
+            git_common_dir_identity: None,
             main_root: String::new(),
             worktree_roots: Vec::new(),
             executables: HealthExecutables::default(),
@@ -103,6 +106,9 @@ impl ScopeFile {
     }
 
     pub fn contains_path(&self, candidate: &str) -> bool {
+        if !self.common_dir_identity_is_current() {
+            return false;
+        }
         self.cached_roots()
             .iter()
             .any(|root| canonical_contains_existing(root, candidate))
@@ -130,6 +136,7 @@ impl ScopeFile {
     pub fn apply_update(&mut self, update: ScopeUpdate) {
         if let Some(common) = update.git_common_dir {
             self.git_common_dir = Some(normalize_windows_path(&common));
+            self.git_common_dir_identity = Some(identity_for_path(&common));
             let discovered = worktrees_from_common_dir(Path::new(&common));
             for root in discovered {
                 push_unique(&mut self.worktree_roots, root);
@@ -155,9 +162,48 @@ impl ScopeFile {
     }
 
     pub fn refresh_identities(&mut self) {
+        refresh_one(&mut self.git_common_dir_identity);
         refresh_one(&mut self.executables.query);
         refresh_one(&mut self.executables.supervisor);
         refresh_one(&mut self.executables.hook);
+    }
+
+    pub fn refresh_cached_roots(&mut self) {
+        let Some(common) = self.git_common_dir.clone() else {
+            self.worktree_roots.retain(|root| Path::new(root).is_dir());
+            self.refresh_identities();
+            return;
+        };
+        if !self.common_dir_identity_is_current() {
+            self.worktree_roots.clear();
+            return;
+        }
+        let mut roots = worktrees_from_common_dir(Path::new(&common));
+        if Path::new(&self.main_root).is_dir() {
+            push_unique(&mut roots, normalize_windows_path(&self.main_root));
+        }
+        roots.retain(|root| Path::new(root).is_dir());
+        self.worktree_roots = roots;
+        self.refresh_identities();
+    }
+
+    pub fn common_dir_identity_is_current(&self) -> bool {
+        let Some(common) = self.git_common_dir.as_deref() else {
+            return true;
+        };
+        let common_path = Path::new(common);
+        if !common_path.is_dir() {
+            return false;
+        }
+        let Some(expected) = self.git_common_dir_identity.as_ref() else {
+            return true;
+        };
+        match expected.identity() {
+            Some(expected) => fsutil::file_identity(common_path)
+                .map(|observed| observed == expected)
+                .unwrap_or(false),
+            None => true,
+        }
     }
 }
 
@@ -194,9 +240,15 @@ pub fn canonical_contains(root: &str, candidate: &str) -> bool {
 }
 
 pub fn canonical_contains_existing(root: &str, candidate: &str) -> bool {
-    let resolved_root = canonicalize_if_existing(root);
-    let resolved_candidate = canonicalize_if_existing(candidate);
-    canonical_contains(&resolved_root, &resolved_candidate)
+    match (
+        canonicalize_existing(root),
+        canonicalize_existing(candidate),
+    ) {
+        (Some(resolved_root), Some(resolved_candidate)) => {
+            canonical_contains(&resolved_root, &resolved_candidate)
+        }
+        _ => false,
+    }
 }
 
 pub fn paths_equivalent(left: &str, right: &str) -> bool {
@@ -252,11 +304,10 @@ pub fn query_matches_installed(
     paths_equivalent(&resolved, &installed.path) || paths_equivalent(command_exe, &installed.path)
 }
 
-fn canonicalize_if_existing(path: &str) -> String {
+fn canonicalize_existing(path: &str) -> Option<String> {
     fs::canonicalize(path)
         .ok()
         .map(|resolved| normalize_windows_path(&resolved.to_string_lossy()))
-        .unwrap_or_else(|| normalize_windows_path(path))
 }
 
 pub fn worktrees_from_common_dir(common: &Path) -> Vec<String> {

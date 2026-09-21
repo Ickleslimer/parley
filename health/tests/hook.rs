@@ -23,26 +23,35 @@ fn deny_reason(decision: HookDecision) -> Option<&'static str> {
 
 #[test]
 fn pretool_use_is_deny_only_and_silent_for_exact_in_scope_query() {
-    let query = r"C:\Parley\parley-health-query.exe";
-    let scope = common::scope_for(r"C:\repo", query);
+    let home = common::TempHome::new("pretool-exact");
+    let root = home.paths.root.to_string_lossy().to_string();
+    let query_path = common::fake_query_exe(&home);
+    let query = query_path.to_string_lossy().to_string();
+    let scope = common::scope_for(&root, &query);
 
     assert_eq!(
-        decide_pretool_use(&pretool(query, r"C:\repo", r"C:\repo"), &scope),
+        decide_pretool_use(&pretool(&query, &root, &root), &scope),
+        HookDecision::Silent
+    );
+    assert_eq!(
+        decide_pretool_use(&pretool(&query.to_ascii_uppercase(), &root, &root), &scope),
+        HookDecision::Silent
+    );
+    assert_eq!(
+        decide_pretool_use(&pretool("git status", &root, &root), &scope),
         HookDecision::Silent
     );
     assert_eq!(
         decide_pretool_use(
-            &pretool(
-                r"C:\Parley\PARLEY-HEALTH-QUERY.EXE",
-                r"C:\REPO\src",
-                r"C:\repo"
-            ),
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "run_terminal_command",
+                "cwd": root,
+                "workspaceRoot": root,
+                "tool_input": { "command": query }
+            }),
             &scope
         ),
-        HookDecision::Silent
-    );
-    assert_eq!(
-        decide_pretool_use(&pretool("git status", r"C:\repo", r"C:\repo"), &scope),
         HookDecision::Silent
     );
 
@@ -56,13 +65,30 @@ fn pretool_use_is_deny_only_and_silent_for_exact_in_scope_query() {
         format!("{query} > out.json"),
         format!("{query} 2> err.txt"),
         format!("{query}.evil"),
-        r"C:\Parley\parley-health-query-helper.exe".to_string(),
-        r"C:\Parley\parley-health-supervisor.exe".to_string(),
-        r"C:\Parley\parley-health-hook.exe".to_string(),
-        r"C:\other\parley-health-query.exe".to_string(),
+        home.paths
+            .root
+            .join("parley-health-query-helper.exe")
+            .to_string_lossy()
+            .to_string(),
+        home.paths
+            .root
+            .join("parley-health-supervisor.exe")
+            .to_string_lossy()
+            .to_string(),
+        home.paths
+            .root
+            .join("parley-health-hook.exe")
+            .to_string_lossy()
+            .to_string(),
+        home.paths
+            .root
+            .join("other")
+            .join("parley-health-query.exe")
+            .to_string_lossy()
+            .to_string(),
     ];
     for command in extras {
-        let decision = decide_pretool_use(&pretool(&command, r"C:\repo", r"C:\repo"), &scope);
+        let decision = decide_pretool_use(&pretool(&command, &root, &root), &scope);
         assert!(
             matches!(decision, HookDecision::Deny { .. }),
             "expected deny for {command}, got {decision:?}"
