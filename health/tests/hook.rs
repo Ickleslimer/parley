@@ -260,3 +260,35 @@ fn hook_binary_reads_stdin_and_denies_writer_image() {
     assert!(!stdout.to_ascii_lowercase().contains("allow"));
     let _ = InboxKind::GrokStopFailure;
 }
+
+#[test]
+fn hook_binary_fails_closed_when_an_in_scope_record_cannot_be_written() {
+    use std::io::Write as _;
+
+    let home = common::TempHome::new("hook-bin-write-failure");
+    let query = common::fake_query_exe(&home);
+    let root = home.paths.root.to_string_lossy().to_string();
+    common::write_scope(&home, &common::scope_for(&root, &query.to_string_lossy()));
+    std::fs::remove_dir(home.paths.inbox()).unwrap();
+    std::fs::write(home.paths.inbox(), b"blocks inbox directory").unwrap();
+
+    let payload = serde_json::to_vec(&json!({
+        "hook_event_name": "StopFailure",
+        "cwd": root,
+        "workspaceRoot": root,
+        "error": { "status": 429, "code": "subscription:free-usage-exhausted" }
+    }))
+    .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_parley-health-hook"))
+        .env("PARLEY_HEALTH_HOME", &home.paths.root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&payload).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}

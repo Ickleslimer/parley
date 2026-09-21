@@ -31,6 +31,18 @@ fn rebuilds_after_incomplete_trailing_journal_data() {
 
     let original = fs::read(home.paths.journal()).unwrap();
     assert!(original.windows(7).any(|w| w == b"partial"));
+
+    let next = common::codex_sample("codex-2", 11, None);
+    journal::append(&home.paths.journal(), &next).unwrap();
+    let repaired = journal::load(&home.paths.journal()).unwrap();
+    assert!(!repaired.diagnostics.journal_incomplete_trailing);
+    assert_eq!(repaired.diagnostics.malformed_journal_lines, 1);
+    assert_eq!(repaired.records.len(), 2);
+    assert_eq!(repaired.records[0].inbox_id, "codex-1");
+    assert_eq!(repaired.records[1].inbox_id, "codex-2");
+    assert!(fs::read_to_string(home.paths.journal())
+        .unwrap()
+        .contains("partial\n{"));
 }
 
 #[test]

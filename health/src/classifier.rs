@@ -148,7 +148,7 @@ fn consider_field(key: &str, value: &Value, evidence: &mut GrokErrorEvidence) {
         "status" | "http_status" | "httpstatus" | "status_code" | "statuscode"
     ) {
         if let Some(status) = as_http_status(value) {
-            evidence.http_status = Some(status);
+            record_http_status(evidence, status);
         }
     }
     if matches!(
@@ -199,6 +199,12 @@ fn as_code(value: &Value) -> Option<String> {
     }
 }
 
+fn record_http_status(evidence: &mut GrokErrorEvidence, status: u16) {
+    if status == 429 || evidence.http_status != Some(429) {
+        evidence.http_status = Some(status);
+    }
+}
+
 fn is_generic_rate_limit(code: &str) -> bool {
     let code = code.to_ascii_lowercase();
     matches!(
@@ -232,11 +238,11 @@ fn scan_unstructured(text: &str, evidence: &mut GrokErrorEvidence) {
         evidence.provider_code = Some(FREE_USAGE_EXHAUSTED.to_string());
     }
     if contains_status_token(text, 429) {
-        evidence.http_status = Some(429);
+        record_http_status(evidence, 429);
     } else if contains_status_token(text, 503) {
-        evidence.http_status = Some(503);
+        record_http_status(evidence, 503);
     } else if contains_status_token(text, 529) {
-        evidence.http_status = Some(529);
+        record_http_status(evidence, 529);
     }
     let lower = text.to_ascii_lowercase();
     if lower.contains("rate_limit")

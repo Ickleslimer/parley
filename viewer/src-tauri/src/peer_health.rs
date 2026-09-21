@@ -271,13 +271,30 @@ fn submit_and_wait(
 ) -> Result<PeerHealthSnapshot, String> {
     let paths = HealthPaths::from_env();
     inbox::write_record(&paths, &record).map_err(|error| error.to_string())?;
-    let deadline = Instant::now() + CONTROL_WAIT;
+    wait_for_reflection(
+        || read_document(&paths),
+        reflected,
+        CONTROL_WAIT,
+        CONTROL_POLL,
+    )
+}
+
+fn wait_for_reflection(
+    mut read: impl FnMut() -> QueryDocument,
+    reflected: impl Fn(&QueryDocument) -> bool,
+    wait: Duration,
+    poll: Duration,
+) -> Result<PeerHealthSnapshot, String> {
+    let deadline = Instant::now() + wait;
     loop {
-        let document = read_document(&paths);
-        if reflected(&document) || Instant::now() >= deadline {
+        let document = read();
+        if reflected(&document) {
             return Ok(document.into());
         }
-        thread::sleep(CONTROL_POLL);
+        if Instant::now() >= deadline {
+            return Err("peer health control was not reflected before timeout".to_string());
+        }
+        thread::sleep(poll);
     }
 }
 
@@ -410,6 +427,19 @@ mod tests {
         let second = viewer_record(InboxKind::Mute, "mute", 10);
         assert_ne!(first.inbox_id, second.inbox_id);
         assert_eq!(sanitize_id(&first.inbox_id), Some(first.inbox_id));
+    }
+
+    #[test]
+    fn viewer_control_wait_reports_timeout_instead_of_false_success() {
+        let document = QueryDocument::unavailable(UnavailableReason::Missing, 7);
+        let error = wait_for_reflection(
+            || document.clone(),
+            |_| false,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("not reflected before timeout"));
     }
 
     #[test]

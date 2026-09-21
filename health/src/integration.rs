@@ -103,15 +103,17 @@ pub fn remove_hooks(grok_home: &Path) -> Result<bool, HealthError> {
     if !path.exists() {
         return Ok(false);
     }
-    let existing = read_json(&path)?;
-    if !is_two_chairs_document(&existing) {
-        return Err(HealthError::msg(format!(
-            "refusing to remove modified Grok hook file {}",
-            path.display()
-        )));
+    let mut existing = read_json(&path)?;
+    if !remove_managed_entries(&mut existing) {
+        return Ok(false);
     }
-    fs::remove_file(&path)
-        .map_err(|error| HealthError::msg(format!("remove {}: {error}", path.display())))?;
+    if only_empty_hooks_remain(&existing) {
+        fs::remove_file(&path)
+            .map_err(|error| HealthError::msg(format!("remove {}: {error}", path.display())))?;
+    } else {
+        let bytes = serde_json::to_vec_pretty(&existing)?;
+        fsutil::atomic_write(&path, &bytes)?;
+    }
     Ok(true)
 }
 
@@ -192,6 +194,62 @@ fn command_targets_hook(command: &str) -> bool {
         .next()
         .map(|name| name.eq_ignore_ascii_case("parley-health-hook.exe"))
         .unwrap_or(false)
+}
+
+fn remove_managed_entries(value: &mut Value) -> bool {
+    let Some(hooks) = value.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let mut removed = false;
+    let mut empty_events = Vec::new();
+    for event in ["PreToolUse", "StopFailure"] {
+        let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        groups.retain_mut(|group| {
+            let Some(object) = group.as_object_mut() else {
+                return true;
+            };
+            let Some(handlers) = object.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let before = handlers.len();
+            handlers.retain(|handler| !is_managed_handler(handler));
+            removed |= handlers.len() != before;
+            !(handlers.is_empty() && object.keys().all(|key| key == "hooks" || key == "matcher"))
+        });
+        if groups.is_empty() {
+            empty_events.push(event);
+        }
+    }
+    for event in empty_events {
+        hooks.remove(event);
+    }
+    removed
+}
+
+fn is_managed_handler(value: &Value) -> bool {
+    let Some(handler) = value.as_object() else {
+        return false;
+    };
+    handler.get("type").and_then(Value::as_str) == Some("command")
+        && handler
+            .get("command")
+            .and_then(Value::as_str)
+            .map(command_targets_hook)
+            .unwrap_or(false)
+}
+
+fn only_empty_hooks_remain(value: &Value) -> bool {
+    let Some(root) = value.as_object() else {
+        return false;
+    };
+    root.len() == 1
+        && root
+            .get("hooks")
+            .and_then(Value::as_object)
+            .map(|hooks| hooks.is_empty())
+            .unwrap_or(false)
 }
 
 fn read_json(path: &Path) -> Result<Value, HealthError> {

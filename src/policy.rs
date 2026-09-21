@@ -499,7 +499,7 @@ fn hardened_grok_denies() -> Vec<String> {
 
 fn add_health_tool_rules(query: &Path, denies: &mut Vec<String>) -> Vec<String> {
     let query_text = query.to_string_lossy();
-    let allows = vec![format!("Bash(*{query_text}*)")];
+    let allows = vec![format!("Bash(& \"{query_text}\")")];
     if let Some(parent) = query.parent() {
         for writer in ["parley-health-supervisor.exe", "parley-health-hook.exe"] {
             denies.push(format!("Bash(*{}*)", parent.join(writer).to_string_lossy()));
@@ -753,7 +753,11 @@ mod tests {
         let mut denies = hardened_grok_denies();
         let allows = add_health_tool_rules(&query, &mut denies);
 
-        assert_eq!(allows, vec![format!("Bash(*{}*)", query.to_string_lossy())]);
+        assert_eq!(
+            allows,
+            vec![format!("Bash(& \"{}\")", query.to_string_lossy())]
+        );
+        assert!(!allows[0].contains('*'));
         for writer in ["parley-health-supervisor.exe", "parley-health-hook.exe"] {
             assert!(denies.iter().any(|rule| rule.contains(writer)));
             assert!(denies.iter().any(|rule| {

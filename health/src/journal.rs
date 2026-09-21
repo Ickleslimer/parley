@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::fsutil;
@@ -76,6 +76,14 @@ pub fn append(path: &Path, record: &HealthRecord) -> Result<(), HealthError> {
     }
     encoded.push(b'\n');
     let mut file = fsutil::open_shared_append(path)?;
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
     file.write_all(&encoded)?;
     file.flush()?;
     file.sync_data()?;

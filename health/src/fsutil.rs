@@ -42,7 +42,7 @@ pub fn open_shared_read(path: &Path) -> io::Result<File> {
 
 pub fn open_shared_append(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.create(true).append(true).write(true);
+    options.create(true).read(true).append(true).write(true);
     apply_share_mode(&mut options);
     options.open(path)
 }

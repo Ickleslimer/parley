@@ -129,6 +129,23 @@ fn extract_uses_structured_fields_and_does_not_require_raw_error_text() {
 }
 
 #[test]
+fn extraction_does_not_demote_a_structured_429_with_later_status_fields() {
+    let value = json!({
+        "errors": [
+            { "status": 429, "code": FREE_USAGE_EXHAUSTED },
+            { "status": 503, "code": "capacity" }
+        ]
+    });
+    let evidence = extract_grok_error(&value, false);
+    assert_eq!(evidence.http_status, Some(429));
+    assert_eq!(
+        evidence.provider_code.as_deref(),
+        Some(FREE_USAGE_EXHAUSTED)
+    );
+    assert_eq!(classify_grok(&evidence).class, ClosedClass::QuotaExhausted);
+}
+
+#[test]
 fn extract_marks_clipped_stdin_and_unstructured_text_without_tokens_as_non_exhausting() {
     let clipped = extract_grok_error(
         &json!({"error": {"status": 429, "code": FREE_USAGE_EXHAUSTED}}),

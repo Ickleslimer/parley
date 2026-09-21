@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -179,12 +179,31 @@ fn append_line(path: &Path, line: &str) -> Result<(), String> {
     }
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|error| format!("open event log {}: {error}", path.display()))?;
-    file.write_all(line.as_bytes())
-        .and_then(|_| file.write_all(b"\n"))
+    let mut encoded = Vec::with_capacity(line.len() + 2);
+    if file
+        .metadata()
+        .and_then(|metadata| {
+            if metadata.len() == 0 {
+                return Ok(false);
+            }
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0_u8; 1];
+            file.read_exact(&mut last)?;
+            Ok(last[0] != b'\n')
+        })
+        .map_err(|error| format!("inspect event log {}: {error}", path.display()))?
+    {
+        encoded.push(b'\n');
+    }
+    encoded.extend_from_slice(line.as_bytes());
+    encoded.push(b'\n');
+    file.write_all(&encoded)
         .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
         .map_err(|error| format!("append event log {}: {error}", path.display()))
 }
 
@@ -252,6 +271,20 @@ mod tests {
             Json::parse(lines[0]).unwrap().as_str(),
             Some("one\n\"two\"")
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn separates_an_incomplete_tail_before_the_next_durable_event() {
+        let path = temp_path("partial-tail.jsonl");
+        fs::write(&path, br#"{"partial":true"#).unwrap();
+        append_line(&path, "{\"ok\":true}").unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines, vec![r#"{"partial":true"#, r#"{"ok":true}"#]);
+        assert!(Json::parse(lines[0]).is_err());
+        assert!(Json::parse(lines[1]).is_ok());
         fs::remove_file(path).unwrap();
     }
 

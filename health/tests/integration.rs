@@ -48,7 +48,7 @@ fn installs_exactly_two_dedicated_hooks_and_preserves_unrelated_files() {
 }
 
 #[test]
-fn refuses_to_replace_or_remove_a_modified_reserved_hook_file() {
+fn refuses_to_replace_an_unrelated_reserved_hook_file_and_leaves_it_on_remove() {
     let home = common::TempHome::new("hook-refuse");
     let install = fake_install(&home);
     let grok_home = home.paths.root.join("grok");
@@ -57,8 +57,38 @@ fn refuses_to_replace_or_remove_a_modified_reserved_hook_file() {
     let reserved = hooks.join(HOOK_FILE_NAME);
     std::fs::write(&reserved, r#"{"hooks":{"SessionStart":[]}}"#).unwrap();
     assert!(install_hooks(&grok_home, &install.join("parley-health-hook.exe")).is_err());
-    assert!(remove_hooks(&grok_home).is_err());
+    assert!(!remove_hooks(&grok_home).unwrap());
     assert!(reserved.exists());
+}
+
+#[test]
+fn remove_hooks_removes_only_managed_entries_from_a_modified_document() {
+    let home = common::TempHome::new("hook-remove-modified");
+    let install = fake_install(&home);
+    let grok_home = home.paths.root.join("grok");
+    let hook_path = grok_home.join("hooks").join(HOOK_FILE_NAME);
+    install_hooks(&grok_home, &install.join("parley-health-hook.exe")).unwrap();
+
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+    document["hooks"]["PreToolUse"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "type": "command",
+            "command": "unrelated-hook.exe",
+            "timeout": 5
+        }));
+    document["hooks"]["SessionStart"] = serde_json::json!([{
+        "hooks": [{"type": "command", "command": "session-start.exe", "timeout": 5}]
+    }]);
+    std::fs::write(&hook_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    assert!(remove_hooks(&grok_home).unwrap());
+    let remaining = std::fs::read_to_string(&hook_path).unwrap();
+    assert!(!remaining.contains("parley-health-hook.exe"));
+    assert!(remaining.contains("unrelated-hook.exe"));
+    assert!(remaining.contains("session-start.exe"));
 }
 
 #[test]
