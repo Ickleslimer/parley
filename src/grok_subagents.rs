@@ -413,8 +413,8 @@ fn permission_tree_pattern(path: &Path) -> Result<String, String> {
 fn permission_path(path: &Path) -> Result<String, String> {
     let text = path
         .to_str()
-        .ok_or_else(|| format!("permission path is not valid Unicode: {}", path.display()))?
-        .replace('\\', "/");
+        .ok_or_else(|| format!("permission path is not valid Unicode: {}", path.display()))?;
+    let text = normalize_windows_extended_path(text).replace('\\', "/");
     if text.chars().any(|character| {
         matches!(
             character,
@@ -427,6 +427,16 @@ fn permission_path(path: &Path) -> Result<String, String> {
         ));
     }
     Ok(text)
+}
+
+fn normalize_windows_extended_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
 }
 
 fn git_common_dir(cwd: &Path) -> Result<PathBuf, String> {
@@ -589,5 +599,22 @@ mod tests {
             path: "safe.rs".to_string(),
         };
         assert!(permission_pattern(Path::new(r"C:\repo(parent)"), &grant).is_err());
+    }
+
+    #[test]
+    fn permission_patterns_strip_only_the_windows_extended_prefix() {
+        let grant = StoredPathGrant {
+            kind: GrantKind::File,
+            path: "README.md".to_string(),
+        };
+        assert_eq!(
+            permission_pattern(Path::new(r"\\?\C:\repo\parent"), &grant).unwrap(),
+            "C:/repo/parent/README.md"
+        );
+        assert_eq!(
+            permission_pattern(Path::new(r"\\?\UNC\server\share\repo"), &grant).unwrap(),
+            "//server/share/repo/README.md"
+        );
+        assert!(permission_pattern(Path::new(r"C:\repo?\parent"), &grant).is_err());
     }
 }
