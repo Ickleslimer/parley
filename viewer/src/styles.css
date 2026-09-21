@@ -486,7 +486,7 @@ select {
 
 .detail-layout {
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
   height: 100%;
   gap: 8px;
   padding: 10px 12px 12px;
@@ -720,11 +720,150 @@ select {
   padding: 8px;
 }
 
+.panel-peer-health {
+  max-height: 42vh;
+  overflow: auto;
+  gap: 6px;
+}
+
+.panel-peer-health [hidden] {
+  display: none !important;
+}
+
+.peer-health-caption,
+.peer-health-meta,
+.peer-health-evidence-text,
+.peer-health-diagnostics,
+.peer-health-handoff,
+.peer-health-silence,
+.peer-health-kicker {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.peer-health-caption {
+  line-height: 1.4;
+}
+
+.peer-health-kicker {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.peer-health-availability {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.peer-health-availability.is-error {
+  color: var(--danger);
+}
+
+.peer-health-availability.is-caution,
+.peer-health-silence {
+  padding: 6px 8px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-text);
+  border-radius: 6px;
+}
+
+.peer-health-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.peer-health-summary,
+.peer-health-evidence,
+.peer-health-incidents {
+  display: grid;
+  gap: 8px;
+}
+
+.peer-health-summary {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.peer-health-evidence,
+.peer-health-incidents {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.peer-health-card,
+.peer-health-incident {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel-2);
+}
+
+.peer-health-card-codex {
+  border-left: 2px solid rgb(126 224 255 / 55%);
+}
+
+.peer-health-card-grok {
+  border-left: 2px solid rgb(196 154 255 / 55%);
+}
+
+.peer-health-incident-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.peer-health-incident-column {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.peer-health-ack {
+  align-self: start;
+  font-size: 11px;
+  padding: 3px 7px;
+}
+
+.peer-health-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.peer-health-handoff {
+  color: var(--accent);
+  font-weight: 650;
+}
+
+.peer-health-diagnostics {
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
 @media (max-width: 980px) {
   .detail-header,
   .detail-main,
   .detail-footer,
-  .settings-form {
+  .settings-form,
+  .peer-health-summary,
+  .peer-health-evidence,
+  .peer-health-incidents {
     grid-template-columns: 1fr;
   }
 
@@ -735,5 +874,10 @@ select {
 
   .panel {
     min-height: 16rem;
+  }
+
+  .panel-peer-health {
+    min-height: 0;
+    max-height: none;
   }
 }

@@ -3,7 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   EventContent,
   ExchangePage,
+  HandoffSelection,
   MonitorInfo,
+  PeerHealthSnapshot,
   SearchPage,
   SessionPage,
   ViewerSettings,
@@ -18,6 +20,11 @@ export interface ViewerApi {
   listExchanges(sessionId: string, cursor: number | null, limit: number): Promise<ExchangePage>;
   search(query: string, cursor: number | null, limit: number): Promise<SearchPage>;
   getEventContent(eventId: string): Promise<EventContent | null>;
+  getPeerHealth(): Promise<PeerHealthSnapshot>;
+  acknowledgePeerIncident(incidentId: string): Promise<PeerHealthSnapshot>;
+  setPeerHealthMuted(muted: boolean): Promise<PeerHealthSnapshot>;
+  testPeerHealthChime(): Promise<void>;
+  openLatestHandoff(): Promise<HandoffSelection>;
   getSettings(): Promise<ViewerSettings>;
   saveSettings(settings: ViewerSettings): Promise<ViewerSettings>;
   listMonitors(): Promise<MonitorInfo[]>;
@@ -40,6 +47,13 @@ export const viewerApi: ViewerApi = {
     invoke<SearchPage>("search_events", { query, cursor, limit }),
   getEventContent: (eventId) =>
     invoke<EventContent | null>("get_event_content", { eventId }),
+  getPeerHealth: () => invoke<PeerHealthSnapshot>("get_peer_health"),
+  acknowledgePeerIncident: (incidentId) =>
+    invoke<PeerHealthSnapshot>("acknowledge_peer_incident", { incidentId }),
+  setPeerHealthMuted: (muted) =>
+    invoke<PeerHealthSnapshot>("set_peer_health_muted", { muted }),
+  testPeerHealthChime: () => invoke<void>("test_peer_health_chime"),
+  openLatestHandoff: () => invoke<HandoffSelection>("open_latest_handoff"),
   getSettings: () => invoke<ViewerSettings>("get_settings"),
   saveSettings: (settings) => invoke<ViewerSettings>("save_settings", { settings }),
   listMonitors: () => invoke<MonitorInfo[]>("list_monitors"),

@@ -133,3 +133,115 @@ export const DEFAULT_SETTINGS: ViewerSettings = {
   height: 360,
   launchAtLogin: false,
 };
+
+export const CLOSED_CLASSES = [
+  "usage_sample",
+  "quota_exhausted",
+  "capacity_throttle",
+  "turn_error",
+  "watchdog_killed",
+  "mcp_stdout_undelivered",
+] as const;
+export type ClosedClass = (typeof CLOSED_CLASSES)[number];
+
+export const PEER_HEALTH_SOURCES = ["codex", "grok", "parley", "viewer"] as const;
+export type PeerHealthSource = (typeof PEER_HEALTH_SOURCES)[number];
+
+export const PEER_INCIDENT_STATUSES = ["active", "recovered"] as const;
+export type PeerIncidentStatus = (typeof PEER_INCIDENT_STATUSES)[number];
+
+export const PEER_HEALTH_UNAVAILABLE_REASONS = [
+  "missing",
+  "malformed",
+  "locked",
+  "arguments_not_allowed",
+] as const;
+export type PeerHealthUnavailableReason = (typeof PEER_HEALTH_UNAVAILABLE_REASONS)[number];
+
+export interface CodexSample {
+  usedPercent: number | null;
+  resetsAt: string | null;
+  planType: string | null;
+  rateLimitReachedType: string | null;
+  asOfMs: number;
+}
+
+export interface GrokObservation {
+  class: ClosedClass;
+  asOfMs: number;
+  success: boolean;
+  httpStatus: number | null;
+  providerCode: string | null;
+}
+
+export interface PeerIncident {
+  incidentId: string;
+  class: ClosedClass;
+  source: PeerHealthSource;
+  status: PeerIncidentStatus;
+  openedMs: number;
+  asOfMs: number;
+  recoveredMs: number | null;
+  acknowledged: boolean;
+  sessionId: string | null;
+  eventId: string | null;
+  exchangeId: string | null;
+}
+
+export interface PeerHealthUnavailable {
+  reason: PeerHealthUnavailableReason;
+}
+
+export interface PeerHealthDiagnostics {
+  snapshotMissing: boolean;
+  snapshotMalformed: boolean;
+  snapshotLocked: boolean;
+  journalIncompleteTrailing: boolean;
+  malformedJournalLines: number;
+  oversizedJournalLines: number;
+  unsupportedJournalRecords: number;
+  quarantinedInbox: number;
+  malformedInbox: number;
+  soundFailures: number;
+  footerMissing: number;
+  codexSampleFailures: number;
+  lastCodexSampleFailureMs: number | null;
+}
+
+export interface PeerHealthSnapshot {
+  schemaVersion: number;
+  generatedMs: number;
+  asOfMs: number | null;
+  muted: boolean;
+  unreadCount: number;
+  latestCodexSample: CodexSample | null;
+  latestGrokObservation: GrokObservation | null;
+  activeIncidents: PeerIncident[];
+  recentIncidents: PeerIncident[];
+  unavailable: PeerHealthUnavailable | null;
+  stale: boolean;
+  diagnostics: PeerHealthDiagnostics;
+}
+
+export interface HandoffSelection {
+  event: EventContent | null;
+  label: string;
+  incidentId: string | null;
+  exactUndelivered: boolean;
+}
+
+export const DEFAULT_PEER_HEALTH_DIAGNOSTICS: PeerHealthDiagnostics = {
+  snapshotMissing: false,
+  snapshotMalformed: false,
+  snapshotLocked: false,
+  journalIncompleteTrailing: false,
+  malformedJournalLines: 0,
+  oversizedJournalLines: 0,
+  unsupportedJournalRecords: 0,
+  quarantinedInbox: 0,
+  malformedInbox: 0,
+  soundFailures: 0,
+  footerMissing: 0,
+  codexSampleFailures: 0,
+  lastCodexSampleFailureMs: null,
+};

@@ -1,7 +1,9 @@
 import type {
   EventContent,
   ExchangeSummary,
+  HandoffSelection,
   MonitorInfo,
+  PeerHealthSnapshot,
   SearchHit,
   SessionSummary,
   ViewerSettings,
@@ -34,6 +36,13 @@ import {
   resetPaging,
   type PagingState,
 } from "./paging";
+import {
+  applyOpenHandoff,
+  buildPeerHealthSection,
+  paintPeerHealth as paintPeerHealthView,
+  presentPeerHealth,
+  TEST_CHIME_REQUESTED_LABEL,
+} from "./peer-health";
 import { createSingleFlightPoller, DETAIL_POLL_MS } from "./poll";
 import {
   createSearchState,
@@ -72,6 +81,12 @@ interface DetailState {
   savingSettings: boolean;
   settingsDirty: boolean;
   exiting: boolean;
+  peerHealth: PeerHealthSnapshot | null;
+  peerHealthError: string | null;
+  peerHealthLoading: boolean;
+  peerHealthBusy: boolean;
+  handoffLabel: string | null;
+  chimeStatus: string | null;
 }
 
 export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => void } {
@@ -102,6 +117,12 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     savingSettings: false,
     settingsDirty: false,
     exiting: false,
+    peerHealth: null,
+    peerHealthError: null,
+    peerHealthLoading: true,
+    peerHealthBusy: false,
+    handoffLabel: null,
+    chimeStatus: null,
   };
 
   let alive = true;
@@ -109,6 +130,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   let sessionLoad = 0;
   let exchangeLoad = 0;
   let searchLoad = 0;
+  let healthLoad = 0;
 
   const paintChrome = (): void => {
     const banner = degradedBanner(state.status);
@@ -203,6 +225,23 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     }
   };
 
+  const paintPeerHealth = (): void => {
+    paintPeerHealthView(
+      nodes.peerHealth,
+      presentPeerHealth({
+        snapshot: state.peerHealth,
+        error: state.peerHealthError,
+        loading: state.peerHealthLoading,
+        busy: state.peerHealthBusy,
+        handoffLabel: state.handoffLabel,
+        chimeStatus: state.chimeStatus,
+      }),
+      (incidentId) => {
+        void acknowledgeIncident(incidentId);
+      },
+    );
+  };
+
   const paintEvent = (): void => {
     if (state.eventLoading) {
       setText(nodes.eventEmpty, "Loading exact event content\u2026");
@@ -233,6 +272,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
 
   const paint = (): void => {
     paintChrome();
+    paintPeerHealth();
     paintSessions();
     paintMiddle();
     paintEvent();
@@ -364,6 +404,80 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       state.search.loading = false;
       state.search.error = loadErrorLabel("search event content");
       state.searchHits = [];
+    }
+  };
+
+  const loadPeerHealth = async (): Promise<void> => {
+    if (state.peerHealthBusy) {
+      return;
+    }
+    const token = ++healthLoad;
+    if (!state.peerHealth) {
+      state.peerHealthLoading = true;
+    }
+    try {
+      const snapshot = await api.getPeerHealth();
+      if (!alive || token !== healthLoad) {
+        return;
+      }
+      state.peerHealth = snapshot;
+      state.peerHealthError = null;
+      state.peerHealthLoading = false;
+    } catch {
+      if (!alive || token !== healthLoad) {
+        return;
+      }
+      state.peerHealthLoading = false;
+      state.peerHealthError = loadErrorLabel("load peer health");
+    }
+  };
+
+  const applyPeerHealthSnapshot = (snapshot: PeerHealthSnapshot, token: number): boolean => {
+    if (!alive || token !== healthLoad) {
+      return false;
+    }
+    state.peerHealth = snapshot;
+    state.peerHealthError = null;
+    state.peerHealthLoading = false;
+    return true;
+  };
+
+  const applyHandoffSelection = (selection: HandoffSelection): void => {
+    const applied = applyOpenHandoff(selection, state.peerHealth);
+    state.handoffLabel = applied.label.length > 0 ? applied.label : null;
+    if (!applied.replaceEvent || !applied.event) {
+      return;
+    }
+    state.event = applied.event;
+    state.selectedEventId = applied.event.eventId;
+    state.selectedSessionId = applied.event.sessionId;
+    state.selectedExchangeId = applied.event.exchangeId;
+    state.eventLoading = false;
+    state.eventError = null;
+  };
+
+  const acknowledgeIncident = async (incidentId: string): Promise<void> => {
+    if (state.peerHealthBusy) {
+      return;
+    }
+    const token = ++healthLoad;
+    state.peerHealthBusy = true;
+    paintPeerHealth();
+    try {
+      const snapshot = await api.acknowledgePeerIncident(incidentId);
+      if (!applyPeerHealthSnapshot(snapshot, token)) {
+        return;
+      }
+    } catch {
+      if (!alive || token !== healthLoad) {
+        return;
+      }
+      state.peerHealthError = loadErrorLabel("acknowledge a peer-health incident");
+    } finally {
+      if (alive && token === healthLoad) {
+        state.peerHealthBusy = false;
+        paintPeerHealth();
+      }
     }
   };
 
@@ -655,6 +769,93 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     });
   });
 
+  nodes.peerHealth.muted.addEventListener("change", () => {
+    if (state.peerHealthBusy) {
+      nodes.peerHealth.muted.checked = state.peerHealth?.muted === true;
+      return;
+    }
+    const muted = nodes.peerHealth.muted.checked;
+    const token = ++healthLoad;
+    state.peerHealthBusy = true;
+    paintPeerHealth();
+    void (async () => {
+      try {
+        const snapshot = await api.setPeerHealthMuted(muted);
+        if (!applyPeerHealthSnapshot(snapshot, token)) {
+          return;
+        }
+      } catch {
+        if (!alive || token !== healthLoad) {
+          return;
+        }
+        state.peerHealthError = loadErrorLabel("update peer-health mute");
+      } finally {
+        if (alive && token === healthLoad) {
+          state.peerHealthBusy = false;
+          paintPeerHealth();
+        }
+      }
+    })();
+  });
+
+  nodes.peerHealth.testChime.addEventListener("click", () => {
+    if (state.peerHealthBusy) {
+      return;
+    }
+    state.peerHealthBusy = true;
+    paintPeerHealth();
+    void (async () => {
+      try {
+        await api.testPeerHealthChime();
+        if (!alive) {
+          return;
+        }
+        state.chimeStatus = TEST_CHIME_REQUESTED_LABEL;
+        state.peerHealthError = null;
+      } catch {
+        if (!alive) {
+          return;
+        }
+        state.peerHealthError = loadErrorLabel("request a peer-health test chime");
+      } finally {
+        if (alive) {
+          state.peerHealthBusy = false;
+          paintPeerHealth();
+        }
+      }
+    })();
+  });
+
+  nodes.peerHealth.openHandoff.addEventListener("click", () => {
+    if (state.peerHealthBusy) {
+      return;
+    }
+    state.peerHealthBusy = true;
+    paintPeerHealth();
+    void (async () => {
+      try {
+        const selection = await api.openLatestHandoff();
+        if (!alive) {
+          return;
+        }
+        applyHandoffSelection(selection);
+        state.peerHealthError = null;
+      } catch {
+        if (!alive) {
+          return;
+        }
+        state.peerHealthError = loadErrorLabel("open the latest handoff");
+      } finally {
+        if (alive) {
+          state.peerHealthBusy = false;
+          paintPeerHealth();
+          paintEvent();
+          paintMiddle();
+        }
+      }
+    })();
+  });
+
   const poller = createSingleFlightPoller(async () => {
     try {
       const status = await api.getStatus();
@@ -680,7 +881,15 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     paintChrome();
   }, DETAIL_POLL_MS);
 
+  const healthPoller = createSingleFlightPoller(async () => {
+    await loadPeerHealth();
+    if (alive) {
+      paintPeerHealth();
+    }
+  }, DETAIL_POLL_MS);
+
   paint();
+  healthPoller.start();
   void bootstrap().then(() => {
     if (alive) {
       poller.start();
@@ -690,6 +899,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   const stop = (): void => {
     alive = false;
     poller.stop();
+    healthPoller.stop();
   };
   window.addEventListener("pagehide", stop);
   return { stop };
@@ -815,6 +1025,8 @@ function buildDetailShell() {
     ],
   });
 
+  const peerHealth = buildPeerHealthSection();
+
   const diagnostics = el("p", { className: "diagnostics-text" });
   const diagnosticsPanel = el("section", {
     className: "panel",
@@ -862,7 +1074,7 @@ function buildDetailShell() {
   });
   const shell = el("div", {
     className: "detail-layout",
-    children: [header, banner, loadError, main, footer],
+    children: [header, banner, loadError, peerHealth.section, main, footer],
   });
 
   return {
@@ -890,6 +1102,7 @@ function buildDetailShell() {
     eventMeta,
     eventEmpty,
     eventBody,
+    peerHealth,
     diagnostics,
     monitor,
     corner,
