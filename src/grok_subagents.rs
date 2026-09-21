@@ -15,7 +15,7 @@ use crate::policy::RuntimePolicy;
 const PARENT_NAME: &str = "two-chairs-parent";
 const WRITER_NAME: &str = "two-chairs-writer";
 const REVIEWER_NAME: &str = "two-chairs-reviewer";
-const PARENT_TOOLS: &str = "read_file,list_dir,grep,search_replace,write,task,get_command_or_subagent_output,wait_commands_or_subagents";
+const PARENT_TOOLS: &str = "read_file,list_dir,grep,search_replace,write,Agent(two-chairs-writer),Agent(two-chairs-reviewer),get_command_or_subagent_output,wait_commands_or_subagents";
 const PARENT_DENIES: &str = "run_terminal_cmd,run_terminal_command,web_search,web_fetch,search_tool,use_tool,workflow,send_subagent_message,scheduler_create,scheduler_delete,scheduler_list,monitor,kill_command_or_subagent,update_goal,todo_write,ask_user_question,enter_plan_mode,exit_plan_mode";
 
 #[derive(Clone, Debug)]
@@ -362,8 +362,8 @@ fn parent_agent_profile() -> String {
         "grep",
         "search_replace",
         "write",
-        "task",
-        "Agent(two-chairs-writer,two-chairs-reviewer)",
+        "Agent(two-chairs-writer)",
+        "Agent(two-chairs-reviewer)",
         "get_command_or_subagent_output",
         "wait_commands_or_subagents",
     ] {
@@ -566,8 +566,9 @@ mod tests {
     fn parent_profile_is_file_selectable_and_closes_authority() {
         let profile = launch().parent_profile_contents();
         assert!(profile.starts_with("---\nname: two-chairs-parent\n"));
-        assert!(profile.contains("  - \"task\"\n"));
-        assert!(profile.contains("  - \"Agent(two-chairs-writer,two-chairs-reviewer)\"\n"));
+        assert!(profile.contains("  - \"Agent(two-chairs-writer)\"\n"));
+        assert!(profile.contains("  - \"Agent(two-chairs-reviewer)\"\n"));
+        assert!(!profile.contains("  - \"task\"\n"));
         assert!(profile.contains("  - \"run_terminal_cmd\"\n"));
         assert!(profile.contains("injectDefaultTools: false\n"));
         assert!(profile.contains("mcpInheritance: none\n"));
@@ -601,9 +602,14 @@ mod tests {
             .args
             .iter()
             .any(|argument| argument == PARENT_TOOLS));
-        assert!(PARENT_TOOLS.split(',').any(|tool| tool == "task"));
+        assert!(PARENT_TOOLS
+            .split(',')
+            .any(|tool| tool == "Agent(two-chairs-writer)"));
+        assert!(PARENT_TOOLS
+            .split(',')
+            .any(|tool| tool == "Agent(two-chairs-reviewer)"));
+        assert!(!PARENT_TOOLS.split(',').any(|tool| tool == "task"));
         assert!(!PARENT_TOOLS.split(',').any(|tool| tool == "spawn_subagent"));
-        assert!(!PARENT_TOOLS.contains("Agent("));
         assert_eq!(
             invocation.env.get("GROK_SUBAGENT_MODEL_INHERITANCE"),
             Some(&"1".to_string())
