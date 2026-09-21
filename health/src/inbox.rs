@@ -20,18 +20,7 @@ pub fn write_record(paths: &HealthPaths, record: &HealthRecord) -> Result<PathBu
     }
     let file_name = format!("{}-{inbox_id}.json", record.as_of_ms);
     let dest = paths.inbox().join(file_name);
-    let temp = paths.inbox().join(format!(
-        ".{}.{}.tmp",
-        dest.file_name().and_then(|name| name.to_str()).unwrap_or("inbox"),
-        std::process::id()
-    ));
-    fs::write(&temp, bytes).map_err(|error| {
-        HealthError::msg(format!("write inbox temp {}: {error}", temp.display()))
-    })?;
-    if let Err(error) = fsutil::replace_file(&temp, &dest) {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
-    }
+    fsutil::atomic_write(&dest, &bytes)?;
     Ok(dest)
 }
 
@@ -97,7 +86,9 @@ pub fn read_record(path: &Path) -> Result<HealthRecord, InboxReadError> {
     let read = fsutil::read_bounded(path, MAX_INBOX_BYTES + 1)
         .map_err(|error| InboxReadError::Io(error.to_string()))?;
     if read.clipped {
-        return Err(InboxReadError::Malformed("inbox record exceeds bound".into()));
+        return Err(InboxReadError::Malformed(
+            "inbox record exceeds bound".into(),
+        ));
     }
     let parsed: HealthRecord = serde_json::from_slice(fsutil::strip_bom(&read.bytes))
         .map_err(|error| InboxReadError::Malformed(error.to_string()))?;
@@ -119,9 +110,8 @@ pub fn quarantine(paths: &HealthPaths, path: &Path) -> Result<(), HealthError> {
     let dest = unique_dest(&paths.quarantine().join(name));
     match fs::rename(path, &dest) {
         Ok(()) => Ok(()),
-        Err(_) => fsutil::replace_file(path, &dest).and_then(|_| {
+        Err(_) => fsutil::replace_file(path, &dest).map(|_| {
             let _ = fs::remove_file(path);
-            Ok(())
         }),
     }
 }

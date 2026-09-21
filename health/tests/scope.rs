@@ -22,10 +22,7 @@ fn windows_path_normalization_is_case_and_slash_insensitive() {
         normalize_windows_path(r"C:/Repo/"),
         normalize_windows_path(r"c:\repo")
     );
-    assert!(paths_equivalent(
-        r"\\?\C:\Work\Root",
-        r"c:\work\root"
-    ));
+    assert!(paths_equivalent(r"\\?\C:\Work\Root", r"c:\work\root"));
 }
 
 #[test]
@@ -64,16 +61,21 @@ fn worktree_discovery_reads_gitdir_files_without_spawning_git() {
     )
     .unwrap();
     let roots = worktrees_from_common_dir(&common_dir);
-    assert!(roots.iter().any(|root| paths_equivalent(root, &home.paths.root.to_string_lossy())));
-    assert!(roots.iter().any(|root| paths_equivalent(root, &worktree.to_string_lossy())));
+    assert!(roots
+        .iter()
+        .any(|root| paths_equivalent(root, &home.paths.root.to_string_lossy())));
+    assert!(roots
+        .iter()
+        .any(|root| paths_equivalent(root, &worktree.to_string_lossy())));
 }
 
 #[test]
-fn command_analysis_filename_is_exact() {
+fn command_analysis_distinguishes_exact_names_from_prefix_lookalikes() {
     let query = analyze_command(r"C:\Parley\parley-health-query.exe");
     assert_eq!(query.health_binary, Some(HealthBinary::Query));
     assert!(query.is_exact_query());
 
     let sibling = analyze_command(r"C:\Parley\parley-health-query-wrapper.exe");
-    assert!(sibling.unrelated());
+    assert_eq!(sibling.health_binary, Some(HealthBinary::Query));
+    assert!(!sibling.is_exact_query());
 }

@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::schema::{
     bound_string, nonempty_reached_type, sanitize_code, sanitize_percent, ClosedClass, Source,
-    FREE_USAGE_EXHAUSTED, MAX_CODE_LEN, MAX_PLAN_LEN,
+    FREE_USAGE_EXHAUSTED, MAX_PLAN_LEN,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,9 +159,20 @@ fn consider_field(key: &str, value: &Value, evidence: &mut GrokErrorEvidence) {
             if is_generic_rate_limit(&code) {
                 evidence.generic_rate_limit = true;
             }
-            if evidence.provider_code.is_none() {
-                evidence.provider_code = sanitize_code(Some(code));
+            let sanitized = sanitize_code(Some(code));
+            if sanitized.as_deref() == Some(FREE_USAGE_EXHAUSTED)
+                || evidence.provider_code.is_none()
+            {
+                evidence.provider_code = sanitized;
             }
+        }
+    }
+    if matches!(
+        key.as_str(),
+        "errordetails" | "error_details" | "message" | "detail" | "reason"
+    ) {
+        if let Value::String(text) = value {
+            scan_unstructured(text, evidence);
         }
     }
 }
@@ -172,7 +183,11 @@ fn as_http_status(value: &Value) -> Option<u16> {
             .as_u64()
             .and_then(|n| u16::try_from(n).ok())
             .filter(|n| (100..600).contains(n)),
-        Value::String(text) => text.trim().parse::<u16>().ok().filter(|n| (100..600).contains(n)),
+        Value::String(text) => text
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|n| (100..600).contains(n)),
         _ => None,
     }
 }
@@ -185,9 +200,10 @@ fn as_code(value: &Value) -> Option<String> {
 }
 
 fn is_generic_rate_limit(code: &str) -> bool {
+    let code = code.to_ascii_lowercase();
     matches!(
-        code,
-        "rate_limit" | "rate-limit" | "rate_limit_exceeded" | "rate_limit_reached"
+        code.as_str(),
+        "rate_limit" | "rate-limit" | "rate_limited" | "rate_limit_exceeded" | "rate_limit_reached"
     )
 }
 
@@ -207,7 +223,7 @@ fn unstructured_text(value: &Value) -> Option<&str> {
 }
 
 fn scan_unstructured(text: &str, evidence: &mut GrokErrorEvidence) {
-    if text.len() > 512 {
+    if text.len() > 2048 {
         evidence.clipped = true;
         evidence.ambiguous = true;
         return;
@@ -222,7 +238,11 @@ fn scan_unstructured(text: &str, evidence: &mut GrokErrorEvidence) {
     } else if contains_status_token(text, 529) {
         evidence.http_status = Some(529);
     }
-    if text.contains("rate_limit") || text.contains("rate-limit") {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("rate_limit")
+        || lower.contains("rate-limit")
+        || lower.contains("rate limited")
+    {
         evidence.generic_rate_limit = true;
     }
     if evidence.http_status.is_none()
@@ -230,12 +250,6 @@ fn scan_unstructured(text: &str, evidence: &mut GrokErrorEvidence) {
         && !evidence.generic_rate_limit
     {
         evidence.ambiguous = true;
-    } else if evidence.http_status != Some(429)
-        || evidence.provider_code.as_deref() != Some(FREE_USAGE_EXHAUSTED)
-    {
-        if evidence.provider_code.is_none() && evidence.http_status.is_none() {
-            evidence.ambiguous = true;
-        }
     }
 }
 

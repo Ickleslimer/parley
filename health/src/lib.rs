@@ -16,4 +16,6 @@ pub mod supervisor;
 
 mod fsutil;
 
-pub use schema::{ClosedClass, HealthError, HealthRecord, InboxKind, QueryDocument, SCHEMA_VERSION};
+pub use schema::{
+    ClosedClass, HealthError, HealthRecord, InboxKind, QueryDocument, SCHEMA_VERSION,
+};

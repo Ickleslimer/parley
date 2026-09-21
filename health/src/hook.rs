@@ -140,7 +140,11 @@ pub fn decide_pretool_use(value: &Value, scope: &ScopeFile) -> HookDecision {
     }
     match analysis.health_binary {
         Some(HealthBinary::Query) => {
-            if analysis.wrapper || analysis.chaining || analysis.redirect || analysis.extra_arguments
+            if analysis.wrapper
+                || analysis.chaining
+                || analysis.redirect
+                || analysis.extra_arguments
+                || !analysis.exact_binary_name
             {
                 return HookDecision::Deny {
                     reason: "parley-health: deny query variant",
@@ -186,10 +190,14 @@ fn emit_stop_failure(
     }
     let evidence = extract_grok_error(value, clipped);
     let session = string_field(value, &["session_id", "sessionId"]).unwrap_or_default();
+    let prompt = string_field(value, &["prompt_id", "promptId"]).unwrap_or_default();
+    let timestamp = string_field(value, &["timestamp"]).unwrap_or_default();
     let as_of_ms = now_ms();
     let mut id_src = format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}",
         session,
+        prompt,
+        timestamp,
         evidence.http_status.unwrap_or(0),
         evidence.provider_code.as_deref().unwrap_or(""),
         evidence.clipped,
@@ -201,6 +209,7 @@ fn emit_stop_failure(
     let mut record = HealthRecord::new(InboxKind::GrokStopFailure, inbox_id, as_of_ms);
     record.schema_version = SCHEMA_VERSION;
     record.source = Some(Source::Grok);
+    record.session_id = sanitize_id(&session);
     record.http_status = evidence.http_status;
     record.provider_code = evidence.provider_code;
     record.generic_rate_limit = Some(evidence.generic_rate_limit);

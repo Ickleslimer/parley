@@ -27,7 +27,10 @@ pub fn strip_bom(bytes: &[u8]) -> &[u8] {
 }
 
 pub fn is_locked_error(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(SHARE_VIOLATION) | Some(LOCK_VIOLATION))
+    matches!(
+        error.raw_os_error(),
+        Some(SHARE_VIOLATION) | Some(LOCK_VIOLATION)
+    )
 }
 
 pub fn open_shared_read(path: &Path) -> io::Result<File> {
@@ -62,7 +65,10 @@ pub fn read_bounded(path: &Path, max_bytes: usize) -> io::Result<ReadBounded> {
         }
         buf.extend_from_slice(&chunk[..read]);
     }
-    Ok(ReadBounded { bytes: buf, clipped })
+    Ok(ReadBounded {
+        bytes: buf,
+        clipped,
+    })
 }
 
 pub struct ReadBounded {
@@ -71,10 +77,11 @@ pub struct ReadBounded {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), HealthError> {
-    let parent = path.parent().ok_or_else(|| HealthError::msg("path has no parent"))?;
-    fs::create_dir_all(parent).map_err(|error| {
-        HealthError::msg(format!("create {}: {error}", parent.display()))
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| HealthError::msg("path has no parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| HealthError::msg(format!("create {}: {error}", parent.display())))?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -129,10 +136,7 @@ pub fn file_identity(path: &Path) -> io::Result<FileIdentity> {
 
 fn temp_sibling(parent: &Path, file_name: &str) -> PathBuf {
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!(
-        ".{file_name}.{}.{seq}.tmp",
-        process::id()
-    ))
+    parent.join(format!(".{file_name}.{}.{seq}.tmp", process::id()))
 }
 
 fn apply_share_mode(_options: &mut OpenOptions) {
@@ -174,7 +178,6 @@ fn identity_from_file(_file: &File) -> io::Result<FileIdentity> {
 
 #[cfg(windows)]
 fn move_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
@@ -198,6 +201,7 @@ fn move_replace(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(windows)]
 pub fn wide_null(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
+
     path.as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))

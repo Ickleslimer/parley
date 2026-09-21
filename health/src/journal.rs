@@ -32,7 +32,7 @@ fn read_records(file: File, loaded: &mut JournalLoad) -> Result<(), HealthError>
         if read == 0 {
             break;
         }
-        let had_newline = buf.ends_with(&[b'\n']);
+        let had_newline = buf.ends_with(b"\n");
         if !had_newline {
             loaded.diagnostics.journal_incomplete_trailing = true;
             break;

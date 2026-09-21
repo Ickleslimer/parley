@@ -8,10 +8,8 @@ mod common;
 #[test]
 fn snapshot_uses_atomic_replace_and_is_readable_after_rewrite() {
     let home = common::TempHome::new("snapshot-atomic");
-    let mut first = QueryDocument::unavailable(
-        parley_health::schema::UnavailableReason::Missing,
-        1,
-    );
+    let mut first =
+        QueryDocument::unavailable(parley_health::schema::UnavailableReason::Missing, 1);
     first.stale = false;
     first.unavailable = None;
     first.muted = true;
@@ -22,7 +20,10 @@ fn snapshot_uses_atomic_replace_and_is_readable_after_rewrite() {
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("tmp"))
         .collect();
-    assert!(temps.is_empty(), "temp snapshot files must not remain: {temps:?}");
+    assert!(
+        temps.is_empty(),
+        "temp snapshot files must not remain: {temps:?}"
+    );
 
     let read = snapshot::read_with_retry(&home.paths);
     assert_eq!(read.schema_version, SCHEMA_VERSION);

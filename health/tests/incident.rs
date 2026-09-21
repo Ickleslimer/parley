@@ -44,7 +44,10 @@ fn recovery_requires_newer_authoritative_evidence_not_silence() {
     supervisor
         .ingest(common::codex_sample("ok-1", 11, None), 11)
         .unwrap();
-    assert_eq!(supervisor.model.incidents[0].status, IncidentStatus::Recovered);
+    assert_eq!(
+        supervisor.model.incidents[0].status,
+        IncidentStatus::Recovered
+    );
 
     supervisor
         .ingest(
@@ -61,7 +64,9 @@ fn recovery_requires_newer_authoritative_evidence_not_silence() {
         .model
         .incidents
         .iter()
-        .any(|i| i.class == ClosedClass::QuotaExhausted && i.source == parley_health::schema::Source::Grok && i.status == IncidentStatus::Active));
+        .any(|i| i.class == ClosedClass::QuotaExhausted
+            && i.source == parley_health::schema::Source::Grok
+            && i.status == IncidentStatus::Active));
 
     supervisor
         .ingest(common::codex_sample("ok-2", 21, None), 21)
@@ -70,7 +75,8 @@ fn recovery_requires_newer_authoritative_evidence_not_silence() {
         .model
         .incidents
         .iter()
-        .any(|i| i.source == parley_health::schema::Source::Grok && i.status == IncidentStatus::Active));
+        .any(|i| i.source == parley_health::schema::Source::Grok
+            && i.status == IncidentStatus::Active));
 
     supervisor
         .ingest(common::parley_success("p-ok", 22), 22)
@@ -79,7 +85,8 @@ fn recovery_requires_newer_authoritative_evidence_not_silence() {
         .model
         .incidents
         .iter()
-        .all(|i| i.source != parley_health::schema::Source::Grok || i.status == IncidentStatus::Recovered));
+        .all(|i| i.source != parley_health::schema::Source::Grok
+            || i.status == IncidentStatus::Recovered));
 }
 
 #[test]
@@ -119,6 +126,38 @@ fn mute_suppresses_incident_sound_but_test_sound_still_plays() {
     supervisor.ingest(inbox::test_sound_record(3), 3).unwrap();
     assert_eq!(recorder.recorded(), vec![SoundKind::Test]);
     assert_eq!(supervisor.model.incidents.len(), 1);
+
+    supervisor.ingest(inbox::mute_record(false, 4), 4).unwrap();
+    supervisor
+        .ingest(common::mcp_undelivered("m-after-test", 5), 5)
+        .unwrap();
+    assert_eq!(
+        recorder.recorded(),
+        vec![SoundKind::Test, SoundKind::Incident]
+    );
+}
+
+#[test]
+fn successful_grok_turn_does_not_recover_terminal_transport_incidents() {
+    let home = common::TempHome::new("terminal-transport");
+    let mut supervisor = common::supervisor(&home);
+    let mut undelivered = common::mcp_undelivered("mcp-terminal", 10);
+    undelivered.event_id = Some("event-10".into());
+    undelivered.exchange_id = Some("exchange-10".into());
+    supervisor.ingest(undelivered, 10).unwrap();
+    supervisor
+        .ingest(common::parley_success("grok-success", 11), 11)
+        .unwrap();
+
+    let incident = supervisor
+        .model
+        .incidents
+        .iter()
+        .find(|incident| incident.class == ClosedClass::McpStdoutUndelivered)
+        .unwrap();
+    assert_eq!(incident.status, IncidentStatus::Active);
+    assert_eq!(incident.event_id.as_deref(), Some("event-10"));
+    assert_eq!(incident.exchange_id.as_deref(), Some("exchange-10"));
 }
 
 #[test]
@@ -127,7 +166,10 @@ fn watchdog_is_silent_and_cooldown_blocks_second_incident_sound() {
     let (mut supervisor, recorder) = with_recorder(&home);
     supervisor.ingest(common::watchdog("wd-1", 1), 1).unwrap();
     assert!(recorder.recorded().is_empty());
-    assert_eq!(supervisor.model.incidents[0].class, ClosedClass::WatchdogKilled);
+    assert_eq!(
+        supervisor.model.incidents[0].class,
+        ClosedClass::WatchdogKilled
+    );
 
     supervisor
         .ingest(common::codex_sample("q1", 2, Some("primary")), 2)

@@ -13,7 +13,9 @@ impl HealthPaths {
     pub fn from_env() -> Self {
         if let Some(override_root) = env::var_os("PARLEY_HEALTH_HOME").map(PathBuf::from) {
             if override_root.is_absolute() {
-                return Self { root: override_root };
+                return Self {
+                    root: override_root,
+                };
             }
         }
         Self {
@@ -58,9 +60,8 @@ impl HealthPaths {
 }
 
 fn create_dir(path: &Path) -> Result<(), HealthError> {
-    fs::create_dir_all(path).map_err(|error| {
-        HealthError::msg(format!("create {}: {error}", path.display()))
-    })
+    fs::create_dir_all(path)
+        .map_err(|error| HealthError::msg(format!("create {}: {error}", path.display())))
 }
 
 fn local_app_data() -> PathBuf {

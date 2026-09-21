@@ -5,7 +5,7 @@ use crate::fsutil;
 use crate::paths::HealthPaths;
 use crate::schema::{
     now_ms, HealthError, QueryDocument, UnavailableReason, MAX_SNAPSHOT_BYTES, SCHEMA_VERSION,
-    SNAPSHOT_RETRY_COUNT, SNAPSHOT_RETRY_MS,
+    SNAPSHOT_RETRY_COUNT, SNAPSHOT_RETRY_MS, STALE_AFTER_MS,
 };
 
 pub fn write(paths: &HealthPaths, document: &QueryDocument) -> Result<(), HealthError> {
@@ -21,7 +21,13 @@ pub fn read_with_retry(paths: &HealthPaths) -> QueryDocument {
     let mut locked = false;
     for attempt in 0..SNAPSHOT_RETRY_COUNT {
         match read_once(paths) {
-            Ok(document) => return document,
+            Ok(mut document) => {
+                document.stale = document
+                    .as_of_ms
+                    .map(|as_of_ms| generated_ms.saturating_sub(as_of_ms) > STALE_AFTER_MS)
+                    .unwrap_or(true);
+                return document;
+            }
             Err(ReadFailure::Missing) => {
                 if attempt + 1 == SNAPSHOT_RETRY_COUNT {
                     return QueryDocument::unavailable(UnavailableReason::Missing, generated_ms);

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,7 +10,6 @@ use parley_health::model::HealthModel;
 use parley_health::paths::HealthPaths;
 use parley_health::schema::{ClosedClass, HealthRecord, InboxKind, Source};
 use parley_health::scope::{normalize_windows_path, ExecutableIdentity, ScopeFile};
-use parley_health::sound::RecordingSound;
 use parley_health::supervisor::Supervisor;
 
 static SEQ: AtomicU64 = AtomicU64::new(1);
@@ -43,14 +44,6 @@ impl Drop for TempHome {
 
 pub fn supervisor(home: &TempHome) -> Supervisor {
     Supervisor::open(home.paths.clone()).expect("open supervisor")
-}
-
-pub fn supervisor_with_sound(home: &TempHome, sound: RecordingSound) -> (Supervisor, RecordingSound) {
-    let mut supervisor = Supervisor::open(home.paths.clone()).expect("open supervisor");
-    // RecordingSound is moved; tests that need both should wrap in Arc. Use set after.
-    supervisor.set_sound(Box::new(RecordingSound::new()));
-    let _ = sound;
-    (supervisor, RecordingSound::new())
 }
 
 pub fn scope_for(root: &str, query_path: &str) -> ScopeFile {
@@ -102,22 +95,16 @@ pub fn grok_stop(
 }
 
 pub fn parley_success(inbox_id: &str, as_of_ms: u64) -> HealthRecord {
-    let mut record = HealthRecord::new(
-        InboxKind::ParleyObservation,
-        inbox_id.to_string(),
-        as_of_ms,
-    );
-    record.source = Some(Source::Parley);
+    let mut record =
+        HealthRecord::new(InboxKind::ParleyObservation, inbox_id.to_string(), as_of_ms);
+    record.source = Some(Source::Grok);
     record.success = Some(true);
     record
 }
 
 pub fn watchdog(inbox_id: &str, as_of_ms: u64) -> HealthRecord {
-    let mut record = HealthRecord::new(
-        InboxKind::ParleyObservation,
-        inbox_id.to_string(),
-        as_of_ms,
-    );
+    let mut record =
+        HealthRecord::new(InboxKind::ParleyObservation, inbox_id.to_string(), as_of_ms);
     record.source = Some(Source::Parley);
     record.success = Some(false);
     record.class = Some(ClosedClass::WatchdogKilled);
@@ -125,11 +112,8 @@ pub fn watchdog(inbox_id: &str, as_of_ms: u64) -> HealthRecord {
 }
 
 pub fn mcp_undelivered(inbox_id: &str, as_of_ms: u64) -> HealthRecord {
-    let mut record = HealthRecord::new(
-        InboxKind::ParleyObservation,
-        inbox_id.to_string(),
-        as_of_ms,
-    );
+    let mut record =
+        HealthRecord::new(InboxKind::ParleyObservation, inbox_id.to_string(), as_of_ms);
     record.source = Some(Source::Parley);
     record.success = Some(false);
     record.class = Some(ClosedClass::McpStdoutUndelivered);

@@ -31,8 +31,8 @@ pub fn acquire(name: &str) -> Result<InstanceGuard, HealthError> {
 
 #[cfg(windows)]
 fn acquire_windows(name: &str) -> Result<InstanceGuard, HealthError> {
-    use std::os::windows::ffi::OsStrExt;
     use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{
         GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, INVALID_HANDLE_VALUE,
     };

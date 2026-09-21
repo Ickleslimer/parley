@@ -21,6 +21,7 @@ impl HealthBinary {
 pub struct CommandAnalysis {
     pub health_binary: Option<HealthBinary>,
     pub executable_token: Option<String>,
+    pub exact_binary_name: bool,
     pub extra_arguments: bool,
     pub wrapper: bool,
     pub chaining: bool,
@@ -34,6 +35,7 @@ impl CommandAnalysis {
 
     pub fn is_exact_query(&self) -> bool {
         self.health_binary == Some(HealthBinary::Query)
+            && self.exact_binary_name
             && !self.extra_arguments
             && !self.wrapper
             && !self.chaining
@@ -100,9 +102,14 @@ pub fn analyze_command(command: &str) -> CommandAnalysis {
     if health_binary.is_none() {
         wrapper = false;
     }
+    let exact_binary_name = match (health_binary, executable_token.as_deref()) {
+        (Some(binary), Some(token)) => token_has_exact_binary_name(token, binary),
+        _ => false,
+    };
     CommandAnalysis {
         health_binary,
         executable_token,
+        exact_binary_name,
         extra_arguments,
         wrapper,
         chaining: chaining && health_binary.is_some(),
@@ -110,14 +117,29 @@ pub fn analyze_command(command: &str) -> CommandAnalysis {
     }
 }
 
+fn token_has_exact_binary_name(token: &str, binary: HealthBinary) -> bool {
+    let name = filename(token).to_ascii_lowercase();
+    let stem = name.strip_suffix(".exe").unwrap_or(&name);
+    match binary {
+        HealthBinary::Query => stem == "parley-health-query",
+        HealthBinary::Supervisor => stem == "parley-health-supervisor",
+        HealthBinary::Hook => stem == "parley-health-hook",
+    }
+}
+
 pub fn health_binary_from_token(token: &str) -> Option<HealthBinary> {
     let name = filename(token).to_ascii_lowercase();
     let stem = name.strip_suffix(".exe").unwrap_or(&name);
-    match stem {
-        "parley-health-query" => Some(HealthBinary::Query),
-        "parley-health-supervisor" => Some(HealthBinary::Supervisor),
-        "parley-health-hook" => Some(HealthBinary::Hook),
-        _ => None,
+    if stem.starts_with("parley-health-query") || name.starts_with("parley-health-query.exe") {
+        Some(HealthBinary::Query)
+    } else if stem.starts_with("parley-health-supervisor")
+        || name.starts_with("parley-health-supervisor.exe")
+    {
+        Some(HealthBinary::Supervisor)
+    } else if stem.starts_with("parley-health-hook") || name.starts_with("parley-health-hook.exe") {
+        Some(HealthBinary::Hook)
+    } else {
+        None
     }
 }
 
@@ -216,7 +238,10 @@ fn is_leading_call_operator(chars: &[char], index: usize) -> bool {
     chars[..index].iter().all(|ch| ch.is_whitespace())
 }
 
-pub fn parse_tool_command(tool_name: &str, tool_input: &serde_json::Value) -> Result<Option<String>, HealthError> {
+pub fn parse_tool_command(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Result<Option<String>, HealthError> {
     if !is_shell_tool(tool_name) {
         return Ok(None);
     }

@@ -7,9 +7,7 @@ use crate::journal;
 use crate::model::{codex_record, durable_state, ApplyOutcome, HealthModel};
 use crate::paths::HealthPaths;
 use crate::sampler::CodexSampler;
-use crate::schema::{
-    now_ms, HealthError, HealthRecord, INBOX_BATCH, POLL_MS, SCHEMA_VERSION,
-};
+use crate::schema::{now_ms, HealthError, HealthRecord, INBOX_BATCH, POLL_MS, SCHEMA_VERSION};
 use crate::scope::{ScopeFile, ScopeUpdate};
 use crate::snapshot;
 use crate::sound::{SilentSound, Sound, SoundKind};
@@ -24,6 +22,7 @@ pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::SeqCst)
 }
 
+#[derive(Default)]
 pub struct TickOutcome {
     pub consumed: u32,
     pub quarantined: u32,
@@ -43,14 +42,6 @@ impl Supervisor {
         paths.ensure()?;
         let loaded = journal::load(&paths.journal())?;
         let mut model = HealthModel::new();
-        model.diagnostics.journal_incomplete_trailing = loaded.diagnostics.journal_incomplete_trailing;
-        model.diagnostics.malformed_journal_lines = loaded.diagnostics.malformed_journal_lines;
-        model.diagnostics.oversized_journal_lines = loaded.diagnostics.oversized_journal_lines;
-        model.diagnostics.unsupported_journal_records =
-            loaded.diagnostics.unsupported_journal_records;
-        for record in loaded.records {
-            model.replay(record);
-        }
         if let Ok(bytes) = crate::fsutil::read_bounded(&paths.state(), 256 * 1024) {
             if !bytes.clipped {
                 if let Ok(state) = serde_json::from_slice::<crate::model::DurableState>(
@@ -59,11 +50,21 @@ impl Supervisor {
                     if state.schema_version == SCHEMA_VERSION {
                         model.muted = state.muted;
                         model.acks = state.acknowledgements;
-                        model.sounded_incident_ids = state.sounded_incident_ids.into_iter().collect();
-                        model.last_sound_ms = state.last_sound_ms.or(model.last_sound_ms);
+                        model.sounded_incident_ids =
+                            state.sounded_incident_ids.into_iter().collect();
+                        model.last_sound_ms = state.last_sound_ms;
                     }
                 }
             }
+        }
+        model.diagnostics.journal_incomplete_trailing =
+            loaded.diagnostics.journal_incomplete_trailing;
+        model.diagnostics.malformed_journal_lines = loaded.diagnostics.malformed_journal_lines;
+        model.diagnostics.oversized_journal_lines = loaded.diagnostics.oversized_journal_lines;
+        model.diagnostics.unsupported_journal_records =
+            loaded.diagnostics.unsupported_journal_records;
+        for record in loaded.records {
+            model.replay(record);
         }
         let mut supervisor = Self {
             paths,
@@ -97,7 +98,11 @@ impl Supervisor {
         Ok(outcome)
     }
 
-    pub fn ingest(&mut self, record: HealthRecord, now_ms: u64) -> Result<TickOutcome, HealthError> {
+    pub fn ingest(
+        &mut self,
+        record: HealthRecord,
+        now_ms: u64,
+    ) -> Result<TickOutcome, HealthError> {
         let mut outcome = TickOutcome::default();
         self.apply_live(record, now_ms, &mut outcome)?;
         Ok(outcome)
@@ -125,8 +130,6 @@ impl Supervisor {
             }
         }
         for (incident_id, kind) in self.model.pending_incident_sounds(now_ms) {
-            let _ = self.sound.play(kind);
-            outcome.sounds.push(kind);
             let mut mark = HealthRecord::new(
                 crate::schema::InboxKind::Acknowledge,
                 format!("sounded-{incident_id}-{now_ms}"),
@@ -137,6 +140,14 @@ impl Supervisor {
             mark.source = Some(crate::schema::Source::Parley);
             journal::append(&self.paths.journal(), &mark)?;
             self.model.processed_inbox_ids.insert(mark.inbox_id);
+            self.persist(now_ms)?;
+            match self.sound.play(kind) {
+                Ok(()) => outcome.sounds.push(kind),
+                Err(_) => {
+                    self.model.diagnostics.sound_failures += 1;
+                    self.persist(now_ms)?;
+                }
+            }
         }
         self.persist(now_ms)?;
         Ok(outcome)
@@ -153,7 +164,11 @@ impl Supervisor {
         Ok(())
     }
 
-    fn note(&mut self, applied: ApplyOutcome, outcome: &mut TickOutcome) -> Result<(), HealthError> {
+    fn note(
+        &mut self,
+        applied: ApplyOutcome,
+        outcome: &mut TickOutcome,
+    ) -> Result<(), HealthError> {
         if applied.duplicate {
             return Ok(());
         }
@@ -163,12 +178,23 @@ impl Supervisor {
         if applied.recovered {
             outcome.recovered += 1;
         }
-        if let Some(kind) = applied.sound {
-            let _ = self.sound.play(kind);
-            outcome.sounds.push(kind);
-        }
+        let persist_ms = applied
+            .durable
+            .as_ref()
+            .and_then(|record| record.recorded_ms)
+            .unwrap_or_else(now_ms);
         if let Some(durable) = applied.durable {
             journal::append(&self.paths.journal(), &durable)?;
+        }
+        self.persist(persist_ms)?;
+        if let Some(kind) = applied.sound {
+            match self.sound.play(kind) {
+                Ok(()) => outcome.sounds.push(kind),
+                Err(_) => {
+                    self.model.diagnostics.sound_failures += 1;
+                    self.persist(persist_ms)?;
+                }
+            }
         }
         Ok(())
     }
@@ -179,18 +205,6 @@ impl Supervisor {
         let state = durable_state(&self.model);
         let bytes = serde_json::to_vec_pretty(&state)?;
         crate::fsutil::atomic_write(&self.paths.state(), &bytes)
-    }
-}
-
-impl Default for TickOutcome {
-    fn default() -> Self {
-        Self {
-            consumed: 0,
-            quarantined: 0,
-            sounds: Vec::new(),
-            opened: 0,
-            recovered: 0,
-        }
     }
 }
 

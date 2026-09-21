@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 use crate::classifier::{
@@ -7,8 +8,8 @@ use crate::classifier::{
 use crate::schema::{
     bound_string, nonempty_reached_type, sanitize_percent, ClosedClass, CodexSampleView,
     GrokObservationView, HealthRecord, InboxKind, IncidentStatus, IncidentView, QueryDiagnostics,
-    QueryDocument, SCHEMA_VERSION, SOUND_COOLDOWN_MS, Source, MAX_ACTIVE_INCIDENTS, MAX_PLAN_LEN,
-    MAX_RECENT_INCIDENTS,
+    QueryDocument, Source, MAX_ACTIVE_INCIDENTS, MAX_PLAN_LEN, MAX_RECENT_INCIDENTS,
+    SCHEMA_VERSION, SOUND_COOLDOWN_MS,
 };
 use crate::sound::SoundKind;
 
@@ -21,6 +22,9 @@ pub struct Incident {
     pub opened_ms: u64,
     pub as_of_ms: u64,
     pub recovered_ms: Option<u64>,
+    pub session_id: Option<String>,
+    pub event_id: Option<String>,
+    pub exchange_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -51,7 +55,8 @@ impl HealthModel {
     }
 
     pub fn replay(&mut self, record: HealthRecord) {
-        let _ = self.apply(record, record.recorded_ms.unwrap_or(record.as_of_ms), true);
+        let replay_ms = record.recorded_ms.unwrap_or(record.as_of_ms);
+        let _ = self.apply(record, replay_ms, true);
     }
 
     pub fn apply(&mut self, mut record: HealthRecord, now_ms: u64, replay: bool) -> ApplyOutcome {
@@ -83,8 +88,6 @@ impl HealthModel {
                         record.last_sound_ms = Some(now_ms);
                     }
                     SoundKind::Test => {
-                        self.last_sound_ms = Some(now_ms);
-                        record.last_sound_ms = Some(now_ms);
                         record.test_sound = Some(true);
                     }
                 }
@@ -128,25 +131,33 @@ impl HealthModel {
             .filter(|incident| incident.status == IncidentStatus::Active)
             .map(|incident| self.view(incident))
             .collect();
-        active.sort_by(|a, b| b.as_of_ms.cmp(&a.as_of_ms));
+        active.sort_by_key(|incident| Reverse(incident.as_of_ms));
         active.truncate(MAX_ACTIVE_INCIDENTS);
 
-        let mut recent: Vec<IncidentView> = self.incidents.iter().map(|incident| self.view(incident)).collect();
-        recent.sort_by(|a, b| b.opened_ms.cmp(&a.opened_ms));
+        let mut recent: Vec<IncidentView> = self
+            .incidents
+            .iter()
+            .map(|incident| self.view(incident))
+            .collect();
+        recent.sort_by_key(|incident| Reverse(incident.opened_ms));
         recent.truncate(MAX_RECENT_INCIDENTS);
 
         let unread_count = self
             .incidents
             .iter()
             .filter(|incident| {
-                incident.status == IncidentStatus::Active && !self.acks.contains_key(&incident.incident_id)
+                incident.status == IncidentStatus::Active
+                    && !self.acks.contains_key(&incident.incident_id)
             })
             .count() as u64;
 
         let as_of_ms = [
             self.latest_codex.as_ref().map(|sample| sample.as_of_ms),
             self.latest_grok.as_ref().map(|obs| obs.as_of_ms),
-            self.incidents.iter().map(|incident| incident.as_of_ms).max(),
+            self.incidents
+                .iter()
+                .map(|incident| incident.as_of_ms)
+                .max(),
         ]
         .into_iter()
         .flatten()
@@ -178,6 +189,9 @@ impl HealthModel {
             as_of_ms: incident.as_of_ms,
             recovered_ms: incident.recovered_ms,
             acknowledged: self.acks.contains_key(&incident.incident_id),
+            session_id: incident.session_id.clone(),
+            event_id: incident.event_id.clone(),
+            exchange_id: incident.exchange_id.clone(),
         }
     }
 
@@ -205,12 +219,7 @@ impl HealthModel {
         });
         let mut outcome = ApplyOutcome::default();
         if classified.class == ClosedClass::QuotaExhausted {
-            outcome.merge(self.open_or_attach(
-                classified.class,
-                Source::Codex,
-                record,
-                now_ms,
-            ));
+            outcome.merge(self.open_or_attach(classified.class, Source::Codex, record, now_ms));
         } else {
             outcome.merge(self.recover_codex(sample.as_of_ms, now_ms, record));
         }
@@ -238,12 +247,7 @@ impl HealthModel {
         });
         let mut outcome = ApplyOutcome::default();
         if classified.class.is_incident() {
-            outcome.merge(self.open_or_attach(
-                classified.class,
-                Source::Grok,
-                record,
-                now_ms,
-            ));
+            outcome.merge(self.open_or_attach(classified.class, Source::Grok, record, now_ms));
         }
         outcome
     }
@@ -307,17 +311,32 @@ impl HealthModel {
         record: &mut HealthRecord,
         now_ms: u64,
     ) -> ApplyOutcome {
-        if let Some(existing) = self
-            .incidents
-            .iter_mut()
-            .find(|incident| incident.status == IncidentStatus::Active && incident.class == class && incident.source == source)
-        {
+        let attach_existing = !matches!(
+            class,
+            ClosedClass::WatchdogKilled | ClosedClass::McpStdoutUndelivered
+        );
+        if let Some(existing) = self.incidents.iter_mut().find(|incident| {
+            attach_existing
+                && incident.status == IncidentStatus::Active
+                && incident.class == class
+                && incident.source == source
+        }) {
             existing.as_of_ms = existing.as_of_ms.max(record.as_of_ms);
+            if record.session_id.is_some() {
+                existing.session_id = record.session_id.clone();
+            }
+            if record.event_id.is_some() {
+                existing.event_id = record.event_id.clone();
+            }
+            if record.exchange_id.is_some() {
+                existing.exchange_id = record.exchange_id.clone();
+            }
             record.incident_id = Some(existing.incident_id.clone());
             let id = existing.incident_id.clone();
-            let mut outcome = ApplyOutcome::default();
-            outcome.sound = self.consider_sound(&id, class, now_ms, false);
-            return outcome;
+            return ApplyOutcome {
+                sound: self.consider_sound(&id, class, now_ms, false),
+                ..ApplyOutcome::default()
+            };
         }
         let incident_id = format!(
             "{}:{}:{:x}",
@@ -333,6 +352,9 @@ impl HealthModel {
             opened_ms: now_ms,
             as_of_ms: record.as_of_ms,
             recovered_ms: None,
+            session_id: record.session_id.clone(),
+            event_id: record.event_id.clone(),
+            exchange_id: record.exchange_id.clone(),
         });
         record.incident_id = Some(incident_id.clone());
         let mut outcome = ApplyOutcome {
@@ -381,7 +403,13 @@ impl HealthModel {
         let mut recovered_id = None;
         for incident in &mut self.incidents {
             if incident.status == IncidentStatus::Active
-                && incident.source != Source::Codex
+                && incident.source == Source::Grok
+                && matches!(
+                    incident.class,
+                    ClosedClass::QuotaExhausted
+                        | ClosedClass::CapacityThrottle
+                        | ClosedClass::TurnError
+                )
                 && as_of_ms > incident.as_of_ms
             {
                 incident.status = IncidentStatus::Recovered;
@@ -479,6 +507,7 @@ pub fn codex_record(sample: CodexUsageSample, inbox_id: String) -> HealthRecord 
     record.used_percent = sanitize_percent(sample.used_percent);
     record.resets_at = bound_string(sample.resets_at, MAX_PLAN_LEN);
     record.plan_type = bound_string(sample.plan_type, MAX_PLAN_LEN);
-    record.rate_limit_reached_type = nonempty_reached_type(sample.rate_limit_reached_type.as_deref());
+    record.rate_limit_reached_type =
+        nonempty_reached_type(sample.rate_limit_reached_type.as_deref());
     record
 }

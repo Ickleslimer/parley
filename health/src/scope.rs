@@ -105,7 +105,7 @@ impl ScopeFile {
     pub fn contains_path(&self, candidate: &str) -> bool {
         self.cached_roots()
             .iter()
-            .any(|root| canonical_contains(root, candidate))
+            .any(|root| canonical_contains_existing(root, candidate))
     }
 
     pub fn in_scope(&self, cwd: Option<&str>, workspace_root: Option<&str>) -> bool {
@@ -193,6 +193,12 @@ pub fn canonical_contains(root: &str, candidate: &str) -> bool {
     candidate.starts_with(&prefix)
 }
 
+pub fn canonical_contains_existing(root: &str, candidate: &str) -> bool {
+    let resolved_root = canonicalize_if_existing(root);
+    let resolved_candidate = canonicalize_if_existing(candidate);
+    canonical_contains(&resolved_root, &resolved_candidate)
+}
+
 pub fn paths_equivalent(left: &str, right: &str) -> bool {
     normalize_windows_path(left) == normalize_windows_path(right)
 }
@@ -200,7 +206,10 @@ pub fn paths_equivalent(left: &str, right: &str) -> bool {
 pub fn is_absolute_windows(path: &str) -> bool {
     let path = path.trim();
     let bytes = path.as_bytes();
-    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/'))
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
         || path.starts_with(r"\\")
 }
 
@@ -236,9 +245,18 @@ pub fn query_matches_installed(
     if let (Some(observed), Some(wanted)) = (observed_identity, installed.identity()) {
         return observed == wanted;
     }
+    if installed.identity().is_some() {
+        return false;
+    }
     let resolved = resolve_candidate(command_exe, cwd, path_dirs);
-    paths_equivalent(&resolved, &installed.path)
-        || paths_equivalent(command_exe, &installed.path)
+    paths_equivalent(&resolved, &installed.path) || paths_equivalent(command_exe, &installed.path)
+}
+
+fn canonicalize_if_existing(path: &str) -> String {
+    fs::canonicalize(path)
+        .ok()
+        .map(|resolved| normalize_windows_path(&resolved.to_string_lossy()))
+        .unwrap_or_else(|| normalize_windows_path(path))
 }
 
 pub fn worktrees_from_common_dir(common: &Path) -> Vec<String> {
@@ -288,7 +306,11 @@ fn refresh_one(slot: &mut Option<ExecutableIdentity>) {
 }
 
 fn push_unique(roots: &mut Vec<String>, root: String) {
-    if !root.is_empty() && !roots.iter().any(|existing| paths_equivalent(existing, &root)) {
+    if !root.is_empty()
+        && !roots
+            .iter()
+            .any(|existing| paths_equivalent(existing, &root))
+    {
         roots.push(root);
     }
 }

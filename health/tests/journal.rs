@@ -46,7 +46,9 @@ fn skips_malformed_and_unsupported_journal_lines_without_deleting() {
     assert_eq!(loaded.records[0].inbox_id, "codex-ok");
     assert_eq!(loaded.diagnostics.malformed_journal_lines, 1);
     assert_eq!(loaded.diagnostics.unsupported_journal_records, 1);
-    assert!(fs::read_to_string(home.paths.journal()).unwrap().contains("not-json"));
+    assert!(fs::read_to_string(home.paths.journal())
+        .unwrap()
+        .contains("not-json"));
 }
 
 #[test]

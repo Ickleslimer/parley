@@ -79,7 +79,11 @@ fn grok_generic_rate_limit_and_unavailable_are_not_exhaustion() {
         },
     ] {
         let classified = classify_grok(&evidence);
-        assert_ne!(classified.class, ClosedClass::QuotaExhausted, "{evidence:?}");
+        assert_ne!(
+            classified.class,
+            ClosedClass::QuotaExhausted,
+            "{evidence:?}"
+        );
         assert_eq!(classified.class, ClosedClass::CapacityThrottle);
     }
 }
@@ -116,14 +120,20 @@ fn extract_uses_structured_fields_and_does_not_require_raw_error_text() {
     });
     let evidence = extract_grok_error(&value, false);
     assert_eq!(evidence.http_status, Some(429));
-    assert_eq!(evidence.provider_code.as_deref(), Some(FREE_USAGE_EXHAUSTED));
+    assert_eq!(
+        evidence.provider_code.as_deref(),
+        Some(FREE_USAGE_EXHAUSTED)
+    );
     assert!(!evidence.clipped);
     assert_eq!(classify_grok(&evidence).class, ClosedClass::QuotaExhausted);
 }
 
 #[test]
 fn extract_marks_clipped_stdin_and_unstructured_text_without_tokens_as_non_exhausting() {
-    let clipped = extract_grok_error(&json!({"error": {"status": 429, "code": FREE_USAGE_EXHAUSTED}}), true);
+    let clipped = extract_grok_error(
+        &json!({"error": {"status": 429, "code": FREE_USAGE_EXHAUSTED}}),
+        true,
+    );
     assert!(clipped.clipped);
     assert_eq!(classify_grok(&clipped).class, ClosedClass::TurnError);
 

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const SOUND_COOLDOWN_MS: u64 = 60_000;
+pub const STALE_AFTER_MS: u64 = 120_000;
 pub const MAX_HOOK_STDIN: usize = 256 * 1024;
 pub const MAX_INBOX_BYTES: usize = 64 * 1024;
 pub const MAX_JOURNAL_LINE: usize = 64 * 1024;
@@ -171,6 +172,12 @@ pub struct HealthRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incident_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovered_incident_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub muted: Option<bool>,
@@ -203,6 +210,9 @@ impl HealthRecord {
             ambiguous: None,
             success: None,
             incident_id: None,
+            session_id: None,
+            event_id: None,
+            exchange_id: None,
             recovered_incident_id: None,
             muted: None,
             sounded_incident_id: None,
@@ -247,9 +257,16 @@ pub struct IncidentView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovered_ms: Option<u64>,
     pub acknowledged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct QueryDiagnostics {
     pub snapshot_missing: bool,
     pub snapshot_malformed: bool,
@@ -260,6 +277,7 @@ pub struct QueryDiagnostics {
     pub unsupported_journal_records: u64,
     pub quarantined_inbox: u64,
     pub malformed_inbox: u64,
+    pub sound_failures: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,9 +365,9 @@ pub fn sanitize_code(value: Option<String>) -> Option<String> {
         let bytes = code.as_bytes();
         !bytes.is_empty()
             && bytes[0].is_ascii_alphanumeric()
-            && bytes[1..]
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b':' | b'.'))
+            && bytes[1..].iter().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b':' | b'.')
+            })
     })
 }
 

@@ -31,7 +31,14 @@ fn pretool_use_is_deny_only_and_silent_for_exact_in_scope_query() {
         HookDecision::Silent
     );
     assert_eq!(
-        decide_pretool_use(&pretool(r"C:\Parley\PARLEY-HEALTH-QUERY.EXE", r"C:\REPO\src", r"C:\repo"), &scope),
+        decide_pretool_use(
+            &pretool(
+                r"C:\Parley\PARLEY-HEALTH-QUERY.EXE",
+                r"C:\REPO\src",
+                r"C:\repo"
+            ),
+            &scope
+        ),
         HookDecision::Silent
     );
     assert_eq!(
@@ -48,6 +55,8 @@ fn pretool_use_is_deny_only_and_silent_for_exact_in_scope_query() {
         format!("{query} | more"),
         format!("{query} > out.json"),
         format!("{query} 2> err.txt"),
+        format!("{query}.evil"),
+        r"C:\Parley\parley-health-query-helper.exe".to_string(),
         r"C:\Parley\parley-health-supervisor.exe".to_string(),
         r"C:\Parley\parley-health-hook.exe".to_string(),
         r"C:\other\parley-health-query.exe".to_string(),
@@ -60,7 +69,9 @@ fn pretool_use_is_deny_only_and_silent_for_exact_in_scope_query() {
         );
         let json = serde_json::to_string(&json!({ "permissionDecision": "deny" })).unwrap();
         assert!(json.contains("deny"));
-        assert!(!format!("{decision:?}").to_ascii_lowercase().contains("allow"));
+        assert!(!format!("{decision:?}")
+            .to_ascii_lowercase()
+            .contains("allow"));
     }
 }
 
@@ -73,7 +84,10 @@ fn out_of_scope_health_invocation_denies_unrelated_tools_noop() {
         HookDecision::Deny { .. }
     ));
     assert_eq!(
-        decide_pretool_use(&pretool("cargo test", r"C:\repo-evil", r"C:\repo-evil"), &scope),
+        decide_pretool_use(
+            &pretool("cargo test", r"C:\repo-evil", r"C:\repo-evil"),
+            &scope
+        ),
         HookDecision::Silent
     );
     assert!(deny_reason(decide_pretool_use(

@@ -1,12 +1,10 @@
 use std::fs;
 use std::os::windows::fs::OpenOptionsExt;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use parley_health::query;
-use parley_health::schema::UnavailableReason;
+use parley_health::schema::{now_ms, UnavailableReason};
 use serde_json::Value;
-use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 mod common;
 
@@ -22,8 +20,9 @@ fn parse_json(text: &str) -> Value {
 fn zero_argument_query_reads_snapshot_and_rejects_extra_args() {
     let home = common::TempHome::new("query-args");
     let mut supervisor = common::supervisor(&home);
+    let sample_ms = now_ms();
     supervisor
-        .ingest(common::codex_sample("q-1", 8, None), 8)
+        .ingest(common::codex_sample("q-1", sample_ms, None), sample_ms)
         .unwrap();
 
     let output = Command::new(query_bin())
@@ -45,7 +44,10 @@ fn zero_argument_query_reads_snapshot_and_rejects_extra_args() {
         .unwrap();
     assert_eq!(denied.status.code(), Some(2));
     let denied_json = parse_json(&String::from_utf8(denied.stdout).unwrap());
-    assert_eq!(denied_json["unavailable"]["reason"], "arguments_not_allowed");
+    assert_eq!(
+        denied_json["unavailable"]["reason"],
+        "arguments_not_allowed"
+    );
     assert_eq!(denied_json["stale"], true);
     let after = fs::metadata(home.paths.snapshot()).unwrap();
     assert_eq!(before.modified().unwrap(), after.modified().unwrap());
@@ -92,7 +94,6 @@ fn locked_snapshot_is_reported_unavailable_without_write() {
     assert_eq!(json["unavailable"]["reason"], "locked");
     assert_eq!(json["stale"], true);
     let _ = UnavailableReason::Locked;
-    let _ = SystemTime::now().duration_since(UNIX_EPOCH);
 }
 
 #[test]

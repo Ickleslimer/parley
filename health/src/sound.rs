@@ -72,7 +72,9 @@ impl WindowsSound {
 #[cfg(windows)]
 impl Sound for WindowsSound {
     fn play(&self, _kind: SoundKind) -> Result<(), String> {
-        use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
+        use windows_sys::Win32::Media::Audio::{
+            PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT,
+        };
 
         if !self.wav_path.is_file() {
             return Err("two-chairs wav is not installed".to_string());
