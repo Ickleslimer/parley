@@ -74,6 +74,11 @@ pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = autostart_result {
         state.set_runtime_error(format!("failed to read launch-at-login state: {error}"));
     }
+    if launch.exit {
+        state.mark_exiting();
+        app.handle().exit(0);
+        return Ok(());
+    }
 
     let saved_source = state.settings().viewer.selected_log;
     let environment_source = env::var_os("PARLEY_EVENT_LOG");
@@ -142,6 +147,10 @@ pub fn handle_second_instance<R: Runtime>(app: &AppHandle<R>, args: Vec<String>)
             return;
         }
     };
+    if options.exit {
+        exit_app(app);
+        return;
+    }
     if let Some(path) = options.event_log.clone() {
         if let Err(error) = state.set_source(Some(path), true) {
             state.set_runtime_error(error);

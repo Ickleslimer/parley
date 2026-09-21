@@ -8,6 +8,7 @@ pub struct LaunchOptions {
     pub event_log: Option<PathBuf>,
     pub show: bool,
     pub autostart: bool,
+    pub exit: bool,
 }
 
 impl LaunchOptions {
@@ -20,6 +21,8 @@ impl LaunchOptions {
                 options.show = true;
             } else if argument == "--autostart" {
                 options.autostart = true;
+            } else if argument == "--exit" {
+                options.exit = true;
             } else if argument == "--event-log" {
                 let value = args
                     .next()
@@ -42,7 +45,7 @@ impl LaunchOptions {
     }
 
     pub fn show_detail(&self) -> bool {
-        self.show || !self.autostart
+        !self.exit && (self.show || !self.autostart)
     }
 
     fn set_event_log(&mut self, value: OsString) -> Result<(), String> {
@@ -124,6 +127,11 @@ mod tests {
             .expect("arguments should parse");
         assert!(shown.show_detail());
         assert!(LaunchOptions::default().show_detail());
+
+        let exit = LaunchOptions::parse(args(&["parley-viewer.exe", "--exit"]))
+            .expect("exit should parse");
+        assert!(exit.exit);
+        assert!(!exit.show_detail());
     }
 
     #[test]

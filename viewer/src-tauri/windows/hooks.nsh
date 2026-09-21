@@ -5,6 +5,7 @@
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  ExecWait '$\"$INSTDIR\parley-viewer.exe$\" --exit'
   ExecWait '$\"$INSTDIR\health\parley-health-supervisor.exe$\" --remove-hooks'
   ExecWait '$\"$INSTDIR\health\parley-health-supervisor.exe$\" --shutdown'
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Parley Health Supervisor"
