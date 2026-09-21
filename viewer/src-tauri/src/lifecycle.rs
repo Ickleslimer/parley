@@ -26,7 +26,7 @@ use crate::peer_health;
 use crate::runtime::{
     calculate_placement, AppState, MonitorInfo, UnderlayAction, UnderlayState, WorkArea,
 };
-use crate::settings::{load_settings, SettingsFile};
+use crate::settings::{load_settings, reconcile_autostart, AutostartReconcile, SettingsFile};
 
 const WIDGET_LABEL: &str = "widget";
 const DETAIL_LABEL: &str = "detail";
@@ -53,7 +53,7 @@ pub struct TrayControls<R: Runtime> {
 
 pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let settings_path = app.path().app_config_dir()?.join("settings.json");
-    let (mut settings, settings_error) = match load_settings(&settings_path) {
+    let (settings, settings_error) = match load_settings(&settings_path) {
         Ok(settings) => (settings, None),
         Err(error) => (SettingsFile::default(), Some(error)),
     };
@@ -62,9 +62,11 @@ pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => (LaunchOptions::default(), Some(error)),
     };
     let autostart_result = app.autolaunch().is_enabled();
-    if let Ok(enabled) = autostart_result {
-        settings.viewer.launch_at_login = enabled;
-    }
+    let autostart_action = reconcile_autostart(
+        settings.autostart_initialized,
+        settings.viewer.launch_at_login,
+        autostart_result.as_ref().ok().copied(),
+    );
 
     app.manage(AppState::new(settings_path, settings));
     let state = app.state::<AppState>();
@@ -79,6 +81,7 @@ pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         app.handle().exit(0);
         return Ok(());
     }
+    restore_autostart_registration(app, autostart_action);
 
     let saved_sources = state.settings().viewer.selected_logs;
     let environment_source = env::var_os("PARLEY_EVENT_LOG");
@@ -488,6 +491,18 @@ fn handle_tray_menu<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEven
         }
         MENU_EXIT => exit_app(app),
         _ => {}
+    }
+}
+
+fn restore_autostart_registration(app: &App, action: AutostartReconcile) {
+    let outcome = match action {
+        AutostartReconcile::KeepPreference => return,
+        AutostartReconcile::EnableRegistration => app.autolaunch().enable(),
+        AutostartReconcile::DisableRegistration => app.autolaunch().disable(),
+    };
+    if let Err(error) = outcome {
+        app.state::<AppState>()
+            .set_runtime_error(format!("failed to restore launch-at-login: {error}"));
     }
 }
 

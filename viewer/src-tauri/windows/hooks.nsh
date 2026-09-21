@@ -16,6 +16,5 @@
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
-  RMDir /r "$APPDATA\com.ickleslimer.parley-viewer"
 !macroend
 

@@ -44,7 +44,8 @@ Widget excerpts are bounded to 420 Unicode scalar values and never model-generat
 - Tray creation precedes underlay attachment. Tray failure keeps the widget detached and opens detail with a visible Exit action.
 - Underlay failure keeps the widget hidden, reports degraded state, and enters bounded reattachment cycles. No always-on-top, click-through, or ordinary-window fallback is allowed.
 - Closing detail hides it to tray. Only the Exit action or tray Exit terminates the process.
-- Health and context evidence directories are external to viewer settings and survive uninstall.
+- Viewer settings (`%APPDATA%\com.ickleslimer.parley-viewer\settings.json`), `%LOCALAPPDATA%\Parley\health`, and `%LOCALAPPDATA%\Parley\context` all survive uninstall and upgrade.
+- Once `autostartInitialized` is true, saved `launchAtLogin` stays authoritative: startup restores or clears the viewer Run entry to match it, including after uninstall removed the registration. First interactive detail launch still enables autostart when `autostartInitialized` is false.
 
 ## Frontend IPC
 
@@ -59,4 +60,4 @@ Widget excerpts are bounded to 420 Unicode scalar values and never model-generat
 
 ## Installer and Evidence
 
-The current-user NSIS package bundles the viewer and health binaries. It owns only its exact viewer and supervisor autostart entries plus the two exact Grok hook entries. Uninstall removes those integrations and viewer settings but preserves `%LOCALAPPDATA%\Parley\health` and `%LOCALAPPDATA%\Parley\context` as evidence. Generic binaries contain no machine-specific event-log path; local sources are seeded after installation through repeated `--event-log` arguments.
+The current-user NSIS package bundles the viewer and health binaries. It owns only its exact viewer and supervisor autostart entries plus the two exact Grok hook entries. Uninstall removes those integrations but preserves per-user viewer settings in `%APPDATA%\com.ickleslimer.parley-viewer` (placement, monitor, dimensions, selected sources, and launch preference) together with `%LOCALAPPDATA%\Parley\health` and `%LOCALAPPDATA%\Parley\context` as evidence. Generic binaries contain no machine-specific event-log path; local sources are seeded after installation through repeated `--event-log` arguments.

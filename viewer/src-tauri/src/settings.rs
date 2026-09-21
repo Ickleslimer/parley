@@ -165,6 +165,29 @@ fn legacy_settings_version() -> u32 {
     0
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutostartReconcile {
+    KeepPreference,
+    EnableRegistration,
+    DisableRegistration,
+}
+
+pub fn reconcile_autostart(
+    initialized: bool,
+    saved_launch_at_login: bool,
+    registration_enabled: Option<bool>,
+) -> AutostartReconcile {
+    if !initialized {
+        return AutostartReconcile::KeepPreference;
+    }
+    match (saved_launch_at_login, registration_enabled) {
+        (true, Some(true)) => AutostartReconcile::KeepPreference,
+        (true, _) => AutostartReconcile::EnableRegistration,
+        (false, Some(true)) => AutostartReconcile::DisableRegistration,
+        (false, _) => AutostartReconcile::KeepPreference,
+    }
+}
+
 pub fn validate_source_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
     let path = path.as_ref();
     if !path.is_absolute() {
@@ -402,5 +425,114 @@ mod tests {
     fn requires_absolute_source_paths() {
         assert!(validate_source_path(r"C:\logs\events.jsonl").is_ok());
         assert!(validate_source_path("events.jsonl").is_err());
+    }
+
+    #[test]
+    fn autostart_reconciliation_matrix() {
+        use AutostartReconcile::{DisableRegistration, EnableRegistration, KeepPreference};
+
+        assert_eq!(
+            reconcile_autostart(false, false, Some(false)),
+            KeepPreference
+        );
+        assert_eq!(
+            reconcile_autostart(false, false, Some(true)),
+            KeepPreference
+        );
+        assert_eq!(
+            reconcile_autostart(false, true, Some(false)),
+            KeepPreference
+        );
+        assert_eq!(reconcile_autostart(false, false, None), KeepPreference);
+
+        assert_eq!(reconcile_autostart(true, true, Some(true)), KeepPreference);
+        assert_eq!(
+            reconcile_autostart(true, true, Some(false)),
+            EnableRegistration
+        );
+        assert_eq!(reconcile_autostart(true, true, None), EnableRegistration);
+
+        assert_eq!(
+            reconcile_autostart(true, false, Some(false)),
+            KeepPreference
+        );
+        assert_eq!(
+            reconcile_autostart(true, false, Some(true)),
+            DisableRegistration
+        );
+        assert_eq!(reconcile_autostart(true, false, None), KeepPreference);
+    }
+
+    #[test]
+    fn installer_hooks_do_not_delete_viewer_config_or_settings() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/windows/hooks.nsh"));
+        assert!(
+            source.contains("!macro NSIS_HOOK_POSTUNINSTALL"),
+            "NSIS_HOOK_POSTUNINSTALL must remain so settings persistence is an explicit installer contract"
+        );
+
+        let commands = nsis_active_commands(source);
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("!macro NSIS_HOOK_POSTUNINSTALL")),
+            "parsed hooks must include NSIS_HOOK_POSTUNINSTALL"
+        );
+        for command in &commands {
+            assert!(
+                !command_deletes_viewer_config(command),
+                "installer hooks must not delete com.ickleslimer.parley-viewer or settings.json; offending command: {command}"
+            );
+        }
+
+        const OLD_POSTUNINSTALL_WIPE: &str = r#"
+!macro NSIS_HOOK_POSTUNINSTALL
+  RMDir /r "$APPDATA\com.ickleslimer.parley-viewer"
+!macroend
+"#;
+        assert!(
+            nsis_active_commands(OLD_POSTUNINSTALL_WIPE)
+                .iter()
+                .any(|command| command_deletes_viewer_config(command)),
+            "regression predicate must reject the previous RMDir /r config wipe"
+        );
+    }
+
+    fn nsis_active_commands(source: &str) -> Vec<String> {
+        source
+            .lines()
+            .filter_map(|line| {
+                let mut code = line;
+                if let Some((left, _)) = code.split_once(';') {
+                    code = left;
+                }
+                if let Some((left, _)) = code.split_once('#') {
+                    code = left;
+                }
+                let trimmed = code.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect()
+    }
+
+    fn nsis_verb(command: &str) -> String {
+        command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('!')
+            .to_ascii_lowercase()
+    }
+
+    fn command_deletes_viewer_config(command: &str) -> bool {
+        let verb = nsis_verb(command);
+        command
+            .to_ascii_lowercase()
+            .contains("com.ickleslimer.parley-viewer")
+            && (verb == "rmdir" || verb == "delete")
     }
 }
