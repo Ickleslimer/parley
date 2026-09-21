@@ -1,11 +1,42 @@
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::harness::Invocation;
+
+#[derive(Clone, Default)]
+pub(crate) struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    #[allow(dead_code)]
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) trait SpawnObserver: Send + Sync {
+    fn process_created(&self, _process_id: u32) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn process_resumed(&self, _process_id: u32) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct NoopSpawnObserver;
+
+impl SpawnObserver for NoopSpawnObserver {}
 
 /// Some agent CLIs keep a single, migration-locked local state store and wedge
 /// when two instances run at once. Antigravity's `agy` is the known case: two
@@ -80,6 +111,7 @@ pub(crate) struct Captured {
     /// (overall or idle/no-output). The captured streams hold whatever arrived
     /// before the kill.
     pub timed_out: bool,
+    pub cancelled: bool,
 }
 
 impl Captured {
@@ -101,6 +133,12 @@ impl Captured {
     /// A concise reason the call did not yield a reply.
     pub(crate) fn failure_message(&self) -> String {
         let stderr = concise_error(&self.stderr);
+        if self.cancelled {
+            return match stderr {
+                Some(err) => format!("cancelled with no complete reply: {err}"),
+                None => "cancelled before a complete reply was produced".to_string(),
+            };
+        }
         if self.timed_out {
             return match stderr {
                 Some(err) => format!("timed out with no complete reply: {err}"),
@@ -214,40 +252,48 @@ pub(crate) fn capture_invocation_timeout(
     cwd: Option<&str>,
     timeouts: Timeouts,
 ) -> Result<Captured, String> {
+    capture_invocation_timeout_controlled(
+        invocation,
+        cwd,
+        timeouts,
+        &CancellationToken::default(),
+        &NoopSpawnObserver,
+    )
+}
+
+pub(crate) fn capture_invocation_timeout_controlled(
+    invocation: Invocation,
+    cwd: Option<&str>,
+    timeouts: Timeouts,
+    cancellation: &CancellationToken,
+    observer: &dyn SpawnObserver,
+) -> Result<Captured, String> {
     // Held for the whole child run for commands that can't run concurrently
     // (see `exclusive_guard`); a no-op for everything else.
     let _exclusive = exclusive_guard(&invocation.command);
 
-    let mut command = Command::new(&invocation.command);
-    command
-        .args(&invocation.args)
-        .envs(&invocation.env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-
-    // Always spawn explicitly. This makes every returned `Err` definitive
-    // evidence that no child existed; wait/reap ambiguity is represented as a
-    // non-successful `Captured` result so stateful callers fail closed.
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to start {}: {error}", invocation.command))?;
+    let mut child = match spawn_child(&invocation, cwd, observer)? {
+        SpawnedChild::Running(child) => child,
+        SpawnedChild::StartedFailure(message) => {
+            return Ok(Captured {
+                stdout: String::new(),
+                stderr: message,
+                success: false,
+                timed_out: false,
+                cancelled: false,
+            })
+        }
+    };
 
     let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let (beat_tx, beat_rx) = mpsc::channel::<()>();
 
     let out_reader = child
-        .stdout
-        .take()
+        .take_stdout()
         .map(|pipe| spawn_reader(pipe, Arc::clone(&out_buf), beat_tx.clone()));
     let err_reader = child
-        .stderr
-        .take()
+        .take_stderr()
         .map(|pipe| spawn_reader(pipe, Arc::clone(&err_buf), beat_tx.clone()));
     // Drop our own sender so the channel disconnects once both readers finish.
     drop(beat_tx);
@@ -255,17 +301,76 @@ pub(crate) fn capture_invocation_timeout(
     let started = Instant::now();
     let mut last_activity = started;
     let mut timed_out = false;
+    let mut cancelled = false;
     // Wait at idle granularity (or a short tick when only an overall bound is
     // set), reacting to output heartbeats and process exit.
     let tick = pick_tick(timeouts);
+    let mut lifecycle_error = None;
     let status = loop {
-        if let Ok(Some(exit_status)) = child.try_wait() {
-            break Some(exit_status);
+        match child.try_wait() {
+            Ok(Some(exit_code)) => {
+                if let Err(error) = child.terminate_remaining_tree() {
+                    lifecycle_error = Some(format!(
+                        "contained process tree cleanup after root exit failed: {error}"
+                    ));
+                }
+                break Some(exit_code);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let termination = child.terminate().err();
+                let reaping = child.wait().err();
+                lifecycle_error = Some(lifecycle_failure(
+                    &format!("indeterminate child wait: {error}"),
+                    termination,
+                    reaping,
+                ));
+                break None;
+            }
+        }
+        if cancellation.is_cancelled() {
+            let termination = child.terminate().err();
+            cancelled = true;
+            match child.wait() {
+                Ok(status) => {
+                    if let Some(error) = termination {
+                        lifecycle_error = Some(format!(
+                            "cancelled process termination reported an error before reap: {error}"
+                        ));
+                    }
+                    break Some(status);
+                }
+                Err(error) => {
+                    lifecycle_error = Some(lifecycle_failure(
+                        "cancelled process could not be reaped",
+                        termination,
+                        Some(error),
+                    ));
+                    break None;
+                }
+            }
         }
         if !timeouts.overall.is_zero() && started.elapsed() >= timeouts.overall {
-            let _ = child.kill();
+            let termination = child.terminate().err();
             timed_out = true;
-            break child.wait().ok();
+            match child.wait() {
+                Ok(status) => {
+                    if let Some(error) = termination {
+                        lifecycle_error = Some(format!(
+                            "timed-out process termination reported an error before reap: {error}"
+                        ));
+                    }
+                    break Some(status);
+                }
+                Err(error) => {
+                    lifecycle_error = Some(lifecycle_failure(
+                        "timed-out process could not be reaped",
+                        termination,
+                        Some(error),
+                    ));
+                    break None;
+                }
+            }
         }
         match beat_rx.recv_timeout(tick) {
             Ok(()) => {
@@ -273,16 +378,57 @@ pub(crate) fn capture_invocation_timeout(
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Readers closed: output is complete, just reap the child.
-                break child.wait().ok();
+                // A child can close its inherited streams before it exits. Keep
+                // the watchdog active rather than switching to an unbounded
+                // blocking wait; no further output can reset the idle timer.
+                if idle_expired(last_activity, timeouts.idle) {
+                    let termination = child.terminate().err();
+                    timed_out = true;
+                    match child.wait() {
+                        Ok(status) => {
+                            if let Some(error) = termination {
+                                lifecycle_error = Some(format!(
+                                    "idle-timed-out process termination reported an error before reap: {error}"
+                                ));
+                            }
+                            break Some(status);
+                        }
+                        Err(error) => {
+                            lifecycle_error = Some(lifecycle_failure(
+                                "idle-timed-out process could not be reaped",
+                                termination,
+                                Some(error),
+                            ));
+                            break None;
+                        }
+                    }
+                }
+                thread::sleep(tick);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if idle_expired(last_activity, timeouts.idle) {
                     // Approximation: no heartbeat within the idle window. Good
                     // enough — a steadily-emitting child keeps resetting it.
-                    let _ = child.kill();
+                    let termination = child.terminate().err();
                     timed_out = true;
-                    break child.wait().ok();
+                    match child.wait() {
+                        Ok(status) => {
+                            if let Some(error) = termination {
+                                lifecycle_error = Some(format!(
+                                    "idle-timed-out process termination reported an error before reap: {error}"
+                                ));
+                            }
+                            break Some(status);
+                        }
+                        Err(error) => {
+                            lifecycle_error = Some(lifecycle_failure(
+                                "idle-timed-out process could not be reaped",
+                                termination,
+                                Some(error),
+                            ));
+                            break None;
+                        }
+                    }
                 }
             }
         }
@@ -295,15 +441,181 @@ pub(crate) fn capture_invocation_timeout(
     }
 
     let stdout = String::from_utf8_lossy(&out_buf.lock().unwrap()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_buf.lock().unwrap()).into_owned();
-    let success = !timed_out && status.map(|s| s.success()).unwrap_or(false);
+    let mut stderr = String::from_utf8_lossy(&err_buf.lock().unwrap()).into_owned();
+    if let Some(error) = &lifecycle_error {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(error);
+    }
+    let success = lifecycle_error.is_none() && !timed_out && !cancelled && status == Some(0);
 
     Ok(Captured {
         stdout,
         stderr,
         success,
         timed_out,
+        cancelled,
     })
+}
+
+enum SpawnedChild {
+    Running(RunningChild),
+    StartedFailure(String),
+}
+
+enum RunningChild {
+    Standard(Child),
+    #[cfg(windows)]
+    Contained(crate::winjob::ContainedChild),
+}
+
+impl RunningChild {
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        match self {
+            Self::Standard(child) => child
+                .stdout
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+            #[cfg(windows)]
+            Self::Contained(child) => child.take_stdout(),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn Read + Send>> {
+        match self {
+            Self::Standard(child) => child
+                .stderr
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+            #[cfg(windows)]
+            Self::Contained(child) => child.take_stderr(),
+        }
+    }
+
+    fn try_wait(&mut self) -> Result<Option<u32>, String> {
+        match self {
+            Self::Standard(child) => child
+                .try_wait()
+                .map(|status| status.map(|status| status.code().unwrap_or(1) as u32))
+                .map_err(|error| format!("wait for child: {error}")),
+            #[cfg(windows)]
+            Self::Contained(child) => child.try_wait(),
+        }
+    }
+
+    fn wait(&mut self) -> Result<u32, String> {
+        match self {
+            Self::Standard(child) => child
+                .wait()
+                .map(|status| status.code().unwrap_or(1) as u32)
+                .map_err(|error| format!("wait for child: {error}")),
+            #[cfg(windows)]
+            Self::Contained(child) => child.wait(),
+        }
+    }
+
+    fn terminate(&mut self) -> Result<(), String> {
+        match self {
+            Self::Standard(child) => child
+                .kill()
+                .map_err(|error| format!("terminate child: {error}")),
+            #[cfg(windows)]
+            Self::Contained(child) => child.terminate(),
+        }
+    }
+
+    fn terminate_remaining_tree(&mut self) -> Result<(), String> {
+        match self {
+            Self::Standard(_) => Ok(()),
+            #[cfg(windows)]
+            Self::Contained(child) => child.terminate(),
+        }
+    }
+}
+
+fn lifecycle_failure(
+    primary: &str,
+    termination: Option<String>,
+    reaping: Option<String>,
+) -> String {
+    let mut message = primary.to_string();
+    if let Some(error) = termination {
+        message.push_str(&format!("; termination failed: {error}"));
+    }
+    if let Some(error) = reaping {
+        message.push_str(&format!("; reap failed: {error}"));
+    }
+    message
+}
+
+fn spawn_child(
+    invocation: &Invocation,
+    cwd: Option<&str>,
+    observer: &dyn SpawnObserver,
+) -> Result<SpawnedChild, String> {
+    #[cfg(windows)]
+    if should_use_job_object(invocation) {
+        return match crate::winjob::spawn(
+            invocation,
+            cwd,
+            |process_id| observer.process_created(process_id),
+            |process_id| observer.process_resumed(process_id),
+        ) {
+            Ok(child) => Ok(SpawnedChild::Running(RunningChild::Contained(child))),
+            Err(error) if error.started => Ok(SpawnedChild::StartedFailure(error.message)),
+            Err(error) => Err(format!(
+                "failed to start {}: {}",
+                invocation.command, error.message
+            )),
+        };
+    }
+
+    let mut command = Command::new(&invocation.command);
+    command
+        .args(&invocation.args)
+        .envs(&invocation.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to start {}: {error}", invocation.command))?;
+    if let Err(error) = observer
+        .process_created(child.id())
+        .and_then(|()| observer.process_resumed(child.id()))
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(SpawnedChild::StartedFailure(format!(
+            "spawn observer failed: {error}"
+        )));
+    }
+    Ok(SpawnedChild::Running(RunningChild::Standard(child)))
+}
+
+#[cfg(windows)]
+fn should_use_job_object(invocation: &Invocation) -> bool {
+    #[cfg(test)]
+    if invocation
+        .env
+        .get("PARLEY_TEST_FORCE_JOB_OBJECT")
+        .is_some_and(|value| value == "1")
+    {
+        return true;
+    }
+    let is_grok = std::path::Path::new(&invocation.command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("grok") || name.eq_ignore_ascii_case("grok.exe")
+        });
+    let is_locked = invocation.env.contains_key("PARLEY_GROK_LOCKED_VERSION")
+        || std::env::var_os("PARLEY_GROK_LOCKED_VERSION").is_some();
+    is_grok && is_locked
 }
 
 /// How often the watchdog wakes to re-check budgets. Bounded so an overall-only
@@ -407,6 +719,61 @@ mod tests {
         assert!(!out.timed_out);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn contained_root_exit_terminates_background_descendants_before_reader_join() {
+        let mut invocation = Invocation::new(
+            std::env::current_exe().unwrap().to_string_lossy(),
+            vec![
+                "--exact".to_string(),
+                "process::tests::contained_background_helper".to_string(),
+                "--ignored".to_string(),
+                "--nocapture".to_string(),
+                "--test-threads=1".to_string(),
+            ],
+        );
+        invocation
+            .env
+            .insert("PARLEY_TEST_FORCE_JOB_OBJECT".to_string(), "1".to_string());
+        let started = Instant::now();
+        let output = capture_invocation_timeout_controlled(
+            invocation,
+            None,
+            Timeouts {
+                overall: Duration::from_secs(5),
+                idle: Duration::from_secs(5),
+            },
+            &CancellationToken::default(),
+            &NoopSpawnObserver,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "elapsed={:?} success={} timed_out={} stderr={} stdout={}",
+            started.elapsed(),
+            output.success,
+            output.timed_out,
+            output.stderr,
+            output.stdout
+        );
+        assert!(
+            output.success,
+            "timed_out={} cancelled={} stderr={} stdout={}",
+            output.timed_out, output.cancelled, output.stderr, output.stdout
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    #[allow(clippy::zombie_processes)]
+    fn contained_background_helper() {
+        Command::new("ping.exe")
+            .args(["-n", "30", "127.0.0.1"])
+            .spawn()
+            .unwrap();
+    }
+
     #[test]
     fn completes_before_timeout() {
         let timeouts = Timeouts {
@@ -425,6 +792,7 @@ mod tests {
             stderr: stderr.to_string(),
             success,
             timed_out,
+            cancelled: false,
         }
     }
 

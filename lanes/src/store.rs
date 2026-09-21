@@ -1,18 +1,22 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::error::{Denial, LaneError};
 use crate::fsutil::{self, metadata_is_reparse};
 use crate::pathcheck::{self, normal_path, same_dir};
 use crate::schema::{
-    parse_grant, seal, validate_draft_shape, validate_token, Access, GrantDraft, GrantKind,
-    GrantRecord, GrantState, PathGrant, MAX_CHILDREN, MAX_GRANT_BYTES, SCHEMA_VERSION,
+    parse_grant, seal, validate_draft_shape, validate_identifier, validate_token, Access,
+    GrantDraft, GrantKind, GrantRecord, GrantState, PathGrant, MAX_CHILDREN, MAX_GRANT_BYTES,
+    SCHEMA_VERSION,
 };
+use crate::validate::{validate_spawn, SpawnClaim};
 
 pub fn create_grant(state_dir: &Path, draft: GrantDraft) -> Result<GrantRecord, LaneError> {
     validate_draft_shape(&draft)?;
     let cwd = pathcheck::observe_dir(&draft.canonical_cwd)?;
     let common = pathcheck::observe_dir(&draft.worktree_common_dir)?;
+    confirm_git_worktree(&cwd.canonical, &common, &draft.base_commit)?;
     let path_grants = normalize_grants(&cwd, draft.role, &draft.path_grants)?;
     let _lock = fsutil::acquire_lock(state_dir)?;
     let existing = load_all(state_dir)?;
@@ -20,7 +24,7 @@ pub fn create_grant(state_dir: &Path, draft: GrantDraft) -> Result<GrantRecord, 
     let record = GrantRecord {
         schema_version: SCHEMA_VERSION,
         grant_id: draft.grant_id.clone(),
-        state: GrantState::Active,
+        state: GrantState::Prepared,
         lane_id: draft.lane_id.clone(),
         role: draft.role,
         canonical_cwd: cwd.canonical.to_string_lossy().into_owned(),
@@ -30,10 +34,16 @@ pub fn create_grant(state_dir: &Path, draft: GrantDraft) -> Result<GrantRecord, 
         base_commit: draft.base_commit.to_ascii_lowercase(),
         path_grants,
         model: draft.model,
+        reasoning_effort: draft.reasoning_effort,
         depth: draft.depth,
         child_slot: draft.child_slot,
         issued_at_ms: draft.issued_at_ms,
         expires_at_ms: draft.expires_at_ms,
+        parent_session_id: None,
+        spawn_tool_use_id: None,
+        child_session_id: None,
+        claimed_at_ms: None,
+        started_at_ms: None,
         consumed_at_ms: None,
         metadata_hash: String::new(),
     };
@@ -61,7 +71,12 @@ pub fn consume_grant(
     }
     let _lock = fsutil::acquire_lock(state_dir)?;
     let mut record = read_grant(state_dir, grant_id)?;
-    ensure_live(&record, now_ms)?;
+    if record.state == GrantState::Consumed || record.consumed_at_ms.is_some() {
+        return Err(LaneError::new(
+            Denial::ConsumedGrant,
+            "grant is already consumed",
+        ));
+    }
     confirm_bindings(&record)?;
     record.state = GrantState::Consumed;
     record.consumed_at_ms = Some(now_ms);
@@ -103,9 +118,95 @@ pub fn activate_grant(
     now_ms: u64,
 ) -> Result<GrantRecord, LaneError> {
     let record = read_grant(state_dir, grant_id)?;
-    ensure_live(&record, now_ms)?;
+    ensure_usable(&record, now_ms)?;
     confirm_bindings(&record)?;
     Ok(record)
+}
+
+pub fn claim_grant_for_spawn(
+    state_dir: &Path,
+    cwd: &Path,
+    claim: &SpawnClaim<'_>,
+    parent_session_id: &str,
+    spawn_tool_use_id: &str,
+    now_ms: u64,
+) -> Result<GrantRecord, LaneError> {
+    if !validate_identifier(parent_session_id) || !validate_identifier(spawn_tool_use_id) {
+        return Err(LaneError::new(
+            Denial::MalformedHook,
+            "spawn lifecycle identifier is malformed",
+        ));
+    }
+    ensure_state_dir(state_dir)?;
+    let observed = pathcheck::observe_dir(cwd)?;
+    let _lock = fsutil::acquire_lock(state_dir)?;
+    let mut record = select_grant_for_observed(state_dir, &observed, now_ms)?
+        .ok_or_else(|| LaneError::new(Denial::MissingGrant, "spawn cwd has no child grant"))?;
+    if record.state != GrantState::Prepared {
+        return Err(LaneError::new(
+            Denial::ConsumedGrant,
+            "child grant has already been claimed",
+        ));
+    }
+    confirm_bindings(&record)?;
+    validate_spawn(&record, claim, now_ms)?;
+    record.state = GrantState::Claimed;
+    record.parent_session_id = Some(parent_session_id.to_string());
+    record.spawn_tool_use_id = Some(spawn_tool_use_id.to_string());
+    record.claimed_at_ms = Some(now_ms);
+    replace_grant(state_dir, &record)?;
+    read_grant(state_dir, &record.grant_id)
+}
+
+pub fn bind_grant_for_child(
+    state_dir: &Path,
+    cwd: &Path,
+    role: &str,
+    child_session_id: &str,
+    now_ms: u64,
+) -> Result<GrantRecord, LaneError> {
+    if !validate_identifier(child_session_id) {
+        return Err(LaneError::new(
+            Denial::MalformedHook,
+            "child session identifier is malformed",
+        ));
+    }
+    ensure_state_dir(state_dir)?;
+    let observed = pathcheck::observe_dir(cwd)?;
+    let _lock = fsutil::acquire_lock(state_dir)?;
+    let mut record = select_grant_for_observed(state_dir, &observed, now_ms)?
+        .ok_or_else(|| LaneError::new(Denial::MissingGrant, "child cwd has no grant"))?;
+    confirm_bindings(&record)?;
+    if role != record.role.as_str() {
+        return Err(LaneError::new(
+            Denial::Role,
+            "child role does not match the grant",
+        ));
+    }
+    match record.state {
+        GrantState::Prepared => Err(LaneError::new(
+            Denial::MissingGrant,
+            "child grant was not claimed by a parent spawn",
+        )),
+        GrantState::Claimed => {
+            record.state = GrantState::Running;
+            record.child_session_id = Some(child_session_id.to_string());
+            record.started_at_ms = Some(now_ms);
+            replace_grant(state_dir, &record)?;
+            read_grant(state_dir, &record.grant_id)
+        }
+        GrantState::Running if record.child_session_id.as_deref() == Some(child_session_id) => {
+            Ok(record)
+        }
+        GrantState::Running => Err(LaneError::new(
+            Denial::Role,
+            "grant is bound to another child session",
+        )),
+        GrantState::Consumed => Err(LaneError::new(
+            Denial::ConsumedGrant,
+            "child grant is consumed",
+        )),
+    }
 }
 
 pub fn find_grant_for_cwd(
@@ -115,33 +216,7 @@ pub fn find_grant_for_cwd(
 ) -> Result<Option<GrantRecord>, LaneError> {
     ensure_state_dir(state_dir)?;
     let observed = pathcheck::observe_dir(cwd)?;
-    let records = load_all(state_dir)?;
-    let mut matched = Vec::new();
-    for record in records {
-        let root = normal_path(Path::new(&record.canonical_cwd))?;
-        if same_dir(&root, &observed.normal) {
-            matched.push(record);
-        }
-    }
-    let live: Vec<&GrantRecord> = matched
-        .iter()
-        .filter(|record| is_live_at(record, now_ms))
-        .collect();
-    match live.len() {
-        1 => Ok(Some(activate_grant(state_dir, &live[0].grant_id, now_ms)?)),
-        count if count > 1 => Err(LaneError::new(
-            Denial::Cwd,
-            "multiple active grants match one cwd",
-        )),
-        _ if matched.is_empty() => Ok(None),
-        _ => {
-            let latest = matched
-                .iter()
-                .max_by_key(|record| record.issued_at_ms)
-                .expect("matched is not empty");
-            Ok(Some(activate_grant(state_dir, &latest.grant_id, now_ms)?))
-        }
-    }
+    select_grant_for_observed(state_dir, &observed, now_ms)
 }
 
 pub fn has_stored_grants(state_dir: &Path) -> Result<bool, LaneError> {
@@ -150,7 +225,27 @@ pub fn has_stored_grants(state_dir: &Path) -> Result<bool, LaneError> {
 
 pub fn path_targets_lane(state_dir: &Path, path: &Path) -> Result<bool, LaneError> {
     ensure_state_dir(state_dir)?;
-    let target = normal_path(path)?;
+    if !path.is_absolute() {
+        return Err(LaneError::new(
+            Denial::Path,
+            "lane target check requires an absolute path",
+        ));
+    }
+    fsutil::refuse_reparse_chain(path)?;
+    let existing = deepest_existing(path)?;
+    let existing_canonical = fs::canonicalize(&existing).map_err(|error| {
+        LaneError::new(
+            Denial::Path,
+            format!("canonicalize target ancestor: {error}"),
+        )
+    })?;
+    let suffix = path.strip_prefix(&existing).map_err(|_| {
+        LaneError::new(
+            Denial::Path,
+            "target path is not beneath its existing ancestor",
+        )
+    })?;
+    let target = normal_path(&existing_canonical.join(suffix))?;
     for record in load_all(state_dir)? {
         let root = normal_path(Path::new(&record.canonical_cwd))?;
         if target.drive == root.drive
@@ -161,6 +256,10 @@ pub fn path_targets_lane(state_dir: &Path, path: &Path) -> Result<bool, LaneErro
         }
     }
     Ok(false)
+}
+
+pub fn path_has_multiple_links(path: &Path) -> Result<bool, LaneError> {
+    Ok(fsutil::file_link_count(path)? > 1)
 }
 
 fn ensure_state_dir(state_dir: &Path) -> Result<(), LaneError> {
@@ -334,14 +433,40 @@ fn ensure_capacity(
 }
 
 fn lifetimes_overlap(record: &GrantRecord, draft: &GrantDraft) -> bool {
-    record.state == GrantState::Active
+    record.state != GrantState::Consumed
         && record.consumed_at_ms.is_none()
         && record.issued_at_ms < draft.expires_at_ms
         && draft.issued_at_ms < record.expires_at_ms
 }
 
+fn deepest_existing(path: &Path) -> Result<PathBuf, LaneError> {
+    let mut current = path.to_path_buf();
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata_is_reparse(&metadata) => {
+                return Err(LaneError::new(
+                    Denial::Path,
+                    "target path traverses a reparse point",
+                ));
+            }
+            Ok(_) => return Ok(current),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = current.parent().map(Path::to_path_buf).ok_or_else(|| {
+                    LaneError::new(Denial::Path, "target path has no existing ancestor")
+                })?;
+            }
+            Err(error) => {
+                return Err(LaneError::new(
+                    Denial::Path,
+                    format!("inspect target path: {error}"),
+                ))
+            }
+        }
+    }
+}
+
 fn is_live_at(record: &GrantRecord, now_ms: u64) -> bool {
-    record.state == GrantState::Active
+    record.state != GrantState::Consumed
         && record.consumed_at_ms.is_none()
         && record.issued_at_ms <= now_ms
         && now_ms < record.expires_at_ms
@@ -385,8 +510,8 @@ fn absolute_overlap(
         || left == right
 }
 
-fn ensure_live(record: &GrantRecord, now_ms: u64) -> Result<(), LaneError> {
-    if record.state != GrantState::Active || record.consumed_at_ms.is_some() {
+fn ensure_usable(record: &GrantRecord, now_ms: u64) -> Result<(), LaneError> {
+    if record.state == GrantState::Consumed || record.consumed_at_ms.is_some() {
         return Err(LaneError::new(
             Denial::ConsumedGrant,
             "grant is already consumed",
@@ -399,6 +524,56 @@ fn ensure_live(record: &GrantRecord, now_ms: u64) -> Result<(), LaneError> {
         ));
     }
     Ok(())
+}
+
+fn select_grant_for_observed(
+    state_dir: &Path,
+    observed: &pathcheck::ObservedDir,
+    now_ms: u64,
+) -> Result<Option<GrantRecord>, LaneError> {
+    let records = load_all(state_dir)?;
+    let mut matched = Vec::new();
+    for record in records {
+        let root = normal_path(Path::new(&record.canonical_cwd))?;
+        if same_dir(&root, &observed.normal) {
+            matched.push(record);
+        }
+    }
+    let live = matched
+        .iter()
+        .filter(|record| is_live_at(record, now_ms))
+        .collect::<Vec<_>>();
+    match live.len() {
+        1 => {
+            confirm_bindings(live[0])?;
+            Ok(Some(live[0].clone()))
+        }
+        count if count > 1 => Err(LaneError::new(
+            Denial::Cwd,
+            "multiple live grants match one cwd",
+        )),
+        _ if matched.is_empty() => Ok(None),
+        _ => {
+            let latest = matched
+                .iter()
+                .max_by_key(|record| record.issued_at_ms)
+                .expect("matched is not empty");
+            ensure_usable(latest, now_ms)?;
+            confirm_bindings(latest)?;
+            Ok(Some(latest.clone()))
+        }
+    }
+}
+
+fn replace_grant(state_dir: &Path, record: &GrantRecord) -> Result<(), LaneError> {
+    let bytes = seal(record)?;
+    if crate::schema::contains_forbidden_material(&bytes) {
+        return Err(LaneError::new(
+            Denial::MalformedGrant,
+            "grant contains forbidden material",
+        ));
+    }
+    fsutil::atomic_replace(&grant_path(state_dir, &record.grant_id)?, &bytes)
 }
 
 fn confirm_bindings(record: &GrantRecord) -> Result<(), LaneError> {
@@ -417,7 +592,59 @@ fn confirm_bindings(record: &GrantRecord) -> Result<(), LaneError> {
             "worktree common-dir identity no longer matches the grant",
         ));
     }
+    confirm_git_worktree(&cwd.canonical, &common, &record.base_commit)?;
     Ok(())
+}
+
+fn confirm_git_worktree(
+    cwd: &Path,
+    expected_common: &pathcheck::ObservedDir,
+    expected_head: &str,
+) -> Result<(), LaneError> {
+    let top_level = git_output(cwd, &["rev-parse", "--show-toplevel"])?;
+    let top_level = pathcheck::observe_dir(Path::new(top_level.trim()))?;
+    let cwd_normal = normal_path(cwd)?;
+    if !same_dir(&top_level.normal, &cwd_normal) {
+        return Err(LaneError::new(
+            Denial::StaleGrant,
+            "granted cwd is no longer the Git worktree root",
+        ));
+    }
+    let common = git_output(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = pathcheck::observe_dir(Path::new(common.trim()))?;
+    if common.identity != expected_common.identity {
+        return Err(LaneError::new(
+            Denial::StaleGrant,
+            "Git common-dir no longer matches the grant",
+        ));
+    }
+    let head = git_output(cwd, &["rev-parse", "--verify", "HEAD"])?;
+    if !head.trim().eq_ignore_ascii_case(expected_head) {
+        return Err(LaneError::new(
+            Denial::StaleGrant,
+            "worktree HEAD no longer matches the grant base",
+        ));
+    }
+    Ok(())
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Result<String, LaneError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| LaneError::new(Denial::StaleGrant, format!("run Git: {error}")))?;
+    if !output.status.success() {
+        return Err(LaneError::new(
+            Denial::StaleGrant,
+            "Git worktree verification failed",
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| LaneError::new(Denial::StaleGrant, "Git output is not UTF-8"))
 }
 
 fn grant_path(state_dir: &Path, grant_id: &str) -> Result<PathBuf, LaneError> {

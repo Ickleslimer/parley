@@ -7,17 +7,25 @@ mod convert;
 mod event_log;
 mod fsx;
 mod fuse;
+mod grok_subagents;
 mod harness;
 mod health_report;
 mod installer;
+mod job_lock;
+mod job_runtime;
 mod jobs;
 mod json;
+mod lane_grants;
+mod lane_plan;
 mod mcp;
 mod model;
 mod policy;
 mod process;
 mod session;
+mod sha256;
 mod signals;
+#[cfg(windows)]
+mod winjob;
 
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};

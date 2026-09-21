@@ -19,5 +19,8 @@ pub use schema::{
     Access, ChildRole, FileIdentity, GrantDraft, GrantKind, GrantRecord, GrantState, PathGrant,
     CHILD_DEPTH, MAX_CHILD_SLOT, SCHEMA_VERSION, STATE_ENV,
 };
-pub use store::{activate_grant, consume_grant, create_grant, read_grant};
+pub use store::{
+    activate_grant, bind_grant_for_child, claim_grant_for_spawn, consume_grant, create_grant,
+    read_grant,
+};
 pub use validate::{validate_path, validate_spawn, PathClaim, SpawnClaim};

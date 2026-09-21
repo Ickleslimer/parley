@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::context::{ContextMode, ContextRecovery};
+use crate::context::{refuse_reparse_chain, ContextMode, ContextRecovery};
 
 const HARDENED_GROK_DENIES: &[&str] = &[
     "WebFetch",
@@ -132,9 +132,19 @@ pub(crate) struct RuntimePolicy {
     grok_health_query_command: Option<String>,
     grok_require_handoff_footer: bool,
     grok_subagent_mode: GrokSubagentMode,
+    guarded_subagents: Option<GuardedSubagentPolicy>,
     context_locked_source: Option<String>,
     context_locked_mode: Option<ContextMode>,
     context_require_explicit_session: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GuardedSubagentPolicy {
+    pub(crate) lane_state_dir: PathBuf,
+    pub(crate) hook_exe: PathBuf,
+    pub(crate) max_writers: usize,
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -186,6 +196,7 @@ impl Default for RuntimePolicy {
             grok_health_query_command: None,
             grok_require_handoff_footer: false,
             grok_subagent_mode: GrokSubagentMode::Unspecified,
+            guarded_subagents: None,
             context_locked_source: None,
             context_locked_mode: None,
             context_require_explicit_session: false,
@@ -273,6 +284,78 @@ impl RuntimePolicy {
                 ))
             }
         };
+        let guarded_subagents = if grok_subagent_mode == GrokSubagentMode::Guarded {
+            let lane_state_dir = env::var_os("PARLEY_LANE_STATE_DIR")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "PARLEY_GROK_SUBAGENT_MODE=guarded requires PARLEY_LANE_STATE_DIR".to_string()
+                })?;
+            if !lane_state_dir.is_absolute() {
+                return Err("PARLEY_LANE_STATE_DIR must be absolute".to_string());
+            }
+            refuse_reparse_chain(&lane_state_dir).map_err(|error| error.to_string())?;
+            let hook_exe = env::var_os("PARLEY_GROK_LANE_HOOK_EXE")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "PARLEY_GROK_SUBAGENT_MODE=guarded requires PARLEY_GROK_LANE_HOOK_EXE"
+                        .to_string()
+                })?;
+            if !hook_exe.is_absolute() || !hook_exe.is_file() {
+                return Err(format!(
+                    "PARLEY_GROK_LANE_HOOK_EXE is not an existing absolute file: {}",
+                    hook_exe.display()
+                ));
+            }
+            refuse_reparse_chain(&hook_exe).map_err(|error| error.to_string())?;
+            let hook_exe = fs::canonicalize(&hook_exe).map_err(|error| {
+                format!(
+                    "canonicalize PARLEY_GROK_LANE_HOOK_EXE {}: {error}",
+                    hook_exe.display()
+                )
+            })?;
+            let max_writers = env_nonempty("PARLEY_GROK_SUBAGENT_MAX_WRITERS")
+                .ok_or_else(|| {
+                    "PARLEY_GROK_SUBAGENT_MODE=guarded requires PARLEY_GROK_SUBAGENT_MAX_WRITERS"
+                        .to_string()
+                })?
+                .parse::<usize>()
+                .map_err(|_| "PARLEY_GROK_SUBAGENT_MAX_WRITERS must be an integer".to_string())?;
+            if max_writers != 2 {
+                return Err(
+                    "guarded Grok subagents require PARLEY_GROK_SUBAGENT_MAX_WRITERS=2".to_string(),
+                );
+            }
+            let model = grok_locked_model.clone().ok_or_else(|| {
+                "guarded Grok subagents require PARLEY_GROK_LOCKED_MODEL".to_string()
+            })?;
+            let reasoning_effort = grok_locked_reasoning_effort.clone().ok_or_else(|| {
+                "guarded Grok subagents require PARLEY_GROK_LOCKED_REASONING_EFFORT".to_string()
+            })?;
+            if model != "grok-4.7" || reasoning_effort != "xhigh" {
+                return Err(
+                    "guarded Grok subagents require locked grok-4.7 with xhigh reasoning"
+                        .to_string(),
+                );
+            }
+            if grok_locked_version.is_none() || grok_locked_permission_mode.is_none() {
+                return Err(
+                    "guarded Grok subagents require locked CLI version and permission mode"
+                        .to_string(),
+                );
+            }
+            Some(GuardedSubagentPolicy {
+                lane_state_dir,
+                hook_exe,
+                max_writers,
+                model,
+                reasoning_effort,
+            })
+        } else {
+            None
+        };
+        if let Some(guarded) = &guarded_subagents {
+            add_lane_hook_tool_rules(&guarded.hook_exe, &mut grok_denies);
+        }
         let context_locked_source =
             env_nonempty("PARLEY_CONTEXT_LOCKED_SOURCE").map(|value| value.to_ascii_lowercase());
         let context_locked_mode = env_nonempty("PARLEY_CONTEXT_LOCKED_MODE")
@@ -315,6 +398,7 @@ impl RuntimePolicy {
             grok_health_query_command,
             grok_require_handoff_footer,
             grok_subagent_mode,
+            guarded_subagents,
             context_locked_source,
             context_locked_mode,
             context_require_explicit_session,
@@ -572,6 +656,15 @@ impl RuntimePolicy {
         self.grok_subagent_mode == GrokSubagentMode::Off
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn grok_subagents_guarded(&self) -> bool {
+        self.grok_subagent_mode == GrokSubagentMode::Guarded
+    }
+
+    pub(crate) fn guarded_subagents(&self) -> Option<&GuardedSubagentPolicy> {
+        self.guarded_subagents.as_ref()
+    }
+
     pub(crate) fn requires_handoff_footer(&self) -> bool {
         self.grok_require_handoff_footer
     }
@@ -729,6 +822,11 @@ fn add_health_tool_rules(
     denies.push("Bash(*parley-health-supervisor.exe*)".to_string());
     denies.push("Bash(*parley-health-hook.exe*)".to_string());
     Ok((allows, command))
+}
+
+fn add_lane_hook_tool_rules(hook: &Path, denies: &mut Vec<String>) {
+    denies.push(format!("Bash(*{}*)", hook.to_string_lossy()));
+    denies.push("Bash(*parley-lane-hook.exe*)".to_string());
 }
 
 fn powershell_direct_command(path: &Path) -> Result<String, String> {
@@ -1237,6 +1335,19 @@ mod tests {
         assert!(!allows.iter().any(|rule| {
             rule.contains("parley-health-supervisor") || rule.contains("parley-health-hook")
         }));
+    }
+
+    #[test]
+    fn lane_hook_image_is_immutably_denied_by_path_and_name() {
+        let hook = PathBuf::from(r"C:\Program Files\Parley\lanes\parley-lane-hook.exe");
+        let mut denies = hardened_grok_denies();
+        add_lane_hook_tool_rules(&hook, &mut denies);
+        assert!(denies
+            .iter()
+            .any(|rule| rule.contains(&hook.to_string_lossy().to_string())));
+        assert!(denies
+            .iter()
+            .any(|rule| rule.contains("parley-lane-hook.exe")));
     }
 
     #[test]

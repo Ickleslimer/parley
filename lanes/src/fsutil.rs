@@ -82,6 +82,13 @@ pub fn file_identity(path: &Path) -> Result<FileIdentity, LaneError> {
     identity_of(&file)
 }
 
+pub fn file_link_count(path: &Path) -> Result<u32, LaneError> {
+    let file = open_identity(path).map_err(|error| {
+        LaneError::new(Denial::Path, format!("open path for link count: {error}"))
+    })?;
+    link_count_of(&file)
+}
+
 pub fn refuse_reparse_chain(path: &Path) -> Result<(), LaneError> {
     let mut current = PathBuf::new();
     let mut inspect = false;
@@ -263,6 +270,34 @@ fn identity_of(file: &File) -> Result<FileIdentity, LaneError> {
         Err(LaneError::new(
             Denial::Cwd,
             "file identity requires Windows",
+        ))
+    }
+}
+
+fn link_count_of(file: &File) -> Result<u32, LaneError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+        if ok == 0 {
+            return Err(LaneError::new(
+                Denial::Path,
+                format!("read file link count: {}", io::Error::last_os_error()),
+            ));
+        }
+        Ok(info.nNumberOfLinks)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Err(LaneError::new(
+            Denial::Path,
+            "file link count requires Windows",
         ))
     }
 }

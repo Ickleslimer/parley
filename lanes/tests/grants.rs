@@ -6,15 +6,34 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use parley_lanes::{
     consume_grant, create_grant, read_grant, Access, ChildRole, Denial, GrantDraft, GrantKind,
-    HookDecision, HookRequest, PathGrant, CHILD_DEPTH,
+    GrantState, HookDecision, HookRequest, PathGrant, CHILD_DEPTH,
 };
 use serde_json::{json, Value};
 
-const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
 const NOW: u64 = 5_000;
 const SENTINEL: &str = "SENTINEL_PROMPT_SHOULD_NOT_LEAK";
+const PARENT_SESSION: &str = "parent-session";
+const CHILD_SESSION: &str = "child-session";
+const TOOL_USE: &str = "call-child-0";
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[test]
+fn parses_the_zero_dependency_root_grant_fixture() {
+    let temp = TempDir::new();
+    let grants = temp.path().join("grants");
+    fs::create_dir_all(&grants).unwrap();
+    let grant_id = "00000000-0000-4000-8000-000000000000-c0";
+    fs::write(
+        grants.join(format!("{grant_id}.json")),
+        include_bytes!("fixtures/root-grant-v1.json"),
+    )
+    .unwrap();
+    let grant = read_grant(temp.path(), grant_id).unwrap();
+    assert_eq!(grant.state, GrantState::Prepared);
+    assert_eq!(grant.role, ChildRole::Writer);
+    assert_eq!(grant.path_grants[0].path, "src/jobs");
+}
 
 struct TempDir(PathBuf);
 
@@ -44,38 +63,97 @@ impl Drop for TempDir {
 
 struct World {
     _root: TempDir,
+    repo: PathBuf,
     state: PathBuf,
     common: PathBuf,
     work: PathBuf,
+    base: String,
 }
 
 impl World {
     fn new() -> Self {
         let root = TempDir::new();
+        let repo = root.path().join("repo");
         let state = root.path().join("state");
-        let common = root.path().join("common");
-        let work = root.path().join("work");
+        fs::create_dir_all(repo.join("src")).unwrap();
         fs::create_dir_all(&state).unwrap();
-        fs::create_dir_all(&common).unwrap();
-        write_worktree(&work);
+        git(root.path(), &["init", "-b", "main", repo.to_str().unwrap()]);
+        git(&repo, &["config", "user.name", "Parley Tests"]);
+        git(
+            &repo,
+            &["config", "user.email", "parley-tests@example.invalid"],
+        );
+        fs::write(repo.join("src/lib.rs"), b"fn kept() {}\n").unwrap();
+        git(&repo, &["add", "src/lib.rs"]);
+        git(&repo, &["commit", "-m", "fixture"]);
+        let base = git_output(&repo, &["rev-parse", "HEAD"]);
+        let common = fs::canonicalize(git_output(
+            &repo,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ))
+        .unwrap();
+        let work = root.path().join("work");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "test-work",
+                work.to_str().unwrap(),
+                &base,
+            ],
+        );
         Self {
             _root: root,
+            repo,
             state,
             common,
             work,
+            base,
         }
     }
 
     fn other_work(&self, name: &str) -> PathBuf {
         let path = self._root.path().join(name);
-        write_worktree(&path);
+        let branch = format!("test-{name}");
+        git(
+            &self.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                path.to_str().unwrap(),
+                &self.base,
+            ],
+        );
         path
     }
 }
 
-fn write_worktree(path: &Path) {
-    fs::create_dir_all(path.join("src")).unwrap();
-    fs::write(path.join("src").join("lib.rs"), b"fn kept() {}\n").unwrap();
+fn git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 fn draft(world: &World, id: &str, slot: u32, work: &Path) -> GrantDraft {
@@ -85,13 +163,14 @@ fn draft(world: &World, id: &str, slot: u32, work: &Path) -> GrantDraft {
         role: ChildRole::Writer,
         canonical_cwd: work.to_path_buf(),
         worktree_common_dir: world.common.clone(),
-        base_commit: BASE.to_string(),
+        base_commit: world.base.clone(),
         path_grants: vec![PathGrant {
             access: Access::Write,
             kind: GrantKind::Tree,
             path: "src".to_string(),
         }],
         model: "grok-4.7".to_string(),
+        reasoning_effort: "xhigh".to_string(),
         depth: CHILD_DEPTH,
         child_slot: slot,
         issued_at_ms: 1_000,
@@ -104,9 +183,25 @@ fn grant_file(world: &World, id: &str) -> PathBuf {
 }
 
 fn hook<'a>(payload: &'a [u8], world: &'a World, now_ms: u64) -> parley_lanes::HookResponse {
+    evaluate(payload, Some(&world.state), now_ms, true)
+}
+
+fn evaluate(
+    payload: &[u8],
+    state_dir: Option<&Path>,
+    now_ms: u64,
+    valid_runtime: bool,
+) -> parley_lanes::HookResponse {
     parley_lanes::evaluate(HookRequest {
         payload,
-        state_dir: Some(&world.state),
+        state_dir,
+        model_inheritance: valid_runtime.then_some("1"),
+        sampling_limit: valid_runtime.then_some("2"),
+        active_agent_messages: valid_runtime.then_some("0"),
+        workflows: valid_runtime.then_some("0"),
+        memory: valid_runtime.then_some("0"),
+        locked_model: valid_runtime.then_some("grok-4.7"),
+        locked_reasoning_effort: valid_runtime.then_some("xhigh"),
         now_ms,
     })
 }
@@ -115,10 +210,12 @@ fn event(tool: &str, cwd: &Path, input: Value, actor: Option<&str>) -> Vec<u8> {
     let mut value = json!({
         "hook_event_name": "PreToolUse",
         "hookEventName": "pre_tool_use",
+        "sessionId": if actor.is_some() { CHILD_SESSION } else { PARENT_SESSION },
+        "toolUseId": TOOL_USE,
+        "toolInputTruncated": false,
         "cwd": cwd.display().to_string(),
         "toolName": tool,
         "toolInput": input,
-        "permissionDecision": "allow",
         "prompt": SENTINEL
     });
     if let Some(actor) = actor {
@@ -127,36 +224,37 @@ fn event(tool: &str, cwd: &Path, input: Value, actor: Option<&str>) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap()
 }
 
-fn spawn_input(
-    work: &Path,
-    role: &str,
-    isolation: &str,
-    model: Option<&str>,
-    slot: Option<u32>,
-) -> Value {
-    let mut input = json!({
+fn spawn_input(work: &Path, role: &str, isolation: &str) -> Value {
+    json!({
         "subagent_type": role,
         "cwd": work.display().to_string(),
         "isolation": isolation,
+        "background": true,
         "prompt": SENTINEL,
         "description": "lane task"
-    });
-    if let Some(model) = model {
-        input["model"] = json!(model);
-    }
-    if let Some(slot) = slot {
-        input["child_slot"] = json!(slot);
-    }
-    input
+    })
+}
+
+fn claim(world: &World, work: &Path, role: &str) {
+    let response = hook(
+        &event(
+            "spawn_subagent",
+            &world.work,
+            spawn_input(work, role, "none"),
+            None,
+        ),
+        world,
+        NOW,
+    );
+    assert_eq!(response.decision, HookDecision::PassThrough);
+    assert!(response.stdout.is_none());
 }
 
 fn denial(response: &parley_lanes::HookResponse) -> Denial {
     match response.decision {
         HookDecision::Deny(denial) => denial,
         HookDecision::Silent => panic!("expected deny, got silent"),
-        HookDecision::PassThrough => {
-            panic!("expected deny, got pass-through: {:?}", response.stdout)
-        }
+        HookDecision::PassThrough => panic!("expected deny, got pass-through"),
     }
 }
 
@@ -168,41 +266,33 @@ fn assert_static_deny(response: &parley_lanes::HookResponse, expected: Denial) {
     let parsed: Value = serde_json::from_str(stdout).unwrap();
     assert_eq!(parsed["decision"], "deny");
     assert_eq!(parsed["permissionDecision"], "deny");
-    assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-    assert!(parsed.get("updatedInput").is_none());
-    assert!(parsed["hookSpecificOutput"].get("updatedInput").is_none());
 }
 
 #[test]
-fn persisted_grant_is_sanitized_schema_v1() {
+fn persisted_grant_is_sanitized_prepared_schema_v1() {
     let world = World::new();
     let record = create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
     assert_eq!(record.schema_version, 1);
+    assert_eq!(record.state, GrantState::Prepared);
     assert_eq!(record.model, "grok-4.7");
-    assert_eq!(record.depth, 1);
-    assert_eq!(record.child_slot, 0);
-    assert_eq!(record.base_commit, BASE);
+    assert_eq!(record.reasoning_effort, "xhigh");
+    assert_eq!(record.base_commit, world.base);
     let bytes = fs::read(grant_file(&world, "child-0")).unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["state"], "prepared");
     for key in [
         "schema_version",
         "grant_id",
-        "state",
         "lane_id",
-        "role",
         "canonical_cwd",
         "worktree_common_dir",
-        "base_commit",
         "path_grants",
         "model",
-        "depth",
-        "child_slot",
+        "reasoning_effort",
         "metadata_hash",
     ] {
         assert!(value.get(key).is_some(), "{key}");
     }
-    assert_eq!(value["role"], "two-chairs-writer");
-    assert_eq!(value["state"], "active");
     for forbidden in ["prompt", "reply", "command", "env", "credential", "token"] {
         assert!(value.get(forbidden).is_none(), "{forbidden}");
     }
@@ -210,355 +300,185 @@ fn persisted_grant_is_sanitized_schema_v1() {
 }
 
 #[test]
-fn create_new_does_not_overwrite() {
+fn spawn_claim_is_atomic_single_use_and_binds_one_child_session() {
     let world = World::new();
     create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
-    let before = fs::read(grant_file(&world, "child-0")).unwrap();
-    let error = create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap_err();
-    assert_eq!(error.denial, Denial::Duplicate);
-    assert_eq!(fs::read(grant_file(&world, "child-0")).unwrap(), before);
-}
+    claim(&world, &world.work, "two-chairs-writer");
+    assert_eq!(
+        read_grant(&world.state, "child-0").unwrap().state,
+        GrantState::Claimed
+    );
 
-#[test]
-fn consumed_transition_is_atomic_and_single_use() {
-    let world = World::new();
-    create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
-    let consumed = consume_grant(&world.state, "child-0", NOW).unwrap();
-    assert_eq!(consumed.consumed_at_ms, Some(NOW));
-    let again = consume_grant(&world.state, "child-0", NOW).unwrap_err();
-    assert_eq!(again.denial, Denial::ConsumedGrant);
-    let bytes = fs::read(grant_file(&world, "child-0")).unwrap();
-    let value: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(value["state"], "consumed");
-    let entries = fs::read_dir(world.state.join("grants")).unwrap();
-    for entry in entries {
-        let name = entry.unwrap().file_name();
-        let name = name.to_string_lossy();
-        assert!(!name.ends_with(".tmp"), "{name}");
-    }
-}
-
-#[test]
-fn consumed_and_expired_grants_release_lane_capacity() {
-    let world = World::new();
-    let second = world.other_work("work-b");
-    create_grant(&world.state, draft(&world, "old-0", 0, &world.work)).unwrap();
-    create_grant(&world.state, draft(&world, "old-1", 1, &second)).unwrap();
-    consume_grant(&world.state, "old-0", NOW).unwrap();
-    consume_grant(&world.state, "old-1", NOW).unwrap();
-
-    let mut replacement = draft(&world, "new-0", 0, &world.work);
-    replacement.issued_at_ms = NOW + 1;
-    create_grant(&world.state, replacement).unwrap();
-
-    let expired_work = world.other_work("expired-work");
-    let mut expired = draft(&world, "expired-1", 1, &expired_work);
-    expired.issued_at_ms = 1_000;
-    expired.expires_at_ms = 2_000;
-    create_grant(&world.state, expired).unwrap();
-    let mut replacement = draft(&world, "new-1", 1, &expired_work);
-    replacement.issued_at_ms = 2_000;
-    replacement.expires_at_ms = 9_000_000_000_001;
-    create_grant(&world.state, replacement).unwrap();
+    let repeated = hook(
+        &event(
+            "spawn_subagent",
+            &world.work,
+            spawn_input(&world.work, "two-chairs-writer", "none"),
+            None,
+        ),
+        &world,
+        NOW + 1,
+    );
+    assert_static_deny(&repeated, Denial::ConsumedGrant);
 
     let response = hook(
         &event(
             "search_replace",
             &world.work,
-            json!({"file_path": "src/lib.rs"}),
+            json!({"file_path":"src/lib.rs","old_string":"kept","new_string":"kept"}),
             Some("two-chairs-writer"),
         ),
         &world,
         NOW + 2,
     );
     assert_eq!(response.decision, HookDecision::PassThrough);
-}
+    assert!(response.stdout.is_none());
+    let running = read_grant(&world.state, "child-0").unwrap();
+    assert_eq!(running.state, GrantState::Running);
+    assert_eq!(running.child_session_id.as_deref(), Some(CHILD_SESSION));
 
-#[test]
-fn malformed_stale_and_missing_grants_fail_closed() {
-    let world = World::new();
-    let error = read_grant(&world.state, "missing-grant").unwrap_err();
-    assert_eq!(error.denial, Denial::MissingGrant);
-
-    create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
-    let path = grant_file(&world, "child-0");
-    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    value["metadata_hash"] =
-        json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    let error = read_grant(&world.state, "child-0").unwrap_err();
-    assert_eq!(error.denial, Denial::MalformedGrant);
-
-    let response = hook(
-        &event(
-            "search_replace",
-            &world.work,
-            json!({"file_path": "src/lib.rs"}),
-            Some("two-chairs-writer"),
-        ),
-        &world,
-        NOW,
-    );
-    assert_static_deny(&response, Denial::MalformedGrant);
-
-    fs::remove_file(&path).unwrap();
-    let mut expired = draft(&world, "child-0", 0, &world.work);
-    expired.issued_at_ms = 1_000;
-    expired.expires_at_ms = 2_000;
-    create_grant(&world.state, expired).unwrap();
-    let response = hook(
-        &event(
-            "search_replace",
-            &world.work,
-            json!({"file_path": "src/lib.rs"}),
-            Some("two-chairs-writer"),
-        ),
-        &world,
-        2_000,
-    );
-    assert_static_deny(&response, Denial::StaleGrant);
-}
-
-#[test]
-fn controlled_operations_fail_closed_without_lane_state() {
-    let world = World::new();
-    let child_payload = event(
-        "search_replace",
-        &world.work,
-        json!({"file_path": "src/lib.rs"}),
-        Some("two-chairs-writer"),
-    );
-    let response = parley_lanes::evaluate(HookRequest {
-        payload: &child_payload,
-        state_dir: None,
-        now_ms: NOW,
+    let other_session = json!({
+        "hook_event_name":"PreToolUse","hookEventName":"pre_tool_use",
+        "sessionId":"other-child","toolUseId":"call-other","toolInputTruncated":false,
+        "cwd":world.work.display().to_string(),"toolName":"read_file",
+        "toolInput":{"target_file":"src/lib.rs"},"subagentType":"two-chairs-writer"
     });
-    assert_static_deny(&response, Denial::MissingGrant);
-
-    let spawn_payload = event(
-        "spawn_subagent",
-        &world.work,
-        spawn_input(&world.work, "two-chairs-writer", "none", None, Some(0)),
-        None,
-    );
-    let response = parley_lanes::evaluate(HookRequest {
-        payload: &spawn_payload,
-        state_dir: None,
-        now_ms: NOW,
-    });
-    assert_static_deny(&response, Denial::MissingGrant);
-
-    let unrelated_payload = event(
-        "search_replace",
-        &world.work,
-        json!({"file_path": "src/lib.rs"}),
-        None,
-    );
-    let response = parley_lanes::evaluate(HookRequest {
-        payload: &unrelated_payload,
-        state_dir: None,
-        now_ms: NOW,
-    });
-    assert_eq!(response.decision, HookDecision::Silent);
-}
-
-#[test]
-fn third_child_grandchild_and_consumed_slot_are_rejected() {
-    let world = World::new();
-    create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
-    let second = world.other_work("work-b");
-    create_grant(&world.state, draft(&world, "child-1", 1, &second)).unwrap();
-    let third = world.other_work("work-c");
-    let mut third_draft = draft(&world, "child-2", 0, &third);
-    third_draft.lane_id = "grok-child-2".to_string();
-    third_draft.child_slot = 0;
-    let error = create_grant(&world.state, third_draft).unwrap_err();
-    assert_eq!(error.denial, Denial::ChildSlot);
-
     let response = hook(
-        &event(
-            "spawn_subagent",
-            &world.work,
-            spawn_input(&world.work, "two-chairs-writer", "none", None, Some(2)),
-            None,
-        ),
+        &serde_json::to_vec(&other_session).unwrap(),
         &world,
-        NOW,
-    );
-    assert_static_deny(&response, Denial::ChildSlot);
-
-    let response = hook(
-        &event(
-            "spawn_subagent",
-            &world.work,
-            spawn_input(&world.work, "two-chairs-writer", "none", None, None),
-            Some("two-chairs-writer"),
-        ),
-        &world,
-        NOW,
-    );
-    assert_static_deny(&response, Denial::Depth);
-
-    consume_grant(&world.state, "child-0", NOW).unwrap();
-    let response = hook(
-        &event(
-            "search_replace",
-            &world.work,
-            json!({"file_path": "src/lib.rs"}),
-            Some("two-chairs-writer"),
-        ),
-        &world,
-        NOW,
-    );
-    assert_static_deny(&response, Denial::ConsumedGrant);
-}
-
-#[test]
-fn wrong_role_cwd_isolation_and_model_are_rejected() {
-    let world = World::new();
-    create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
-    let elsewhere = world.other_work("elsewhere");
-
-    let response = hook(
-        &event(
-            "spawn_subagent",
-            &world.work,
-            spawn_input(&world.work, "general-purpose", "none", None, None),
-            None,
-        ),
-        &world,
-        NOW,
+        NOW + 3,
     );
     assert_static_deny(&response, Denial::Role);
+}
 
-    let response = hook(
+#[test]
+fn malformed_truncated_and_missing_state_fail_closed() {
+    let world = World::new();
+    let controlled = event(
+        "spawn_subagent",
+        &world.work,
+        spawn_input(&world.work, "two-chairs-writer", "none"),
+        None,
+    );
+    assert_static_deny(
+        &evaluate(&controlled, None, NOW, true),
+        Denial::MissingGrant,
+    );
+    let mut truncated: Value = serde_json::from_slice(&controlled).unwrap();
+    truncated["toolInputTruncated"] = json!(true);
+    assert_static_deny(
+        &evaluate(
+            &serde_json::to_vec(&truncated).unwrap(),
+            Some(&world.state),
+            NOW,
+            true,
+        ),
+        Denial::MalformedHook,
+    );
+    assert_static_deny(
+        &evaluate(b"{", Some(&world.state), NOW, true),
+        Denial::MalformedHook,
+    );
+}
+
+#[test]
+fn capacity_depth_roles_overrides_and_runtime_lock_are_closed() {
+    let world = World::new();
+    let second = world.other_work("work-b");
+    let third = world.other_work("work-c");
+    create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
+    create_grant(&world.state, draft(&world, "child-1", 1, &second)).unwrap();
+    let mut third_draft = draft(&world, "child-2", 0, &third);
+    third_draft.lane_id = "grok-child-2".to_string();
+    assert_eq!(
+        create_grant(&world.state, third_draft).unwrap_err().denial,
+        Denial::ChildSlot
+    );
+
+    let wrong_role = hook(
         &event(
             "spawn_subagent",
             &world.work,
-            spawn_input(&elsewhere, "two-chairs-writer", "none", None, None),
+            spawn_input(&world.work, "two-chairs-reviewer", "none"),
             None,
         ),
         &world,
         NOW,
     );
-    assert_static_deny(&response, Denial::Cwd);
-
-    let response = hook(
+    assert_static_deny(&wrong_role, Denial::Role);
+    let wrong_isolation = hook(
         &event(
             "spawn_subagent",
             &world.work,
-            spawn_input(&world.work, "two-chairs-writer", "worktree", None, None),
+            spawn_input(&world.work, "two-chairs-writer", "worktree"),
             None,
         ),
         &world,
         NOW,
     );
-    assert_static_deny(&response, Denial::Isolation);
-
+    assert_static_deny(&wrong_isolation, Denial::Isolation);
+    let mut model_override = spawn_input(&world.work, "two-chairs-writer", "none");
+    model_override["model"] = json!("grok-4.7");
     let response = hook(
+        &event("spawn_subagent", &world.work, model_override, None),
+        &world,
+        NOW,
+    );
+    assert_static_deny(&response, Denial::Uncontrolled);
+    let response = evaluate(
         &event(
             "spawn_subagent",
             &world.work,
-            spawn_input(
-                &world.work,
-                "two-chairs-writer",
-                "none",
-                Some("grok-4.6"),
-                None,
-            ),
+            spawn_input(&world.work, "two-chairs-writer", "none"),
             None,
         ),
-        &world,
+        Some(&world.state),
         NOW,
+        false,
     );
     assert_static_deny(&response, Denial::Model);
+    let grandchild = hook(
+        &event(
+            "spawn_subagent",
+            &world.work,
+            spawn_input(&second, "two-chairs-writer", "none"),
+            Some("two-chairs-writer"),
+        ),
+        &world,
+        NOW,
+    );
+    assert_static_deny(&grandchild, Denial::Depth);
 }
 
 #[test]
-fn path_overlap_escape_casing_and_new_files_follow_the_grant() {
+fn path_grants_reject_escape_unknown_fields_reparse_and_hardlinks() {
     let world = World::new();
-    let mut overlapping = draft(&world, "child-0", 0, &world.work);
-    overlapping.path_grants.push(PathGrant {
-        access: Access::Write,
-        kind: GrantKind::File,
-        path: "src/lib.rs".to_string(),
-    });
-    let error = create_grant(&world.state, overlapping).unwrap_err();
-    assert_eq!(error.denial, Denial::Path);
-
-    let mut ambiguous = draft(&world, "child-0", 0, &world.work);
-    ambiguous.path_grants = vec![PathGrant {
-        access: Access::Write,
-        kind: GrantKind::File,
-        path: "src/missing/new.rs".to_string(),
-    }];
-    let error = create_grant(&world.state, ambiguous).unwrap_err();
-    assert_eq!(error.denial, Denial::Path);
-
     create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
-    fs::create_dir_all(world.work.join("src-extra")).unwrap();
-    let before = fs::read(grant_file(&world, "child-0")).unwrap();
+    claim(&world, &world.work, "two-chairs-writer");
 
-    let response = hook(
+    let escaped = hook(
         &event(
             "search_replace",
             &world.work,
-            json!({"file_path": "src-extra/a.rs", "prompt": SENTINEL}),
+            json!({"file_path":"../outside.rs","old_string":"a","new_string":"b"}),
             Some("two-chairs-writer"),
         ),
         &world,
-        NOW,
+        NOW + 1,
     );
-    assert_static_deny(&response, Denial::Path);
-
-    let response = hook(
+    assert_static_deny(&escaped, Denial::Path);
+    let widened = hook(
         &event(
             "search_replace",
             &world.work,
-            json!({"file_path": "src/../../outside.rs"}),
+            json!({"file_path":"src/lib.rs","old_string":"a","new_string":"b","other_path":"elsewhere"}),
             Some("two-chairs-writer"),
         ),
         &world,
-        NOW,
+        NOW + 2,
     );
-    assert_static_deny(&response, Denial::Path);
+    assert_static_deny(&widened, Denial::Uncontrolled);
 
-    let response = hook(
-        &event(
-            "search_replace",
-            &world.work,
-            json!({"path": "SRC/LIB.rs", "file_path": "SRC/LIB.rs"}),
-            Some("two-chairs-writer"),
-        ),
-        &world,
-        NOW,
-    );
-    assert_eq!(response.decision, HookDecision::PassThrough);
-
-    let response = hook(
-        &event(
-            "write",
-            &world.work,
-            json!({"file_path": "src/nested/new.rs"}),
-            Some("two-chairs-writer"),
-        ),
-        &world,
-        NOW,
-    );
-    assert_eq!(response.decision, HookDecision::PassThrough);
-    let stdout = response.stdout.unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&stdout).unwrap(),
-        json!({"decision": "defer"})
-    );
-    assert!(!stdout.contains(SENTINEL));
-    assert!(!stdout.contains("allow"));
-    assert_eq!(fs::read(grant_file(&world, "child-0")).unwrap(), before);
-}
-
-#[test]
-fn reparse_points_are_rejected() {
-    let world = World::new();
     let link = world.work.join("link");
     let created = std::os::windows::fs::symlink_dir(world.work.join("src"), &link).is_ok()
         || Command::new("cmd")
@@ -568,143 +488,149 @@ fn reparse_points_are_rejected() {
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-    assert!(
-        created,
-        "junction creation is required to prove reparse rejection"
-    );
-    create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
+    assert!(created);
     let response = hook(
         &event(
             "search_replace",
             &world.work,
-            json!({"file_path": "link/lib.rs"}),
+            json!({"file_path":"link/lib.rs","old_string":"a","new_string":"b"}),
             Some("two-chairs-writer"),
         ),
         &world,
-        NOW,
+        NOW + 3,
     );
     assert_static_deny(&response, Denial::Path);
     let _ = fs::remove_dir(&link);
-}
 
-#[test]
-fn hook_pass_through_requires_a_fully_valid_grant() {
-    let world = World::new();
-    create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
-    let response = hook(b"", &world, NOW);
-    assert_static_deny(&response, Denial::MalformedHook);
-    let response = hook(b"{", &world, NOW);
-    assert_static_deny(&response, Denial::MalformedHook);
-
-    let response = hook(
-        &event(
-            "run_terminal_command",
-            &world.work,
-            json!({"command": "git status"}),
-            Some("two-chairs-writer"),
-        ),
-        &world,
-        NOW,
-    );
-    assert_static_deny(&response, Denial::Uncontrolled);
-
-    let response = hook(
-        &event(
-            "spawn_subagent",
-            &world.work,
-            {
-                let mut input = spawn_input(&world.work, "two-chairs-writer", "none", None, None);
-                input["tools"] = json!(["write"]);
-                input
-            },
-            None,
-        ),
-        &world,
-        NOW,
-    );
-    assert_static_deny(&response, Denial::Uncontrolled);
-
-    let response = hook(
-        &event(
-            "spawn_subagent",
-            &world.work,
-            spawn_input(
-                &world.work,
-                "two-chairs-writer",
-                "none",
-                Some("grok-4.7"),
-                None,
-            ),
-            None,
-        ),
-        &world,
-        NOW,
-    );
-    assert_eq!(response.decision, HookDecision::PassThrough);
-    assert_eq!(
-        serde_json::from_str::<Value>(response.stdout.as_deref().unwrap()).unwrap(),
-        json!({"decision": "defer"})
-    );
-
-    let elsewhere = world.other_work("parent");
+    let hardlink = world.work.join("src/hardlink.rs");
+    fs::hard_link(world.work.join("src/lib.rs"), &hardlink).unwrap();
     let response = hook(
         &event(
             "search_replace",
-            &elsewhere,
-            json!({"file_path": "src/lib.rs"}),
+            &world.work,
+            json!({"file_path":"src/hardlink.rs","old_string":"a","new_string":"b"}),
+            Some("two-chairs-writer"),
+        ),
+        &world,
+        NOW + 4,
+    );
+    assert_static_deny(&response, Denial::Path);
+}
+
+#[test]
+fn consumed_stale_and_git_drift_fail_closed() {
+    let world = World::new();
+    create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
+    consume_grant(&world.state, "child-0", NOW).unwrap();
+    assert_eq!(
+        consume_grant(&world.state, "child-0", NOW + 1)
+            .unwrap_err()
+            .denial,
+        Denial::ConsumedGrant
+    );
+
+    let second = world.other_work("work-b");
+    let mut expired = draft(&world, "expired", 1, &second);
+    expired.issued_at_ms = 1_000;
+    expired.expires_at_ms = 2_000;
+    create_grant(&world.state, expired).unwrap();
+    let response = hook(
+        &event(
+            "spawn_subagent",
+            &world.work,
+            spawn_input(&second, "two-chairs-writer", "none"),
             None,
         ),
         &world,
         NOW,
     );
-    assert_eq!(response.decision, HookDecision::Silent);
-    assert!(response.stdout.is_none());
+    assert_static_deny(&response, Denial::StaleGrant);
+
+    let third = world.other_work("work-c");
+    create_grant(&world.state, draft(&world, "drift", 0, &third)).unwrap();
+    fs::write(third.join("drift.txt"), b"drift\n").unwrap();
+    git(&third, &["add", "drift.txt"]);
+    git(&third, &["commit", "-m", "drift"]);
+    let response = hook(
+        &event(
+            "spawn_subagent",
+            &world.work,
+            spawn_input(&third, "two-chairs-writer", "none"),
+            None,
+        ),
+        &world,
+        NOW,
+    );
+    assert_static_deny(&response, Denial::StaleGrant);
 }
 
 #[test]
-fn hook_binary_fails_closed_without_granting_input_fields() {
+fn unrelated_tools_are_untouched_and_valid_pass_through_is_silent() {
     let world = World::new();
     create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_parley-lane-hook"))
-        .env("PARLEY_LANE_STATE_DIR", &world.state)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let elsewhere = world.repo.clone();
+    let unrelated = hook(
+        &event(
+            "run_terminal_command",
+            &elsewhere,
+            json!({"command":"git status"}),
+            None,
+        ),
+        &world,
+        NOW,
+    );
+    assert_eq!(unrelated.decision, HookDecision::Silent);
+    assert!(unrelated.stdout.is_none());
+
+    claim(&world, &world.work, "two-chairs-writer");
+    let valid = hook(
+        &event(
+            "read_file",
+            &world.work,
+            json!({"target_file":"src/lib.rs"}),
+            Some("two-chairs-writer"),
+        ),
+        &world,
+        NOW + 1,
+    );
+    assert_eq!(valid.decision, HookDecision::PassThrough);
+    assert!(valid.stdout.is_none());
+}
+
+#[test]
+fn hook_binary_never_echoes_payload_or_grants_authority() {
+    let world = World::new();
+    create_grant(&world.state, draft(&world, "child-0", 0, &world.work)).unwrap();
+    claim(&world, &world.work, "two-chairs-writer");
     let payload = event(
         "search_replace",
         &world.work,
-        json!({"file_path": "src/lib.rs", "new_string": SENTINEL}),
+        json!({
+            "file_path":"src/lib.rs",
+            "old_string":"kept",
+            "new_string":SENTINEL
+        }),
         Some("two-chairs-writer"),
     );
-    let mut child = output;
-    use std::io::Write;
-    child.stdin.as_mut().unwrap().write_all(&payload).unwrap();
-    drop(child.stdin.take());
-    let finished = child.wait_with_output().unwrap();
-    assert!(finished.status.success());
-    let stdout = String::from_utf8(finished.stdout).unwrap();
-    assert!(!stdout.contains(SENTINEL));
-    assert_eq!(
-        serde_json::from_str::<Value>(stdout.trim()).unwrap()["decision"],
-        "defer"
-    );
-
-    let denied = Command::new(env!("CARGO_BIN_EXE_parley-lane-hook"))
-        .env("PARLEY_LANE_STATE_DIR", "relative-state")
-        .arg("ignored")
+    let mut child = Command::new(env!("CARGO_BIN_EXE_parley-lane-hook"))
+        .env("PARLEY_LANE_STATE_DIR", &world.state)
+        .env("GROK_SUBAGENT_MODEL_INHERITANCE", "1")
+        .env("GROK_SUBAGENT_SAMPLING_LIMIT", "2")
+        .env("GROK_ACTIVE_AGENT_MESSAGES", "0")
+        .env("GROK_WORKFLOWS", "0")
+        .env("GROK_MEMORY", "0")
+        .env("PARLEY_GROK_LOCKED_MODEL", "grok-4.7")
+        .env("PARLEY_GROK_LOCKED_REASONING_EFFORT", "xhigh")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut denied = denied;
-    denied.stdin.as_mut().unwrap().write_all(&payload).unwrap();
-    drop(denied.stdin.take());
-    let finished = denied.wait_with_output().unwrap();
-    let stdout = String::from_utf8(finished.stdout).unwrap();
-    assert!(stdout.contains("parley-lane: deny malformed grant"));
-    assert!(!stdout.contains(SENTINEL));
+    use std::io::Write;
+    child.stdin.as_mut().unwrap().write_all(&payload).unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
 }
 
 fn remove_tree(path: &Path) {

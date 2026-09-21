@@ -203,6 +203,7 @@ pub(crate) fn run_judge(
         yolo,
         context: None,
         max_context_chars: Some(max_context),
+        allow_subagents: false,
     };
     run_one(&req)
 }
@@ -251,6 +252,7 @@ fn build_requests(
                 yolo,
                 context: context.clone(),
                 max_context_chars: Some(max_context),
+                allow_subagents: false,
             };
             (label, req)
         })
@@ -323,6 +325,7 @@ fn dry_run(prompt: &str, panel: &[String], config: DryRunConfig<'_>) -> Result<(
         yolo: config.yolo,
         context: None,
         max_context_chars: Some(config.max_context),
+        allow_subagents: false,
     };
     println!(
         "# judge {judge} — dry run\n{}",

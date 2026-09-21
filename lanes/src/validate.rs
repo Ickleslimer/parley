@@ -17,6 +17,7 @@ pub struct SpawnClaim<'a> {
 
 pub struct PathClaim<'a> {
     pub role: &'a str,
+    pub session_id: &'a str,
     pub cwd: &'a Path,
     pub access: Access,
     pub path: &'a Path,
@@ -30,7 +31,13 @@ pub fn validate_spawn(
     if claim.requested_depth != CHILD_DEPTH || grant.depth != CHILD_DEPTH {
         return Err(LaneError::new(Denial::Depth, "child depth must be one"));
     }
-    ensure_active(grant, now_ms)?;
+    ensure_live(grant, now_ms)?;
+    if grant.state != GrantState::Prepared {
+        return Err(LaneError::new(
+            Denial::ConsumedGrant,
+            "child grant has already been claimed",
+        ));
+    }
     if claim.widening || claim.effort_overridden {
         return Err(LaneError::new(
             Denial::Uncontrolled,
@@ -49,15 +56,11 @@ pub fn validate_spawn(
             "child role does not match the grant",
         ));
     }
-    match claim.model {
-        None => {}
-        Some(model) if model == grant.model => {}
-        Some(_) => {
-            return Err(LaneError::new(
-                Denial::Model,
-                "child model is not the inherited model",
-            ));
-        }
+    if claim.model.is_some() {
+        return Err(LaneError::new(
+            Denial::Model,
+            "child model must be inherited without a spawn override",
+        ));
     }
     if let Some(slot) = claim.child_slot {
         if slot > MAX_CHILD_SLOT || slot != grant.child_slot {
@@ -75,7 +78,15 @@ pub fn validate_path(
     claim: &PathClaim<'_>,
     now_ms: u64,
 ) -> Result<(), LaneError> {
-    ensure_active(grant, now_ms)?;
+    ensure_live(grant, now_ms)?;
+    if grant.state != GrantState::Running
+        || grant.child_session_id.as_deref() != Some(claim.session_id)
+    {
+        return Err(LaneError::new(
+            Denial::Role,
+            "child session is not bound to the running grant",
+        ));
+    }
     if claim.role != grant.role.as_str() {
         return Err(LaneError::new(
             Denial::Role,
@@ -85,6 +96,12 @@ pub fn validate_path(
     confirm_cwd(grant, claim.cwd)?;
     let cwd = pathcheck::observe_dir(claim.cwd)?;
     let resolved = pathcheck::resolve_operation(&cwd, claim.path)?;
+    if claim.access == Access::Read {
+        return Ok(());
+    }
+    if claim.access == Access::Write {
+        pathcheck::reject_hardlinked_write(&resolved)?;
+    }
     let matches = grant
         .path_grants
         .iter()
@@ -99,8 +116,8 @@ pub fn validate_path(
     Ok(())
 }
 
-fn ensure_active(grant: &GrantRecord, now_ms: u64) -> Result<(), LaneError> {
-    if grant.state != GrantState::Active || grant.consumed_at_ms.is_some() {
+fn ensure_live(grant: &GrantRecord, now_ms: u64) -> Result<(), LaneError> {
+    if grant.state == GrantState::Consumed || grant.consumed_at_ms.is_some() {
         return Err(LaneError::new(
             Denial::ConsumedGrant,
             "grant is already consumed",

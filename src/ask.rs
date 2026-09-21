@@ -17,11 +17,16 @@ use crate::context::{
     ContextBounds, ContextKey, ContextMode, ContextPlan, ContextRecovery, JournalStore, PlanKind,
     PromptFile, ResolvedSource, StateDirEnv,
 };
-use crate::event_log::{ExchangeLog, ExchangeReceipt};
+use crate::event_log::{EventReceipt, ExchangeLog, ExchangeReceipt};
+use crate::grok_subagents::GuardedSubagentLaunch;
 use crate::harness::{normalize_harness, HarnessFactory, Invocation, Request};
 use crate::health_report::HealthReporter;
+use crate::job_lock::ExecutionLease;
+use crate::lane_grants::GrantSet;
 use crate::policy::{ContextPolicyRequest, PolicyRequest, RuntimePolicy};
-use crate::process::{capture_invocation_timeout, Captured, Timeouts};
+use crate::process::{
+    capture_invocation_timeout_controlled, CancellationToken, Captured, SpawnObserver, Timeouts,
+};
 use crate::session;
 use crate::signals::fnv1a_64;
 
@@ -52,6 +57,7 @@ pub(crate) struct AskRequest {
     pub yolo: bool,
     pub context: Option<ContextRef>,
     pub max_context_chars: Option<usize>,
+    pub(crate) allow_subagents: bool,
 }
 
 pub(crate) struct AskOutcome {
@@ -62,6 +68,58 @@ pub(crate) struct AskOutcome {
 pub(crate) struct AskFailure {
     pub(crate) message: String,
     pub(crate) receipt: Option<Box<ExchangeReceipt>>,
+    pub(crate) captured_reply: Option<String>,
+    pub(crate) timed_out: bool,
+    pub(crate) cancelled: bool,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct AskSpawnReceipt {
+    pub(crate) exchange_id: String,
+    pub(crate) request_event_id: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) process_id: u32,
+}
+
+pub(crate) trait AskSpawnObserver: Send + Sync {
+    fn process_created(&self, _receipt: &AskSpawnReceipt) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn process_resumed(&self, _receipt: &AskSpawnReceipt) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct NoopAskSpawnObserver;
+
+impl AskSpawnObserver for NoopAskSpawnObserver {}
+
+struct ProcessObserverAdapter<'a> {
+    observer: &'a dyn AskSpawnObserver,
+    request: &'a EventReceipt,
+}
+
+impl ProcessObserverAdapter<'_> {
+    fn receipt(&self, process_id: u32) -> AskSpawnReceipt {
+        AskSpawnReceipt {
+            exchange_id: self.request.exchange_id.clone(),
+            request_event_id: self.request.event_id.clone(),
+            session_id: self.request.session_id.clone(),
+            process_id,
+        }
+    }
+}
+
+impl SpawnObserver for ProcessObserverAdapter<'_> {
+    fn process_created(&self, process_id: u32) -> Result<(), String> {
+        self.observer.process_created(&self.receipt(process_id))
+    }
+
+    fn process_resumed(&self, process_id: u32) -> Result<(), String> {
+        self.observer.process_resumed(&self.receipt(process_id))
+    }
 }
 
 struct StatefulPrompt {
@@ -117,6 +175,9 @@ impl AskFailure {
         Self {
             message: message.into(),
             receipt: None,
+            captured_reply: None,
+            timed_out: false,
+            cancelled: false,
         }
     }
 
@@ -124,7 +185,21 @@ impl AskFailure {
         Self {
             message: message.into(),
             receipt: Some(Box::new(receipt)),
+            captured_reply: None,
+            timed_out: false,
+            cancelled: false,
         }
+    }
+
+    fn with_captured_reply(mut self, reply: Option<String>) -> Self {
+        self.captured_reply = reply;
+        self
+    }
+
+    fn with_execution_state(mut self, timed_out: bool, cancelled: bool) -> Self {
+        self.timed_out = timed_out;
+        self.cancelled = cancelled;
+        self
     }
 }
 
@@ -306,7 +381,24 @@ fn build_prepared(req: &AskRequest, prompt: String) -> Result<Invocation, String
 
     let request = Request::from_options(options, String::new())?;
     let harness = HarnessFactory::default().create(&request.harness)?;
-    harness.build(&request)
+    let mut invocation = harness.build(&request)?;
+    enforce_subagent_boundary(req, &mut invocation);
+    Ok(invocation)
+}
+
+fn enforce_subagent_boundary(req: &AskRequest, invocation: &mut Invocation) {
+    if req.harness == "grok"
+        && !req.allow_subagents
+        && !invocation.args.iter().any(|arg| arg == "--no-subagents")
+    {
+        let index = invocation
+            .args
+            .iter()
+            .position(|arg| arg == "--no-auto-update")
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        invocation.args.insert(index, "--no-subagents".to_string());
+    }
 }
 
 /// Build and run the call, returning the target agent's captured output. A
@@ -319,13 +411,38 @@ pub(crate) fn run(req: &AskRequest) -> Result<Captured, String> {
 }
 
 pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailure> {
+    run_with_receipt_controlled(req, &CancellationToken::default(), &NoopAskSpawnObserver)
+}
+
+pub(crate) fn run_with_receipt_controlled(
+    req: &AskRequest,
+    cancellation: &CancellationToken,
+    observer: &dyn AskSpawnObserver,
+) -> Result<AskOutcome, AskFailure> {
     let (req, policy) = prepare_with_policy(req)?;
+    run_prepared_with_receipt_controlled(&req, &policy, None, cancellation, observer)
+}
+
+#[allow(dead_code)]
+pub(crate) fn prepare_for_job(req: &AskRequest) -> Result<(AskRequest, RuntimePolicy), String> {
+    prepare_with_policy(req)
+}
+
+pub(crate) fn run_prepared_with_receipt_controlled(
+    req: &AskRequest,
+    policy: &RuntimePolicy,
+    guarded_launch: Option<&GuardedSubagentLaunch>,
+    cancellation: &CancellationToken,
+    observer: &dyn AskSpawnObserver,
+) -> Result<AskOutcome, AskFailure> {
+    let _execution_lease = ExecutionLease::acquire_for_request(req, "synchronous-or-worker")
+        .map_err(|error| AskFailure::new(format!("execution lease preflight failed: {error}")))?;
     let exchange_id = ExchangeLog::allocate_exchange_id();
-    let resolved = match resolve_prompt(&req, &exchange_id, false) {
+    let resolved = match resolve_prompt(req, &exchange_id, false) {
         Ok(resolved) => resolved,
         Err(error) => {
             return Err(preflight_failure(
-                &req,
+                req,
                 &req.prompt,
                 exchange_id,
                 "context_preflight_error",
@@ -333,11 +450,11 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
             ));
         }
     };
-    let mut invocation = match build_prepared(&req, resolved.text.clone()) {
+    let mut invocation = match build_prepared(req, resolved.text.clone()) {
         Ok(invocation) => invocation,
         Err(error) => {
             return Err(preflight_failure(
-                &req,
+                req,
                 &resolved.text,
                 exchange_id,
                 "context_preflight_error",
@@ -345,13 +462,24 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
             ));
         }
     };
+    if let Some(guarded_launch) = guarded_launch {
+        if let Err(error) = guarded_launch.configure_invocation(&mut invocation) {
+            return Err(preflight_failure(
+                req,
+                &resolved.text,
+                exchange_id,
+                "lane_preflight_error",
+                &format!("guarded lane invocation failed; agent was not started: {error}"),
+            ));
+        }
+    }
     let timeouts = Timeouts::from_env();
     let mut prompt_file = None;
-    if should_use_prompt_file(&req, &invocation, resolved.stateful.is_some()) {
+    if should_use_prompt_file(req, &invocation, resolved.stateful.is_some()) {
         let max_age = timeouts.overall.saturating_add(Duration::from_secs(300));
         if let Err(error) = cleanup_stale_prompt_files(max_age) {
             return Err(preflight_failure(
-                &req,
+                req,
                 &resolved.text,
                 exchange_id,
                 "prompt_file_error",
@@ -362,7 +490,7 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
             Ok(file) => file,
             Err(error) => {
                 return Err(preflight_failure(
-                    &req,
+                    req,
                     &resolved.text,
                     exchange_id,
                     "prompt_file_error",
@@ -378,7 +506,7 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
                     .map(|error| format!("; prompt cleanup also failed: {error}"))
                     .unwrap_or_default();
                 return Err(preflight_failure(
-                    &req,
+                    req,
                     &resolved.text,
                     exchange_id,
                     "prompt_file_error",
@@ -394,7 +522,7 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
                 .map(|error| format!("; prompt cleanup also failed: {error}"))
                 .unwrap_or_default();
             return Err(preflight_failure(
-                &req,
+                req,
                 &resolved.text,
                 exchange_id,
                 "prompt_file_error",
@@ -403,7 +531,7 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
         }
         prompt_file = Some(file);
     }
-    let log = match ExchangeLog::start_with_exchange_id(&req, &resolved.text, exchange_id.clone()) {
+    let log = match ExchangeLog::start_with_exchange_id(req, &resolved.text, exchange_id.clone()) {
         Ok(log) => log,
         Err(error) => {
             let suffix = cleanup_prompt_file(&mut prompt_file)
@@ -447,8 +575,31 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
             ));
         }
     };
+    let mut active_grants = match guarded_launch {
+        Some(guarded_launch) => match guarded_launch.activate(timeouts.overall) {
+            Ok(grants) => Some(grants),
+            Err(error) => {
+                let abort = resolved
+                    .stateful
+                    .as_ref()
+                    .and_then(|stateful| stateful.abort(&exchange_id).err());
+                let cleanup = cleanup_prompt_file(&mut prompt_file).err();
+                return Err(failure_after_request(
+                    &log,
+                    "lane_state_error",
+                    &join_preflight_errors(
+                        &format!("guarded lane activation failed; agent was not started: {error}"),
+                        abort,
+                        cleanup,
+                    ),
+                ));
+            }
+        },
+        None => None,
+    };
     if req.harness == "grok" {
         if let Err(error) = reporter.request_started(log.request_receipt()) {
+            let lane_cleanup = consume_grants(&mut active_grants).err();
             let abort = resolved
                 .stateful
                 .as_ref()
@@ -457,21 +608,36 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
             return Err(failure_after_request(
                 &log,
                 "health_preflight_error",
-                &join_preflight_errors(
+                &append_lane_cleanup(
+                    join_preflight_errors(
                     &format!(
                         "health request logging failed before Grok launch; agent was not started: {error}"
                     ),
                     abort,
                     cleanup,
+                    ),
+                    lane_cleanup,
                 ),
             ));
         }
     }
     let started = Instant::now();
-    match capture_invocation_timeout(invocation, req.cwd.to_str(), timeouts) {
+    let process_observer = ProcessObserverAdapter {
+        observer,
+        request: log.request_receipt(),
+    };
+    match capture_invocation_timeout_controlled(
+        invocation,
+        req.cwd.to_str(),
+        timeouts,
+        cancellation,
+        &process_observer,
+    ) {
         Ok(out) => {
+            let lane_result = consume_grants(&mut active_grants);
             let duration_ms = started.elapsed().as_millis();
             let reply_result = out.reply();
+            let usable_reply = reply_result.as_ref().ok().cloned();
             let context_result = resolved.stateful.as_ref().map(|stateful| {
                 if reply_result.is_ok() {
                     stateful.commit(&exchange_id)
@@ -482,7 +648,13 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
             let log_result = match &reply_result {
                 Ok(reply) => log.success(reply, duration_ms),
                 Err(error) => log.failure(
-                    if out.timed_out { "timeout" } else { "error" },
+                    if out.cancelled {
+                        "cancelled"
+                    } else if out.timed_out {
+                        "timeout"
+                    } else {
+                        "error"
+                    },
                     error,
                     duration_ms,
                 ),
@@ -496,20 +668,26 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
                         let suffix = cleanup_error
                             .map(|error| format!("; prompt cleanup also failed: {error}"))
                             .unwrap_or_default();
+                        let lane_suffix = lane_error_suffix(&lane_result);
                         Err(AskFailure::after_completion(
                             format!(
-                                "context cursor transition failed after Grok ran; do not retry automatically: {context_error}{suffix}\nCaptured result:\n{captured}"
+                                "context cursor transition failed after Grok ran; do not retry automatically: {context_error}{suffix}{lane_suffix}\nCaptured result:\n{captured}"
                             ),
                             receipt,
-                        ))
+                        )
+                        .with_captured_reply(usable_reply.clone())
+                        .with_execution_state(out.timed_out, out.cancelled))
                     }
                     Err(log_error) => {
                         let suffix = cleanup_error
                             .map(|error| format!("; prompt cleanup also failed: {error}"))
                             .unwrap_or_default();
+                        let lane_suffix = lane_error_suffix(&lane_result);
                         Err(AskFailure::new(format!(
-                            "context cursor transition failed after Grok ran: {context_error}; event log completion also failed: {log_error}{suffix}\nCaptured result:\n{captured}"
-                        )))
+                            "context cursor transition failed after Grok ran: {context_error}; event log completion also failed: {log_error}{suffix}{lane_suffix}\nCaptured result:\n{captured}"
+                        ))
+                        .with_captured_reply(usable_reply.clone())
+                        .with_execution_state(out.timed_out, out.cancelled))
                     }
                 };
             }
@@ -529,9 +707,12 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
                         .err()
                         .map(|error| format!("; prompt cleanup also failed: {error}"))
                         .unwrap_or_default();
+                    let lane_suffix = lane_error_suffix(&lane_result);
                     return Err(AskFailure::new(format!(
-                        "event log completion failed after the agent ran; do not retry automatically: {log_error}{health_suffix}{cleanup_suffix}\nCaptured result:\n{captured}"
-                    )));
+                        "event log completion failed after the agent ran; do not retry automatically: {log_error}{health_suffix}{cleanup_suffix}{lane_suffix}\nCaptured result:\n{captured}"
+                    ))
+                    .with_captured_reply(usable_reply.clone())
+                    .with_execution_state(out.timed_out, out.cancelled));
                 }
             };
             let receipt = log.exchange_receipt(completion);
@@ -550,16 +731,19 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
                 };
                 if let Err(health_error) = health_result {
                     let captured = reply_result.unwrap_or_else(|error| error);
+                    let lane_suffix = lane_error_suffix(&lane_result);
                     return Err(AskFailure::after_completion(
                         format!(
-                            "health completion logging failed after Grok ran; do not retry automatically: {health_error}{}\nCaptured result:\n{captured}",
+                            "health completion logging failed after Grok ran; do not retry automatically: {health_error}{}{lane_suffix}\nCaptured result:\n{captured}",
                             cleanup_prompt_file(&mut prompt_file)
                                 .err()
                                 .map(|error| format!("; prompt cleanup also failed: {error}"))
                                 .unwrap_or_default()
                         ),
                         receipt,
-                    ));
+                    )
+                    .with_captured_reply(usable_reply.clone())
+                    .with_execution_state(out.timed_out, out.cancelled));
                 }
                 if policy.requires_handoff_footer()
                     && reply_result
@@ -571,12 +755,26 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
             }
             if let Err(error) = cleanup_prompt_file(&mut prompt_file) {
                 let captured = reply_result.unwrap_or_else(|error| error);
+                let lane_suffix = lane_error_suffix(&lane_result);
                 return Err(AskFailure::after_completion(
                     format!(
-                        "prompt-file cleanup failed after the agent ran; do not retry automatically: {error}\nCaptured result:\n{captured}"
+                        "prompt-file cleanup failed after the agent ran; do not retry automatically: {error}{lane_suffix}\nCaptured result:\n{captured}"
                     ),
                     receipt,
-                ));
+                )
+                .with_captured_reply(usable_reply)
+                .with_execution_state(out.timed_out, out.cancelled));
+            }
+            if let Err(lane_error) = lane_result {
+                let captured = reply_result.unwrap_or_else(|error| error);
+                return Err(AskFailure::after_completion(
+                    format!(
+                        "guarded lane state finalization failed after Grok ran; do not retry automatically: {lane_error}\nCaptured result:\n{captured}"
+                    ),
+                    receipt,
+                )
+                .with_captured_reply(usable_reply)
+                .with_execution_state(out.timed_out, out.cancelled));
             }
             Ok(AskOutcome {
                 captured: out,
@@ -585,12 +783,16 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
         }
         Err(error) => {
             let duration_ms = started.elapsed().as_millis();
+            let lane_cleanup = consume_grants(&mut active_grants).err();
             let abort_error = resolved
                 .stateful
                 .as_ref()
                 .and_then(|stateful| stateful.abort(&exchange_id).err());
             let cleanup_error = cleanup_prompt_file(&mut prompt_file).err();
-            let error = join_preflight_errors(&error, abort_error, cleanup_error);
+            let error = append_lane_cleanup(
+                join_preflight_errors(&error, abort_error, cleanup_error),
+                lane_cleanup,
+            );
             let completion = match log.failure("error", &error, duration_ms) {
                 Ok(receipt) => receipt,
                 Err(log_error) => {
@@ -647,6 +849,28 @@ fn cleanup_prompt_file(file: &mut Option<PromptFile>) -> Result<(), String> {
         Some(file) => file.cleanup().map_err(|error| error.to_string()),
         None => Ok(()),
     }
+}
+
+fn consume_grants(grants: &mut Option<GrantSet>) -> Result<(), String> {
+    match grants.take() {
+        Some(grants) => grants.consume(),
+        None => Ok(()),
+    }
+}
+
+fn append_lane_cleanup(mut message: String, lane_error: Option<String>) -> String {
+    if let Some(error) = lane_error {
+        message.push_str(&format!("; lane grant cleanup also failed: {error}"));
+    }
+    message
+}
+
+fn lane_error_suffix(result: &Result<(), String>) -> String {
+    result
+        .as_ref()
+        .err()
+        .map(|error| format!("; lane grant finalization also failed: {error}"))
+        .unwrap_or_default()
 }
 
 fn join_preflight_errors(
@@ -856,6 +1080,7 @@ fn resolve(options: AskOptions) -> Result<AskRequest, String> {
             })
             .transpose()?,
         max_context_chars: options.max_context_chars,
+        allow_subagents: false,
     })
 }
 
@@ -963,5 +1188,37 @@ mod tests {
         assert!(!has_handoff_footer(
             "continuity: not_authorized appears earlier\nTWO_CHAIRS_HANDOFF\npeer: grok\nevidence_class: unavailable\nincident_id: null\nas_of_ms: unknown\ncontinuity: not_authorized"
         ));
+    }
+
+    #[test]
+    fn synchronous_boundary_forces_no_subagents_even_if_profile_is_guarded() {
+        let mut request = resolve(AskOptions {
+            harness: Some("grok".to_string()),
+            prompt: Some("task".to_string()),
+            ..AskOptions::default()
+        })
+        .unwrap();
+        let mut invocation = Invocation::new(
+            "grok",
+            vec![
+                "--no-auto-update".to_string(),
+                "--single".to_string(),
+                "task".to_string(),
+            ],
+        );
+        enforce_subagent_boundary(&request, &mut invocation);
+        assert_eq!(invocation.args[1], "--no-subagents");
+
+        request.allow_subagents = true;
+        let mut guarded = Invocation::new(
+            "grok",
+            vec![
+                "--no-auto-update".to_string(),
+                "--single".to_string(),
+                "task".to_string(),
+            ],
+        );
+        enforce_subagent_boundary(&request, &mut guarded);
+        assert!(!guarded.args.iter().any(|arg| arg == "--no-subagents"));
     }
 }

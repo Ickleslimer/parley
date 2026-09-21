@@ -6,8 +6,11 @@ use parley_health::integration::{
 use parley_health::scope::ScopeFile;
 
 fn fake_install(home: &common::TempHome) -> std::path::PathBuf {
-    let install = home.paths.root.join("install");
+    let install_root = home.paths.root.join("install");
+    let install = install_root.join("health");
+    let lanes = install_root.join("lanes");
     std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(&lanes).unwrap();
     for binary in [
         "parley-health-query.exe",
         "parley-health-supervisor.exe",
@@ -15,11 +18,20 @@ fn fake_install(home: &common::TempHome) -> std::path::PathBuf {
     ] {
         std::fs::write(install.join(binary), binary.as_bytes()).unwrap();
     }
+    std::fs::write(lanes.join("parley-lane-hook.exe"), b"parley-lane-hook.exe").unwrap();
     install
 }
 
+fn lane_hook(health_install: &std::path::Path) -> std::path::PathBuf {
+    health_install
+        .parent()
+        .unwrap()
+        .join("lanes")
+        .join("parley-lane-hook.exe")
+}
+
 #[test]
-fn installs_exactly_two_dedicated_hooks_and_preserves_unrelated_files() {
+fn installs_health_and_lane_hooks_and_preserves_unrelated_files() {
     let home = common::TempHome::new("hook-install");
     let install = fake_install(&home);
     let grok_home = home.paths.root.join("grok");
@@ -28,13 +40,18 @@ fn installs_exactly_two_dedicated_hooks_and_preserves_unrelated_files() {
     let unrelated = hooks.join("unrelated.json");
     std::fs::write(&unrelated, r#"{"hooks":{"SessionStart":[]}}"#).unwrap();
 
-    install_hooks(&grok_home, &install.join("parley-health-hook.exe")).unwrap();
+    install_hooks(
+        &grok_home,
+        &install.join("parley-health-hook.exe"),
+        &lane_hook(&install),
+    )
+    .unwrap();
     let installed: serde_json::Value =
         serde_json::from_slice(&std::fs::read(hooks.join(HOOK_FILE_NAME)).unwrap()).unwrap();
     assert_eq!(installed["hooks"].as_object().unwrap().len(), 2);
     assert_eq!(
         installed["hooks"]["PreToolUse"].as_array().unwrap().len(),
-        1
+        2
     );
     assert_eq!(
         installed["hooks"]["StopFailure"].as_array().unwrap().len(),
@@ -56,7 +73,12 @@ fn refuses_to_replace_an_unrelated_reserved_hook_file_and_leaves_it_on_remove() 
     std::fs::create_dir_all(&hooks).unwrap();
     let reserved = hooks.join(HOOK_FILE_NAME);
     std::fs::write(&reserved, r#"{"hooks":{"SessionStart":[]}}"#).unwrap();
-    assert!(install_hooks(&grok_home, &install.join("parley-health-hook.exe")).is_err());
+    assert!(install_hooks(
+        &grok_home,
+        &install.join("parley-health-hook.exe"),
+        &lane_hook(&install),
+    )
+    .is_err());
     assert!(!remove_hooks(&grok_home).unwrap());
     assert!(reserved.exists());
 }
@@ -67,7 +89,12 @@ fn remove_hooks_removes_only_managed_entries_from_a_modified_document() {
     let install = fake_install(&home);
     let grok_home = home.paths.root.join("grok");
     let hook_path = grok_home.join("hooks").join(HOOK_FILE_NAME);
-    install_hooks(&grok_home, &install.join("parley-health-hook.exe")).unwrap();
+    install_hooks(
+        &grok_home,
+        &install.join("parley-health-hook.exe"),
+        &lane_hook(&install),
+    )
+    .unwrap();
 
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
@@ -87,6 +114,7 @@ fn remove_hooks_removes_only_managed_entries_from_a_modified_document() {
     assert!(remove_hooks(&grok_home).unwrap());
     let remaining = std::fs::read_to_string(&hook_path).unwrap();
     assert!(!remaining.contains("parley-health-hook.exe"));
+    assert!(!remaining.contains("parley-lane-hook.exe"));
     assert!(remaining.contains("unrelated-hook.exe"));
     assert!(remaining.contains("session-start.exe"));
 }
@@ -112,8 +140,64 @@ fn configure_caches_r3_identity_and_installed_executable_identities() {
             &std::fs::read(grok_home.join("hooks").join(HOOK_FILE_NAME)).unwrap()
         )
         .unwrap(),
-        hook_document(&install.join("parley-health-hook.exe"))
+        hook_document(
+            &install.join("parley-health-hook.exe"),
+            &lane_hook(&install),
+        )
     );
+}
+
+#[test]
+fn upgrade_replaces_managed_entries_without_removing_unrelated_hooks() {
+    let home = common::TempHome::new("hook-upgrade");
+    let install = fake_install(&home);
+    let grok_home = home.paths.root.join("grok");
+    let hook_path = grok_home.join("hooks").join(HOOK_FILE_NAME);
+    install_hooks(
+        &grok_home,
+        &install.join("parley-health-hook.exe"),
+        &lane_hook(&install),
+    )
+    .unwrap();
+
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+    document["hooks"]["PreToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "matcher": "Read",
+            "hooks": [{"type": "command", "command": "unrelated-hook.exe", "timeout": 7}]
+        }));
+    std::fs::write(&hook_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    install_hooks(
+        &grok_home,
+        &install.join("parley-health-hook.exe"),
+        &lane_hook(&install),
+    )
+    .unwrap();
+    let installed = std::fs::read_to_string(&hook_path).unwrap();
+    assert_eq!(installed.matches("parley-health-hook.exe").count(), 2);
+    assert_eq!(installed.matches("parley-lane-hook.exe").count(), 1);
+    assert!(installed.contains("unrelated-hook.exe"));
+}
+
+#[test]
+fn configure_refuses_installation_without_the_lane_hook() {
+    let home = common::TempHome::new("configure-missing-lane");
+    let install = fake_install(&home);
+    std::fs::remove_file(lane_hook(&install)).unwrap();
+    let main = home.paths.root.join("r3");
+    let common_dir = main.join(".git");
+    std::fs::create_dir_all(&common_dir).unwrap();
+    let grok_home = home.paths.root.join("grok");
+
+    let error = configure_r3(&home.paths, &common_dir, &main, &install, &grok_home)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("lane hook"));
+    assert!(!grok_home.join("hooks").join(HOOK_FILE_NAME).exists());
 }
 
 #[test]

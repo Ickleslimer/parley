@@ -20,6 +20,7 @@ pub(crate) use prompt_file::{cleanup_stale_prompt_files, PromptFile};
 pub(crate) use root::{
     resolve_codex_rollout, resolve_codex_sessions_root, CodexHomeEnv, ResolvedSource,
 };
+pub(crate) use winfile::refuse_reparse_chain;
 #[cfg(test)]
 pub(crate) use winfile::SourceIdentity;
 

@@ -8,14 +8,21 @@ use serde_json::{Map, Value};
 use crate::error::{Denial, LaneError};
 use crate::fsutil::strip_bom;
 use crate::schema::{Access, STATE_ENV};
-use crate::store::{self, find_grant_for_cwd};
-use crate::validate::{validate_path, validate_spawn, PathClaim, SpawnClaim};
+use crate::store::{self, bind_grant_for_child, claim_grant_for_spawn, find_grant_for_cwd};
+use crate::validate::{validate_path, PathClaim, SpawnClaim};
 
 const MAX_HOOK_STDIN: usize = 256 * 1024;
 
 pub struct HookRequest<'a> {
     pub payload: &'a [u8],
     pub state_dir: Option<&'a Path>,
+    pub model_inheritance: Option<&'a str>,
+    pub sampling_limit: Option<&'a str>,
+    pub active_agent_messages: Option<&'a str>,
+    pub workflows: Option<&'a str>,
+    pub memory: Option<&'a str>,
+    pub locked_model: Option<&'a str>,
+    pub locked_reasoning_effort: Option<&'a str>,
     pub now_ms: u64,
 }
 
@@ -39,7 +46,7 @@ pub fn evaluate(request: HookRequest<'_>) -> HookResponse {
         },
         Ok(HookDecision::PassThrough) => HookResponse {
             decision: HookDecision::PassThrough,
-            stdout: Some(defer_json()),
+            stdout: None,
         },
         Ok(HookDecision::Deny(denial)) => deny_response(denial),
         Err(error) => deny_response(error.denial),
@@ -62,9 +69,23 @@ pub fn run() -> i32 {
         Ok(now_ms) => now_ms,
         Err(error) => return emit(deny_response(error.denial).stdout.as_deref()),
     };
+    let model_inheritance = std::env::var("GROK_SUBAGENT_MODEL_INHERITANCE").ok();
+    let sampling_limit = std::env::var("GROK_SUBAGENT_SAMPLING_LIMIT").ok();
+    let active_agent_messages = std::env::var("GROK_ACTIVE_AGENT_MESSAGES").ok();
+    let workflows = std::env::var("GROK_WORKFLOWS").ok();
+    let memory = std::env::var("GROK_MEMORY").ok();
+    let locked_model = std::env::var("PARLEY_GROK_LOCKED_MODEL").ok();
+    let locked_reasoning_effort = std::env::var("PARLEY_GROK_LOCKED_REASONING_EFFORT").ok();
     let response = evaluate(HookRequest {
         payload: &payload,
         state_dir: state_dir.as_deref().map(Path::new),
+        model_inheritance: model_inheritance.as_deref(),
+        sampling_limit: sampling_limit.as_deref(),
+        active_agent_messages: active_agent_messages.as_deref(),
+        workflows: workflows.as_deref(),
+        memory: memory.as_deref(),
+        locked_model: locked_model.as_deref(),
+        locked_reasoning_effort: locked_reasoning_effort.as_deref(),
         now_ms,
     });
     emit(response.stdout.as_deref())
@@ -88,6 +109,14 @@ fn decide(request: &HookRequest<'_>) -> Result<HookDecision, LaneError> {
     if !is_pretool(event)? {
         return Ok(HookDecision::Silent);
     }
+    if optional_bool(event, &["toolInputTruncated", "tool_input_truncated"]) != Some(false) {
+        return Err(LaneError::new(
+            Denial::MalformedHook,
+            "tool input truncation flag is missing or true",
+        ));
+    }
+    let session_id = required_string(event, &["sessionId", "session_id"])?;
+    let tool_use_id = required_string(event, &["toolUseId", "tool_use_id"])?;
     let tool_name = required_string(event, &["tool_name", "toolName"])?;
     let class = classify_tool(&tool_name);
     let tool_input = tool_input(event)?;
@@ -122,64 +151,68 @@ fn decide(request: &HookRequest<'_>) -> Result<HookDecision, LaneError> {
         ));
     }
     if class == ToolClass::Spawn {
-        return decide_spawn(state_dir, &tool_input, request.now_ms);
+        return decide_spawn(request, state_dir, &tool_input, &session_id, &tool_use_id);
     }
     let cwd = required_string(event, &["cwd"])?;
     let cwd_path = PathBuf::from(&cwd);
-    match find_grant_for_cwd(state_dir, &cwd_path, request.now_ms)? {
-        Some(grant) => {
-            let role = actor_role
-                .as_deref()
-                .ok_or_else(|| LaneError::new(Denial::Role, "lane actor role is missing"))?;
-            match class {
-                ToolClass::Read | ToolClass::Write => {
-                    let access = if class == ToolClass::Read {
-                        Access::Read
-                    } else {
-                        Access::Write
-                    };
-                    let path = operation_path(&tool_input)?;
-                    validate_path(
-                        &grant,
-                        &PathClaim {
-                            role,
-                            cwd: &cwd_path,
-                            access,
-                            path: &path,
-                        },
-                        request.now_ms,
-                    )?;
-                    Ok(HookDecision::PassThrough)
-                }
-                ToolClass::Spawn => unreachable!("spawn is handled above"),
-                ToolClass::Forbidden | ToolClass::Unknown => Err(LaneError::new(
-                    Denial::Uncontrolled,
-                    "tool is outside the lane grant",
-                )),
+    if controlled_actor {
+        let role = actor_role.as_deref().expect("controlled actor has a role");
+        let grant = bind_grant_for_child(state_dir, &cwd_path, role, &session_id, request.now_ms)?;
+        validate_runtime_lock(request, &grant)?;
+        return match class {
+            ToolClass::Read | ToolClass::Write => {
+                let access = if class == ToolClass::Read {
+                    Access::Read
+                } else {
+                    Access::Write
+                };
+                let path = operation_path(&tool_name, &tool_input)?;
+                validate_path(
+                    &grant,
+                    &PathClaim {
+                        role,
+                        session_id: &session_id,
+                        cwd: &cwd_path,
+                        access,
+                        path: &path,
+                    },
+                    request.now_ms,
+                )?;
+                Ok(HookDecision::PassThrough)
             }
-        }
-        None => {
-            if controlled_actor {
+            ToolClass::Spawn => unreachable!("spawn is handled above"),
+            ToolClass::Forbidden | ToolClass::Unknown => Err(LaneError::new(
+                Denial::Uncontrolled,
+                "tool is outside the child tool catalog",
+            )),
+        };
+    }
+    if find_grant_for_cwd(state_dir, &cwd_path, request.now_ms)?.is_some() {
+        return Err(LaneError::new(
+            Denial::Role,
+            "a non-child session attempted to operate inside a child lane",
+        ));
+    }
+    if matches!(class, ToolClass::Read | ToolClass::Write) {
+        if let Ok(path) = operation_path(&tool_name, &tool_input) {
+            let full = if path.is_absolute() {
+                path
+            } else {
+                cwd_path.join(path)
+            };
+            if class == ToolClass::Write && full.is_file() && store::path_has_multiple_links(&full)?
+            {
                 return Err(LaneError::new(
-                    Denial::MissingGrant,
-                    "controlled lane actor has no active grant",
+                    Denial::Path,
+                    "write target has multiple hard links",
                 ));
             }
-            if matches!(class, ToolClass::Read | ToolClass::Write) {
-                if let Ok(path) = operation_path(&tool_input) {
-                    let full = if path.is_absolute() {
-                        path
-                    } else {
-                        cwd_path.join(path)
-                    };
-                    if store::path_targets_lane(state_dir, &full)? {
-                        return Err(LaneError::new(Denial::Path, "path enters another lane"));
-                    }
-                }
+            if store::path_targets_lane(state_dir, &full)? {
+                return Err(LaneError::new(Denial::Path, "path enters another lane"));
             }
-            Ok(HookDecision::Silent)
         }
     }
+    Ok(HookDecision::Silent)
 }
 
 fn is_controlled_role(role: &str) -> bool {
@@ -190,10 +223,13 @@ fn is_controlled_role(role: &str) -> bool {
 }
 
 fn decide_spawn(
+    request: &HookRequest<'_>,
     state_dir: &Path,
     tool_input: &Map<String, Value>,
-    now_ms: u64,
+    parent_session_id: &str,
+    tool_use_id: &str,
 ) -> Result<HookDecision, LaneError> {
+    validate_spawn_input(tool_input)?;
     if has_widening_field(tool_input) {
         return Err(LaneError::new(
             Denial::Uncontrolled,
@@ -208,8 +244,7 @@ fn decide_spawn(
     let cwd_path = PathBuf::from(&cwd);
     let isolation = optional_string(tool_input, &["isolation"])?;
     let model = optional_string(tool_input, &["model", "model_id", "modelId"])?;
-    let child_slot = optional_u32(tool_input, &["child_slot", "childSlot"])?;
-    let grant = match find_grant_for_cwd(state_dir, &cwd_path, now_ms)? {
+    let grant = match find_grant_for_cwd(state_dir, &cwd_path, request.now_ms)? {
         Some(grant) => grant,
         None => {
             if store::has_stored_grants(state_dir)? {
@@ -224,22 +259,27 @@ fn decide_spawn(
             ));
         }
     };
-    validate_spawn(
-        &grant,
-        &SpawnClaim {
-            role: &role,
-            cwd: &cwd_path,
-            isolation: isolation.as_deref(),
-            model: model.as_deref(),
-            effort_overridden: has_any(
-                tool_input,
-                &["reasoning_effort", "reasoningEffort", "effort"],
-            ),
-            widening: false,
-            requested_depth: 1,
-            child_slot,
-        },
-        now_ms,
+    validate_runtime_lock(request, &grant)?;
+    let claim = SpawnClaim {
+        role: &role,
+        cwd: &cwd_path,
+        isolation: isolation.as_deref(),
+        model: model.as_deref(),
+        effort_overridden: has_any(
+            tool_input,
+            &["reasoning_effort", "reasoningEffort", "effort"],
+        ),
+        widening: false,
+        requested_depth: 1,
+        child_slot: None,
+    };
+    claim_grant_for_spawn(
+        state_dir,
+        &cwd_path,
+        &claim,
+        parent_session_id,
+        tool_use_id,
+        request.now_ms,
     )?;
     Ok(HookDecision::PassThrough)
 }
@@ -275,37 +315,100 @@ fn classify_tool(name: &str) -> ToolClass {
     }
 }
 
-fn operation_path(tool_input: &Map<String, Value>) -> Result<PathBuf, LaneError> {
-    if has_any(
-        tool_input,
-        &[
-            "command",
-            "cmd",
-            "command_line",
-            "commandLine",
-            "script",
-            "url",
-            "urls",
-        ],
-    ) {
-        return Err(LaneError::new(
-            Denial::Uncontrolled,
-            "path tool carries a command or url",
-        ));
+fn validate_runtime_lock(
+    request: &HookRequest<'_>,
+    grant: &crate::schema::GrantRecord,
+) -> Result<(), LaneError> {
+    let valid = request.model_inheritance == Some("1")
+        && request.sampling_limit == Some("2")
+        && request.active_agent_messages == Some("0")
+        && request.workflows == Some("0")
+        && request.memory == Some("0")
+        && request.locked_model == Some(grant.model.as_str())
+        && request.locked_reasoning_effort == Some(grant.reasoning_effort.as_str());
+    if valid {
+        Ok(())
+    } else {
+        Err(LaneError::new(
+            Denial::Model,
+            "locked child inheritance environment is missing or conflicting",
+        ))
     }
-    let path = required_string(
+}
+
+fn validate_spawn_input(tool_input: &Map<String, Value>) -> Result<(), LaneError> {
+    validate_keys(
         tool_input,
         &[
-            "file_path",
-            "filePath",
-            "target_file",
-            "targetFile",
-            "path",
-            "notebook_path",
-            "notebookPath",
+            "prompt",
+            "description",
+            "subagent_type",
+            "background",
+            "isolation",
+            "cwd",
         ],
     )?;
-    Ok(PathBuf::from(path))
+    required_string(tool_input, &["prompt"])?;
+    required_string(tool_input, &["description"])?;
+    if let Some(value) = tool_input.get("background") {
+        if !value.is_boolean() {
+            return Err(LaneError::new(
+                Denial::MalformedHook,
+                "spawn background field is not boolean",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn operation_path(tool_name: &str, tool_input: &Map<String, Value>) -> Result<PathBuf, LaneError> {
+    let (path_key, allowed): (&str, &[&str]) = match tool_name.to_ascii_lowercase().as_str() {
+        "read_file" => (
+            "target_file",
+            &["target_file", "offset", "limit", "format", "pages"],
+        ),
+        "list_dir" => ("target_directory", &["target_directory"]),
+        "grep" => (
+            "path",
+            &[
+                "pattern",
+                "path",
+                "type",
+                "glob",
+                "output_mode",
+                "-A",
+                "-B",
+                "-C",
+                "-i",
+                "multiline",
+                "head_limit",
+            ],
+        ),
+        "search_replace" => (
+            "file_path",
+            &["file_path", "old_string", "new_string", "replace_all"],
+        ),
+        "write" => ("filePath", &["filePath", "content"]),
+        _ => {
+            return Err(LaneError::new(
+                Denial::Uncontrolled,
+                "tool has no controlled path schema",
+            ))
+        }
+    };
+    validate_keys(tool_input, allowed)?;
+    required_string(tool_input, &[path_key]).map(PathBuf::from)
+}
+
+fn validate_keys(map: &Map<String, Value>, allowed: &[&str]) -> Result<(), LaneError> {
+    if map.keys().all(|key| allowed.contains(&key.as_str())) {
+        Ok(())
+    } else {
+        Err(LaneError::new(
+            Denial::Uncontrolled,
+            "tool input contains an unsupported field",
+        ))
+    }
 }
 
 fn is_pretool(event: &Map<String, Value>) -> Result<bool, LaneError> {
@@ -394,31 +497,19 @@ fn optional_string(map: &Map<String, Value>, keys: &[&str]) -> Result<Option<Str
     Ok(found)
 }
 
-fn optional_u32(map: &Map<String, Value>, keys: &[&str]) -> Result<Option<u32>, LaneError> {
+fn optional_bool(map: &Map<String, Value>, keys: &[&str]) -> Option<bool> {
     let mut found = None;
     for key in keys {
         if let Some(value) = map.get(*key) {
-            let Some(number) = value.as_u64() else {
-                return Err(LaneError::new(
-                    Denial::MalformedHook,
-                    "child slot is not an integer",
-                ));
-            };
-            let slot = u32::try_from(number)
-                .map_err(|_| LaneError::new(Denial::ChildSlot, "child slot is outside u32"))?;
+            let boolean = value.as_bool()?;
             match found {
-                None => found = Some(slot),
-                Some(existing) if existing != slot => {
-                    return Err(LaneError::new(
-                        Denial::MalformedHook,
-                        "child slot aliases disagree",
-                    ));
-                }
+                None => found = Some(boolean),
+                Some(existing) if existing != boolean => return None,
                 Some(_) => {}
             }
         }
     }
-    Ok(found)
+    found
 }
 
 fn has_widening_field(map: &Map<String, Value>) -> bool {
@@ -476,10 +567,6 @@ fn deny_json(denial: Denial) -> String {
         r#"{"decision":"deny","reason":"parley-lane: deny malformed hook","permissionDecision":"deny","permissionDecisionReason":"parley-lane: deny malformed hook"}"#
             .to_string()
     })
-}
-
-fn defer_json() -> String {
-    r#"{"decision":"defer"}"#.to_string()
 }
 
 #[derive(Serialize)]

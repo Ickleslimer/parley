@@ -21,6 +21,7 @@ pub struct ObservedDir {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedPath {
+    pub full: PathBuf,
     pub relative: Vec<String>,
     pub ancestor_rel_len: usize,
 }
@@ -110,9 +111,24 @@ pub fn resolve_operation(cwd: &ObservedDir, requested: &Path) -> Result<Resolved
         return Err(LaneError::new(Denial::Path, "path is the worktree root"));
     }
     Ok(ResolvedPath {
+        full,
         relative,
         ancestor_rel_len: ancestor_normal.parts.len() - cwd.normal.parts.len(),
     })
+}
+
+pub fn reject_hardlinked_write(resolved: &ResolvedPath) -> Result<(), LaneError> {
+    match fs::symlink_metadata(&resolved.full) {
+        Ok(metadata) if metadata.is_file() && fsutil::file_link_count(&resolved.full)? > 1 => Err(
+            LaneError::new(Denial::Path, "write target has multiple hard links"),
+        ),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LaneError::new(
+            Denial::Path,
+            format!("inspect write target: {error}"),
+        )),
+    }
 }
 
 pub fn normalize_grant(cwd: &ObservedDir, grant: &PathGrant) -> Result<PathGrant, LaneError> {

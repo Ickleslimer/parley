@@ -24,6 +24,8 @@ use crate::fsx;
 use crate::fuse;
 use crate::harness::{normalize_harness, Invocation};
 use crate::health_report::HealthReporter;
+use crate::job_runtime::{self, JobRuntime};
+use crate::jobs::{JobMode, JobSpec, MAX_LISTED_JOBS};
 use crate::json::Json;
 use crate::policy::RuntimePolicy;
 use crate::process::{capture_invocation, run_invocation};
@@ -69,28 +71,33 @@ pub(crate) fn run(_options: McpOptions) -> Result<(), String> {
     let cwd = env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?;
     let policy = RuntimePolicy::from_env()?;
     let reporter = HealthReporter::from_env()?;
+    let jobs = JobRuntime::from_env()?;
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|e| format!("stdin read error: {e}"))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    let result = (|| {
+        for line in stdin.lock().lines() {
+            let line = line.map_err(|e| format!("stdin read error: {e}"))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let response = match Json::parse(trimmed) {
+                Ok(request) => handle_request_with_receipt(&request, &cwd, &policy, &jobs),
+                Err(_) => Some(HandledResponse {
+                    json: error_response(&Json::Null, -32700, "parse error"),
+                    delivery: None,
+                }),
+            };
+            if let Some(response) = response {
+                write_mcp_response(&mut out, &response, &reporter)?;
+            }
         }
-        let response = match Json::parse(trimmed) {
-            Ok(request) => handle_request_with_receipt(&request, &cwd, &policy),
-            Err(_) => Some(HandledResponse {
-                json: error_response(&Json::Null, -32700, "parse error"),
-                delivery: None,
-            }),
-        };
-        if let Some(response) = response {
-            write_mcp_response(&mut out, &response, &reporter)?;
-        }
-    }
-    Ok(())
+        Ok(())
+    })();
+    jobs.drain();
+    result
 }
 
 fn write_mcp_response(
@@ -370,13 +377,15 @@ fn handle_request_with_policy(
     default_cwd: &Path,
     policy: &RuntimePolicy,
 ) -> Option<Json> {
-    handle_request_with_receipt(request, default_cwd, policy).map(|response| response.json)
+    handle_request_with_receipt(request, default_cwd, policy, &JobRuntime::disabled())
+        .map(|response| response.json)
 }
 
 fn handle_request_with_receipt(
     request: &Json,
     default_cwd: &Path,
     policy: &RuntimePolicy,
+    jobs: &JobRuntime,
 ) -> Option<HandledResponse> {
     let method = request.get("method").and_then(Json::as_str).unwrap_or("");
     // Notifications carry no id and expect no reply.
@@ -386,7 +395,7 @@ fn handle_request_with_receipt(
     let result = match method {
         "initialize" => Ok(initialize_result()),
         "tools/list" => Ok(tools_list_result()),
-        "tools/call" => call_tool(request, default_cwd, policy, &mut delivery),
+        "tools/call" => call_tool(request, default_cwd, policy, jobs, &mut delivery),
         "ping" => Ok(obj(vec![])),
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -643,9 +652,197 @@ fn tools_list_result() -> Json {
         vec!["prompt"],
     );
 
+    let grant_schema = obj(vec![
+        ("type", Json::Str("object".to_string())),
+        (
+            "properties",
+            obj(vec![
+                (
+                    "kind",
+                    obj(vec![
+                        ("type", Json::Str("string".to_string())),
+                        (
+                            "enum",
+                            Json::Array(vec![
+                                Json::Str("file".to_string()),
+                                Json::Str("tree".to_string()),
+                            ]),
+                        ),
+                    ]),
+                ),
+                ("path", str_prop("Relative non-glob writable path.")),
+            ]),
+        ),
+        (
+            "required",
+            Json::Array(vec![
+                Json::Str("kind".to_string()),
+                Json::Str("path".to_string()),
+            ]),
+        ),
+    ]);
+    let lane_schema = obj(vec![
+        ("type", Json::Str("object".to_string())),
+        (
+            "properties",
+            obj(vec![
+                ("lane_id", str_prop("Stable lane identifier.")),
+                (
+                    "owner",
+                    obj(vec![
+                        ("type", Json::Str("string".to_string())),
+                        (
+                            "enum",
+                            Json::Array(
+                                ["codex", "grok_parent", "grok_child"]
+                                    .into_iter()
+                                    .map(|value| Json::Str(value.to_string()))
+                                    .collect(),
+                            ),
+                        ),
+                    ]),
+                ),
+                (
+                    "role",
+                    obj(vec![
+                        ("type", Json::Str("string".to_string())),
+                        (
+                            "enum",
+                            Json::Array(vec![
+                                Json::Str("writer".to_string()),
+                                Json::Str("reviewer".to_string()),
+                            ]),
+                        ),
+                    ]),
+                ),
+                (
+                    "worktree",
+                    str_prop("Absolute pre-created Git worktree path."),
+                ),
+                (
+                    "writable_paths",
+                    obj(vec![
+                        ("type", Json::Str("array".to_string())),
+                        ("items", grant_schema),
+                    ]),
+                ),
+            ]),
+        ),
+        (
+            "required",
+            Json::Array(
+                ["lane_id", "owner", "role", "worktree", "writable_paths"]
+                    .into_iter()
+                    .map(|value| Json::Str(value.to_string()))
+                    .collect(),
+            ),
+        ),
+    ]);
+    let lane_plan_prop = obj(vec![
+        ("type", Json::Str("object".to_string())),
+        (
+            "properties",
+            obj(vec![
+                (
+                    "base_commit",
+                    str_prop("Exact 40-character immutable Git base commit."),
+                ),
+                (
+                    "integration_worktree",
+                    str_prop("Absolute read-only integration worktree path."),
+                ),
+                (
+                    "lanes",
+                    obj(vec![
+                        ("type", Json::Str("array".to_string())),
+                        ("items", lane_schema),
+                        ("minItems", Json::Number(2.0)),
+                        ("maxItems", Json::Number(4.0)),
+                    ]),
+                ),
+            ]),
+        ),
+        (
+            "required",
+            Json::Array(
+                ["base_commit", "integration_worktree", "lanes"]
+                    .into_iter()
+                    .map(|value| Json::Str(value.to_string()))
+                    .collect(),
+            ),
+        ),
+    ]);
+    let mut start_properties = ask_tool
+        .get("inputSchema")
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Json::as_object)
+        .cloned()
+        .unwrap_or_default();
+    start_properties.insert(
+        "job_id".to_string(),
+        str_prop("Caller-generated idempotency UUID."),
+    );
+    start_properties.insert(
+        "job_mode".to_string(),
+        obj(vec![
+            ("type", Json::Str("string".to_string())),
+            (
+                "enum",
+                Json::Array(
+                    ["write", "review", "probe"]
+                        .into_iter()
+                        .map(|value| Json::Str(value.to_string()))
+                        .collect(),
+                ),
+            ),
+        ]),
+    );
+    start_properties.insert("lane_plan".to_string(), lane_plan_prop);
+    let start_job_tool = tool(
+        "start_agent_job",
+        "Start one idempotent contained Grok job and return after its request is logged and the process is running, or with its exact terminal preflight result.",
+        Json::Object(start_properties),
+        vec!["job_id", "job_mode", "harness", "prompt"],
+    );
+    let get_job_tool = tool(
+        "get_agent_job",
+        "Read one asynchronous job, including its exact terminal reply or error when available.",
+        obj(vec![("job_id", str_prop("Caller-generated job UUID."))]),
+        vec!["job_id"],
+    );
+    let list_job_tool = tool(
+        "list_agent_jobs",
+        "List newest-first bounded asynchronous job metadata without replies.",
+        obj(vec![(
+            "limit",
+            obj(vec![
+                ("type", Json::Str("integer".to_string())),
+                ("minimum", Json::Number(1.0)),
+                ("maximum", Json::Number(MAX_LISTED_JOBS as f64)),
+            ]),
+        )]),
+        vec![],
+    );
+    let cancel_job_tool = tool(
+        "cancel_agent_job",
+        "Cancel one exact active job and its contained process tree without retrying it.",
+        obj(vec![("job_id", str_prop("Caller-generated job UUID."))]),
+        vec!["job_id"],
+    );
+
     obj(vec![(
         "tools",
-        Json::Array(vec![list_tool, last_tool, resume_tool, ask_tool, fuse_tool]),
+        Json::Array(vec![
+            list_tool,
+            last_tool,
+            resume_tool,
+            ask_tool,
+            start_job_tool,
+            get_job_tool,
+            list_job_tool,
+            cancel_job_tool,
+            fuse_tool,
+        ]),
     )])
 }
 
@@ -653,6 +850,7 @@ fn call_tool(
     request: &Json,
     default_cwd: &Path,
     policy: &RuntimePolicy,
+    jobs: &JobRuntime,
     delivery: &mut Option<ExchangeReceipt>,
 ) -> Result<Json, (i64, String)> {
     let params = request
@@ -695,50 +893,8 @@ fn call_tool(
             }
         }
         "ask_agent" => {
-            let harness = harness.ok_or((-32602, "missing harness".to_string()))?;
-            let prompt = args
-                .get("prompt")
-                .and_then(Json::as_str)
-                .ok_or((-32602, "missing prompt".to_string()))?;
-            let context = parse_ask_context(args)?;
-            let cwd = policy
-                .validate_spawn_cwd(&cwd)
-                .map_err(|error| (-32602, error))?;
-            let yolo = policy
-                .resolve_mcp_yolo(args.get("yolo").and_then(Json::as_bool))
-                .map_err(|error| (-32602, error))?;
-            let max_turns = optional_positive_integer(args, "max_turns")?;
-            let max_context_chars = optional_positive_usize(args, "max_context_chars")?;
-            let request = AskRequest {
-                harness: harness.to_string(),
-                prompt: prompt.to_string(),
-                model: args.get("model").and_then(Json::as_str).map(str::to_string),
-                reasoning_effort: args
-                    .get("reasoning_effort")
-                    .and_then(Json::as_str)
-                    .map(str::to_string),
-                provider: args
-                    .get("provider")
-                    .and_then(Json::as_str)
-                    .map(str::to_string),
-                cwd: cwd.clone(),
-                permission_mode: args
-                    .get("permission_mode")
-                    .and_then(Json::as_str)
-                    .map(str::to_string),
-                max_turns,
-                session_id: args
-                    .get("session_id")
-                    .and_then(Json::as_str)
-                    .map(str::to_string),
-                resume_id: args
-                    .get("resume_id")
-                    .and_then(Json::as_str)
-                    .map(str::to_string),
-                yolo,
-                context,
-                max_context_chars,
-            };
+            let request = parse_ask_request(args, default_cwd, policy)?;
+            let harness = request.harness.clone();
             match ask::run_with_receipt(&request) {
                 Ok(outcome) => match outcome.captured.reply() {
                     Ok(reply) => {
@@ -758,6 +914,76 @@ fn call_tool(
                     }
                     Ok(text_content(&failure.message, true))
                 }
+            }
+        }
+        "start_agent_job" => {
+            let job_id = required_arg_string(args, "job_id")?;
+            let mode = JobMode::parse(&required_arg_string(args, "job_mode")?)
+                .map_err(|error| (-32602, error))?;
+            let request = parse_ask_request(args, default_cwd, policy)?;
+            let lane_plan = args
+                .get("lane_plan")
+                .map(crate::lane_plan::parse)
+                .transpose()
+                .map_err(|error| (-32602, error))?;
+            match jobs.start(JobSpec {
+                job_id,
+                mode,
+                request,
+                lane_plan,
+            }) {
+                Ok(lookup) => {
+                    if let Some(receipt) = lookup.delivery {
+                        *delivery = Some(receipt);
+                    }
+                    Ok(text_content(
+                        &job_runtime::view_json(&lookup.view, true).to_pretty_string(),
+                        false,
+                    ))
+                }
+                Err(error) => Ok(text_content(&error, true)),
+            }
+        }
+        "get_agent_job" => {
+            let job_id = required_arg_string(args, "job_id")?;
+            match jobs.get(&job_id) {
+                Ok(Some(lookup)) => {
+                    if let Some(receipt) = lookup.delivery {
+                        *delivery = Some(receipt);
+                    }
+                    Ok(text_content(
+                        &job_runtime::view_json(&lookup.view, true).to_pretty_string(),
+                        false,
+                    ))
+                }
+                Ok(None) => Ok(text_content(&format!("job {job_id} was not found"), true)),
+                Err(error) => Ok(text_content(&error, true)),
+            }
+        }
+        "list_agent_jobs" => {
+            let limit = optional_positive_usize(args, "limit")?.unwrap_or(20);
+            match jobs.list(limit) {
+                Ok(views) => Ok(text_content(
+                    &Json::Array(
+                        views
+                            .iter()
+                            .map(|view| job_runtime::view_json(view, false))
+                            .collect(),
+                    )
+                    .to_pretty_string(),
+                    false,
+                )),
+                Err(error) => Ok(text_content(&error, true)),
+            }
+        }
+        "cancel_agent_job" => {
+            let job_id = required_arg_string(args, "job_id")?;
+            match jobs.cancel(&job_id) {
+                Ok(lookup) => Ok(text_content(
+                    &job_runtime::view_json(&lookup.view, true).to_pretty_string(),
+                    false,
+                )),
+                Err(error) => Ok(text_content(&error, true)),
             }
         }
         "fuse" => {
@@ -850,6 +1076,61 @@ fn call_tool(
         }
         other => Err((-32602, format!("unknown tool: {other}"))),
     }
+}
+
+fn parse_ask_request(
+    args: &Json,
+    default_cwd: &Path,
+    policy: &RuntimePolicy,
+) -> Result<AskRequest, (i64, String)> {
+    let harness = required_arg_string(args, "harness")?;
+    let prompt = required_arg_string(args, "prompt")?;
+    let context = parse_ask_context(args)?;
+    let cwd = policy
+        .validate_spawn_cwd(&arg_cwd(args, default_cwd))
+        .map_err(|error| (-32602, error))?;
+    let yolo = policy
+        .resolve_mcp_yolo(args.get("yolo").and_then(Json::as_bool))
+        .map_err(|error| (-32602, error))?;
+    Ok(AskRequest {
+        harness,
+        prompt,
+        model: args.get("model").and_then(Json::as_str).map(str::to_string),
+        reasoning_effort: args
+            .get("reasoning_effort")
+            .and_then(Json::as_str)
+            .map(str::to_string),
+        provider: args
+            .get("provider")
+            .and_then(Json::as_str)
+            .map(str::to_string),
+        cwd,
+        permission_mode: args
+            .get("permission_mode")
+            .and_then(Json::as_str)
+            .map(str::to_string),
+        max_turns: optional_positive_integer(args, "max_turns")?,
+        session_id: args
+            .get("session_id")
+            .and_then(Json::as_str)
+            .map(str::to_string),
+        resume_id: args
+            .get("resume_id")
+            .and_then(Json::as_str)
+            .map(str::to_string),
+        yolo,
+        context,
+        max_context_chars: optional_positive_usize(args, "max_context_chars")?,
+        allow_subagents: false,
+    })
+}
+
+fn required_arg_string(args: &Json, name: &str) -> Result<String, (i64, String)> {
+    args.get(name)
+        .and_then(Json::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or((-32602, format!("missing {name}")))
 }
 
 fn is_logged_grok_response(receipt: &ExchangeReceipt) -> bool {
@@ -1158,7 +1439,7 @@ mod tests {
             .and_then(|r| r.get("tools"))
             .and_then(Json::as_array)
             .unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 9);
         let names: Vec<_> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Json::as_str))
@@ -1167,7 +1448,51 @@ mod tests {
         assert!(names.contains(&"get_last_session"));
         assert!(names.contains(&"resume_command"));
         assert!(names.contains(&"ask_agent"));
+        assert!(names.contains(&"start_agent_job"));
+        assert!(names.contains(&"get_agent_job"));
+        assert!(names.contains(&"list_agent_jobs"));
+        assert!(names.contains(&"cancel_agent_job"));
         assert!(names.contains(&"fuse"));
+    }
+
+    #[test]
+    fn async_job_schema_exposes_idempotency_modes_and_lane_grants() {
+        let result = tools_list_result();
+        let tools = result.get("tools").and_then(Json::as_array).unwrap();
+        let start = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Json::as_str) == Some("start_agent_job"))
+            .unwrap();
+        let schema = start.get("inputSchema").unwrap();
+        let required = schema
+            .get("required")
+            .and_then(Json::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Json::as_str)
+            .collect::<Vec<_>>();
+        for name in ["job_id", "job_mode", "harness", "prompt"] {
+            assert!(required.contains(&name));
+        }
+        let properties = schema.get("properties").unwrap();
+        assert_eq!(
+            properties
+                .get("job_mode")
+                .and_then(|property| property.get("enum"))
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Json::as_str)
+                .collect::<Vec<_>>(),
+            vec!["write", "review", "probe"]
+        );
+        let plan = properties.get("lane_plan").unwrap();
+        let lanes = plan
+            .get("properties")
+            .and_then(|value| value.get("lanes"))
+            .unwrap();
+        assert_eq!(lanes.get("minItems").and_then(Json::as_number), Some(2.0));
+        assert_eq!(lanes.get("maxItems").and_then(Json::as_number), Some(4.0));
     }
 
     #[test]

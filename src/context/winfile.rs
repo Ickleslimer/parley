@@ -148,15 +148,12 @@ fn identity_from_file(file: &File, canonical_path: String) -> Result<SourceIdent
 
         #[link(name = "kernel32")]
         unsafe extern "system" {
-            fn GetFileInformationByHandle(
-                file: *mut c_void,
-                information: *mut ByHandleFileInformation,
-            ) -> i32;
+            fn GetFileInformationByHandle(file: *mut c_void, information: *mut c_void) -> i32;
         }
 
         let mut information = MaybeUninit::<ByHandleFileInformation>::uninit();
         let ok = unsafe {
-            GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+            GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr().cast())
         };
         if ok == 0 {
             return Err(io::Error::last_os_error().into());

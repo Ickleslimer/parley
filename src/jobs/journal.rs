@@ -432,6 +432,10 @@ fn canonical_request_json(spec: &JobSpec) -> Result<String, JobError> {
         return Err(JobError::invalid("invalid: harness must not be empty"));
     }
     let mut map = BTreeMap::new();
+    map.insert(
+        "allow_subagents".to_string(),
+        Json::Bool(spec.request.allow_subagents),
+    );
     map.insert("context".to_string(), context_json(&spec.request.context));
     map.insert(
         "cwd".to_string(),
@@ -1904,6 +1908,7 @@ mod tests {
             yolo: false,
             context: None,
             max_context_chars: None,
+            allow_subagents: false,
         }
     }
 

@@ -15,7 +15,9 @@ pub const REVIEWER_ROLE: &str = "two-chairs-reviewer";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantState {
-    Active,
+    Prepared,
+    Claimed,
+    Running,
     Consumed,
 }
 
@@ -75,6 +77,7 @@ pub struct GrantDraft {
     pub base_commit: String,
     pub path_grants: Vec<PathGrant>,
     pub model: String,
+    pub reasoning_effort: String,
     pub depth: u32,
     pub child_slot: u32,
     pub issued_at_ms: u64,
@@ -95,10 +98,16 @@ pub struct GrantRecord {
     pub base_commit: String,
     pub path_grants: Vec<PathGrant>,
     pub model: String,
+    pub reasoning_effort: String,
     pub depth: u32,
     pub child_slot: u32,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
+    pub parent_session_id: Option<String>,
+    pub spawn_tool_use_id: Option<String>,
+    pub child_session_id: Option<String>,
+    pub claimed_at_ms: Option<u64>,
+    pub started_at_ms: Option<u64>,
     pub consumed_at_ms: Option<u64>,
     pub metadata_hash: String,
 }
@@ -118,10 +127,16 @@ struct GrantFile {
     base_commit: String,
     path_grants: Vec<PathGrant>,
     model: String,
+    reasoning_effort: String,
     depth: u32,
     child_slot: u32,
     issued_at_ms: u64,
     expires_at_ms: u64,
+    parent_session_id: Option<String>,
+    spawn_tool_use_id: Option<String>,
+    child_session_id: Option<String>,
+    claimed_at_ms: Option<u64>,
+    started_at_ms: Option<u64>,
     consumed_at_ms: Option<u64>,
     metadata_hash: String,
 }
@@ -140,10 +155,16 @@ struct HashBody<'a> {
     base_commit: &'a str,
     path_grants: &'a [PathGrant],
     model: &'a str,
+    reasoning_effort: &'a str,
     depth: u32,
     child_slot: u32,
     issued_at_ms: u64,
     expires_at_ms: u64,
+    parent_session_id: &'a Option<String>,
+    spawn_tool_use_id: &'a Option<String>,
+    child_session_id: &'a Option<String>,
+    claimed_at_ms: Option<u64>,
+    started_at_ms: Option<u64>,
     consumed_at_ms: Option<u64>,
 }
 
@@ -158,6 +179,18 @@ pub fn validate_token(value: &str) -> bool {
 
 pub fn validate_model(value: &str) -> bool {
     validate_token(value)
+}
+
+pub fn validate_reasoning_effort(value: &str) -> bool {
+    matches!(value, "low" | "medium" | "high" | "xhigh")
+}
+
+pub fn validate_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 pub fn validate_commit(value: &str) -> bool {
@@ -181,6 +214,12 @@ pub fn validate_draft_shape(draft: &GrantDraft) -> Result<(), LaneError> {
         return Err(LaneError::new(
             Denial::Model,
             "model is not a safe inherited model id",
+        ));
+    }
+    if !validate_reasoning_effort(&draft.reasoning_effort) {
+        return Err(LaneError::new(
+            Denial::Model,
+            "reasoning effort is not a supported locked value",
         ));
     }
     if !validate_commit(&draft.base_commit) {
@@ -207,10 +246,10 @@ pub fn validate_draft_shape(draft: &GrantDraft) -> Result<(), LaneError> {
             "grant expiry must be after issue time",
         ));
     }
-    if draft.path_grants.is_empty() || draft.path_grants.len() > 32 {
+    if draft.path_grants.len() > 32 {
         return Err(LaneError::new(
             Denial::Path,
-            "path grants must contain one to 32 entries",
+            "path grants may contain at most 32 entries",
         ));
     }
     if !draft.canonical_cwd.is_absolute() || !draft.worktree_common_dir.is_absolute() {
@@ -274,10 +313,16 @@ fn hash_of(file: &GrantFile) -> String {
         base_commit: &file.base_commit,
         path_grants: &file.path_grants,
         model: &file.model,
+        reasoning_effort: &file.reasoning_effort,
         depth: file.depth,
         child_slot: file.child_slot,
         issued_at_ms: file.issued_at_ms,
         expires_at_ms: file.expires_at_ms,
+        parent_session_id: &file.parent_session_id,
+        spawn_tool_use_id: &file.spawn_tool_use_id,
+        child_session_id: &file.child_session_id,
+        claimed_at_ms: file.claimed_at_ms,
+        started_at_ms: file.started_at_ms,
         consumed_at_ms: file.consumed_at_ms,
     };
     let bytes = serde_json::to_vec(&body).unwrap_or_default();
@@ -297,7 +342,10 @@ fn validate_record(record: &GrantRecord) -> Result<(), LaneError> {
             "grant identifiers are not safe tokens",
         ));
     }
-    if !validate_model(&record.model) || !validate_commit(&record.base_commit) {
+    if !validate_model(&record.model)
+        || !validate_reasoning_effort(&record.reasoning_effort)
+        || !validate_commit(&record.base_commit)
+    {
         return Err(LaneError::new(
             Denial::MalformedGrant,
             "model or base commit is malformed",
@@ -327,25 +375,11 @@ fn validate_record(record: &GrantRecord) -> Result<(), LaneError> {
             "file identity is malformed",
         ));
     }
-    match record.state {
-        GrantState::Active if record.consumed_at_ms.is_some() => {
-            return Err(LaneError::new(
-                Denial::MalformedGrant,
-                "active grant carries a consumed timestamp",
-            ));
-        }
-        GrantState::Consumed if record.consumed_at_ms.is_none() => {
-            return Err(LaneError::new(
-                Denial::MalformedGrant,
-                "consumed grant is missing its transition timestamp",
-            ));
-        }
-        GrantState::Active | GrantState::Consumed => {}
-    }
-    if record.path_grants.is_empty() || record.path_grants.len() > 32 {
+    validate_transition_fields(record)?;
+    if record.path_grants.len() > 32 {
         return Err(LaneError::new(
             Denial::MalformedGrant,
-            "path grants are missing or unbounded",
+            "path grants are unbounded",
         ));
     }
     let writes = record
@@ -367,6 +401,72 @@ fn validate_record(record: &GrantRecord) -> Result<(), LaneError> {
             ));
         }
         ChildRole::Writer | ChildRole::Reviewer => {}
+    }
+    Ok(())
+}
+
+fn validate_transition_fields(record: &GrantRecord) -> Result<(), LaneError> {
+    for identifier in [
+        record.parent_session_id.as_deref(),
+        record.spawn_tool_use_id.as_deref(),
+        record.child_session_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !validate_identifier(identifier) {
+            return Err(LaneError::new(
+                Denial::MalformedGrant,
+                "grant lifecycle identifier is malformed",
+            ));
+        }
+    }
+    let prepared = record.parent_session_id.is_none()
+        && record.spawn_tool_use_id.is_none()
+        && record.child_session_id.is_none()
+        && record.claimed_at_ms.is_none()
+        && record.started_at_ms.is_none()
+        && record.consumed_at_ms.is_none();
+    let claimed = record.parent_session_id.is_some()
+        && record.spawn_tool_use_id.is_some()
+        && record.child_session_id.is_none()
+        && record.claimed_at_ms.is_some()
+        && record.started_at_ms.is_none()
+        && record.consumed_at_ms.is_none();
+    let running = record.parent_session_id.is_some()
+        && record.spawn_tool_use_id.is_some()
+        && record.child_session_id.is_some()
+        && record.claimed_at_ms.is_some()
+        && record.started_at_ms.is_some()
+        && record.consumed_at_ms.is_none();
+    let consumed = record.consumed_at_ms.is_some();
+    let valid = match record.state {
+        GrantState::Prepared => prepared,
+        GrantState::Claimed => claimed,
+        GrantState::Running => running,
+        GrantState::Consumed => consumed,
+    };
+    if !valid {
+        return Err(LaneError::new(
+            Denial::MalformedGrant,
+            "grant lifecycle fields do not match its state",
+        ));
+    }
+    if let (Some(claimed_at), Some(started_at)) = (record.claimed_at_ms, record.started_at_ms) {
+        if started_at < claimed_at {
+            return Err(LaneError::new(
+                Denial::MalformedGrant,
+                "grant start precedes its claim",
+            ));
+        }
+    }
+    if let Some(consumed_at) = record.consumed_at_ms {
+        if consumed_at < record.issued_at_ms {
+            return Err(LaneError::new(
+                Denial::MalformedGrant,
+                "grant consumption precedes its issue",
+            ));
+        }
     }
     Ok(())
 }
@@ -399,10 +499,16 @@ impl GrantFile {
             base_commit: record.base_commit.clone(),
             path_grants: record.path_grants.clone(),
             model: record.model.clone(),
+            reasoning_effort: record.reasoning_effort.clone(),
             depth: record.depth,
             child_slot: record.child_slot,
             issued_at_ms: record.issued_at_ms,
             expires_at_ms: record.expires_at_ms,
+            parent_session_id: record.parent_session_id.clone(),
+            spawn_tool_use_id: record.spawn_tool_use_id.clone(),
+            child_session_id: record.child_session_id.clone(),
+            claimed_at_ms: record.claimed_at_ms,
+            started_at_ms: record.started_at_ms,
             consumed_at_ms: record.consumed_at_ms,
             metadata_hash: record.metadata_hash.clone(),
         }
@@ -422,10 +528,16 @@ impl GrantFile {
             base_commit: self.base_commit,
             path_grants: self.path_grants,
             model: self.model,
+            reasoning_effort: self.reasoning_effort,
             depth: self.depth,
             child_slot: self.child_slot,
             issued_at_ms: self.issued_at_ms,
             expires_at_ms: self.expires_at_ms,
+            parent_session_id: self.parent_session_id,
+            spawn_tool_use_id: self.spawn_tool_use_id,
+            child_session_id: self.child_session_id,
+            claimed_at_ms: self.claimed_at_ms,
+            started_at_ms: self.started_at_ms,
             consumed_at_ms: self.consumed_at_ms,
             metadata_hash: self.metadata_hash,
         })

@@ -107,6 +107,7 @@ pub(crate) fn run_cli(options: ConverseOptions) -> Result<(), String> {
             yolo: options.yolo,
             context: None,
             max_context_chars: Some(max_context),
+            allow_subagents: false,
         };
 
         if options.dry_run {
