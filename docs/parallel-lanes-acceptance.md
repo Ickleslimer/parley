@@ -50,6 +50,21 @@ alias `task` in the allowlist and then exposes the internal tool as
 `spawn_subagent`; no session on this machine exposes an internal `task` tool.
 The captured history contained no spawn call, and all Grok lanes stayed clean.
 
+A third guarded run started from commit
+`9873a03061f158663e99483c4813a72305d6db5a` with job
+`515893e9-9999-407b-8622-b923fbc649f8` and Grok session
+`5ada7d6d-9269-4170-b897-2da5a5fa5c5b`. The parent catalog used the installed
+CLI alias `task`; this evidence edit again occurred while the job was `running`.
+The resulting catalog exposed `spawn_subagent`, and the parent emitted two real
+spawn calls, but the captured schema had only `prompt`, `description`,
+`background`, `isolation`, `resume_from`, and `cwd`. It omitted
+`subagent_type` and named no Two Chairs child type. Both calls therefore omitted
+the required role and Auto denied them as lacking a concrete inspectable effect.
+No child session started, no Grok lane changed, and a later parent edit attempt
+was also denied without writing. This proves the active parent must carry an
+immutable `Agent(two-chairs-writer,two-chairs-reviewer)` catalog rather than
+only receiving child definitions through `--agents`.
+
 ## Fail-closed startup evidence
 
 Two earlier development attempts never launched Grok:
