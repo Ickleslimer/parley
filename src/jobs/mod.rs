@@ -1,5 +1,13 @@
 #![allow(dead_code)]
 
+mod journal;
+
+#[allow(unused_imports)]
+pub(crate) use journal::{
+    request_fingerprint, resolve_namespace, BeginOutcome, JobError, JobErrorKind, JobStateEnv,
+    JobStore, JobTransition, NamespacePaths, MAX_LISTED_JOBS, STARTUP_RECOVERY_ERROR,
+};
+
 use std::path::PathBuf;
 
 use crate::ask::AskRequest;
@@ -58,6 +66,22 @@ impl JobState {
         }
     }
 
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "preparing" => Ok(Self::Preparing),
+            "running" => Ok(Self::Running),
+            "cancelling" => Ok(Self::Cancelling),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "timed_out" => Ok(Self::TimedOut),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            _ => Err(format!(
+                "job state must be preparing, running, cancelling, succeeded, failed, timed_out, cancelled, or interrupted, got {value}"
+            )),
+        }
+    }
+
     pub(crate) fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -73,16 +97,44 @@ pub(crate) enum LaneOwner {
     GrokChild,
 }
 
+impl LaneOwner {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::GrokParent => "grok_parent",
+            Self::GrokChild => "grok_child",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LaneRole {
     Writer,
     Reviewer,
 }
 
+impl LaneRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Writer => "writer",
+            Self::Reviewer => "reviewer",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrantKind {
     File,
     Tree,
+}
+
+impl GrantKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Tree => "tree",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +189,9 @@ mod tests {
     fn job_modes_and_terminal_states_are_closed() {
         assert_eq!(JobMode::parse("write").unwrap(), JobMode::Write);
         assert!(JobMode::parse("other").is_err());
+        assert_eq!(JobState::parse("timed_out").unwrap(), JobState::TimedOut);
+        assert_eq!(JobState::parse("cancelling").unwrap(), JobState::Cancelling);
+        assert!(JobState::parse("canceled").is_err());
         assert!(!JobState::Running.is_terminal());
         assert!(JobState::Interrupted.is_terminal());
     }
