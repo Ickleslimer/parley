@@ -5,6 +5,7 @@ mod commands;
 pub mod event_engine;
 mod launch;
 mod lifecycle;
+mod peer_health;
 mod runtime;
 mod settings;
 
@@ -28,6 +29,11 @@ pub fn run() {
             commands::list_exchanges,
             commands::search_events,
             commands::get_event_content,
+            commands::get_peer_health,
+            commands::acknowledge_peer_incident,
+            commands::set_peer_health_muted,
+            commands::test_peer_health_chime,
+            commands::open_latest_handoff,
             commands::get_settings,
             commands::save_settings,
             commands::list_monitors,

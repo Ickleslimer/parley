@@ -2451,9 +2451,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "parley-health"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "parley-viewer"
 version = "0.1.0"
 dependencies = [
+ "parley-health",
  "serde",
  "serde_json",
  "tauri",

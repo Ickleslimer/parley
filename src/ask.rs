@@ -246,16 +246,67 @@ pub(crate) fn run_with_receipt(req: &AskRequest) -> Result<AskOutcome, AskFailur
 }
 
 fn has_handoff_footer(reply: &str) -> bool {
-    [
-        "TWO_CHAIRS_HANDOFF",
-        "peer:",
-        "evidence_class:",
-        "incident_id:",
-        "as_of_ms:",
-        "continuity: not_authorized",
-    ]
-    .iter()
-    .all(|field| reply.contains(field))
+    let normalized = reply.replace("\r\n", "\n");
+    let trimmed = normalized.trim_end();
+    let marker = "TWO_CHAIRS_HANDOFF";
+    let start = trimmed
+        .rfind(&format!("\n{marker}\n"))
+        .map(|index| index + 1)
+        .or_else(|| trimmed.starts_with(&format!("{marker}\n")).then_some(0));
+    let Some(start) = start else {
+        return false;
+    };
+    let lines = trimmed[start..].lines().collect::<Vec<_>>();
+    if lines.first().copied() != Some(marker)
+        || lines.last().copied() != Some("continuity: not_authorized")
+    {
+        return false;
+    }
+
+    let mut fields = std::collections::HashMap::new();
+    for line in &lines[1..] {
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if value.is_empty()
+            || !matches!(
+                key,
+                "peer"
+                    | "evidence_class"
+                    | "incident_id"
+                    | "as_of_ms"
+                    | "event_id"
+                    | "exchange_id"
+                    | "continuity"
+            )
+            || fields.insert(key, value).is_some()
+        {
+            return false;
+        }
+    }
+    matches!(fields.get("peer"), Some(value) if *value == "codex")
+        && matches!(
+            fields.get("evidence_class"),
+            Some(value)
+                if matches!(
+                    *value,
+                    "usage_sample"
+                        | "quota_exhausted"
+                        | "capacity_throttle"
+                        | "turn_error"
+                        | "watchdog_killed"
+                        | "mcp_stdout_undelivered"
+                        | "unavailable"
+                )
+        )
+        && fields.contains_key("incident_id")
+        && matches!(
+            fields.get("as_of_ms"),
+            Some(value) if *value == "unknown" || value.parse::<u64>().is_ok()
+        )
+        && matches!(fields.get("continuity"), Some(value) if *value == "not_authorized")
 }
 
 fn prepare(req: &AskRequest) -> Result<AskRequest, String> {
@@ -358,8 +409,17 @@ mod tests {
     fn handoff_footer_requires_every_locked_field() {
         let complete = "TWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: usage_sample\nincident_id: null\nas_of_ms: 42\ncontinuity: not_authorized";
         assert!(has_handoff_footer(complete));
+        assert!(has_handoff_footer(
+            "report\n\nTWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: mcp_stdout_undelivered\nincident_id: incident-1\nas_of_ms: 42\nevent_id: event-1\nexchange_id: exchange-1\ncontinuity: not_authorized\r\n"
+        ));
         assert!(!has_handoff_footer(
             "TWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: unavailable\nincident_id: null\nas_of_ms: 42"
+        ));
+        assert!(!has_handoff_footer(
+            "TWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: unavailable\nincident_id: null\nas_of_ms: unknown\ncontinuity: not_authorized\ntrailing text"
+        ));
+        assert!(!has_handoff_footer(
+            "continuity: not_authorized appears earlier\nTWO_CHAIRS_HANDOFF\npeer: grok\nevidence_class: unavailable\nincident_id: null\nas_of_ms: unknown\ncontinuity: not_authorized"
         ));
     }
 }

@@ -11,6 +11,7 @@ import type {
 } from "../contracts";
 import { DEFAULT_SETTINGS } from "../contracts";
 import type { ViewerApi } from "../ipc";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { button, el, labelledControl, setText } from "./dom";
 import { exactEventBody, presentExchange, searchHitHeading } from "./excerpt";
@@ -456,6 +457,34 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     state.eventError = null;
   };
 
+  const openLatestHandoff = async (): Promise<void> => {
+    if (state.peerHealthBusy) {
+      return;
+    }
+    state.peerHealthBusy = true;
+    paintPeerHealth();
+    try {
+      const selection = await api.openLatestHandoff();
+      if (!alive) {
+        return;
+      }
+      applyHandoffSelection(selection);
+      state.peerHealthError = null;
+    } catch {
+      if (!alive) {
+        return;
+      }
+      state.peerHealthError = loadErrorLabel("open the latest handoff");
+    } finally {
+      if (alive) {
+        state.peerHealthBusy = false;
+        paintPeerHealth();
+        paintEvent();
+        paintMiddle();
+      }
+    }
+  };
+
   const acknowledgeIncident = async (incidentId: string): Promise<void> => {
     if (state.peerHealthBusy) {
       return;
@@ -827,34 +856,21 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   });
 
   nodes.peerHealth.openHandoff.addEventListener("click", () => {
-    if (state.peerHealthBusy) {
-      return;
-    }
-    state.peerHealthBusy = true;
-    paintPeerHealth();
-    void (async () => {
-      try {
-        const selection = await api.openLatestHandoff();
-        if (!alive) {
-          return;
-        }
-        applyHandoffSelection(selection);
-        state.peerHealthError = null;
-      } catch {
-        if (!alive) {
-          return;
-        }
-        state.peerHealthError = loadErrorLabel("open the latest handoff");
-      } finally {
-        if (alive) {
-          state.peerHealthBusy = false;
-          paintPeerHealth();
-          paintEvent();
-          paintMiddle();
-        }
-      }
-    })();
+    void openLatestHandoff();
   });
+
+  let unlistenHandoff: UnlistenFn | null = null;
+  if ("__TAURI_INTERNALS__" in window) {
+    void listen("peer-health-open-handoff", () => {
+      void openLatestHandoff();
+    }).then((unlisten) => {
+      if (alive) {
+        unlistenHandoff = unlisten;
+      } else {
+        unlisten();
+      }
+    });
+  }
 
   const poller = createSingleFlightPoller(async () => {
     try {
@@ -898,6 +914,8 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
 
   const stop = (): void => {
     alive = false;
+    unlistenHandoff?.();
+    unlistenHandoff = null;
     poller.stop();
     healthPoller.stop();
   };

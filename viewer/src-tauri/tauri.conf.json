@@ -57,6 +57,12 @@
     "shortDescription": "Exact local Parley conversation viewer",
     "longDescription": "A local Windows desktop-underlay widget and transcript browser for Parley JSONL event logs.",
     "icon": ["icons/icon.ico"],
+    "resources": {
+      "../../health/target/release/parley-health-supervisor.exe": "health/parley-health-supervisor.exe",
+      "../../health/target/release/parley-health-query.exe": "health/parley-health-query.exe",
+      "../../health/target/release/parley-health-hook.exe": "health/parley-health-hook.exe",
+      "../../health/assets/two-chairs.wav": "health/two-chairs.wav"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",

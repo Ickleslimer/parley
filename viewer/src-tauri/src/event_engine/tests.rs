@@ -113,6 +113,79 @@ fn event_engine_is_send_sync_and_starts_empty() {
     assert_eq!(status.session_count, 0);
     assert!(engine.widget_snapshot().exchange_id.is_none());
     assert!(engine.event_content("missing").is_none());
+    assert!(engine.response_for_exchange("missing").is_none());
+    assert!(engine.latest_grok_response_before(u64::MAX, None).is_none());
+}
+
+#[test]
+fn selects_exact_exchange_response_and_latest_preceding_grok_reply() {
+    let log = TempLog::new("handoff-selection");
+    write_lines(
+        &log,
+        &[
+            event_line(
+                "response",
+                "response-old",
+                "exchange-old",
+                Some("session-a"),
+                Some("older"),
+                10,
+            ),
+            event_line(
+                "error",
+                "error-newer",
+                "exchange-error",
+                Some("session-a"),
+                None,
+                15,
+            ),
+            event_line(
+                "response",
+                "response-a",
+                "exchange-a",
+                Some("session-a"),
+                Some("session a"),
+                20,
+            ),
+            event_line(
+                "response",
+                "response-b",
+                "exchange-b",
+                Some("session-b"),
+                Some("session b"),
+                25,
+            ),
+            event_line(
+                "response",
+                "response-after",
+                "exchange-after",
+                Some("session-a"),
+                Some("too late"),
+                30,
+            ),
+        ],
+    );
+    let engine = watching_engine(&log);
+
+    assert_eq!(
+        engine.response_for_exchange("exchange-a").unwrap().event_id,
+        "response-a"
+    );
+    assert!(engine.response_for_exchange("exchange-error").is_none());
+    assert_eq!(
+        engine
+            .latest_grok_response_before(26, Some("session-a"))
+            .unwrap()
+            .event_id,
+        "response-a"
+    );
+    assert_eq!(
+        engine
+            .latest_grok_response_before(26, None)
+            .unwrap()
+            .event_id,
+        "response-b"
+    );
 }
 
 #[test]

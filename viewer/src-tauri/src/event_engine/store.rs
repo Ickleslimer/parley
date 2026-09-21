@@ -254,9 +254,46 @@ impl Store {
 
     pub(crate) fn event_content(&self, event_id: &str) -> Option<EventContent> {
         let idx = *self.by_event_id.get(event_id)?;
+        Some(self.content_at(idx))
+    }
+
+    pub(crate) fn response_for_exchange(&self, exchange_id: &str) -> Option<EventContent> {
+        let exchange = self.exchanges.get(exchange_id)?;
+        let idx = exchange.completion_idx?;
+        (self.events[idx].event_type == EventType::Response).then(|| self.content_at(idx))
+    }
+
+    pub(crate) fn latest_grok_response_before(
+        &self,
+        timestamp_ms: u64,
+        session_id: Option<&str>,
+    ) -> Option<EventContent> {
+        let idx = self
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.event_type == EventType::Response
+                    && event.target.eq_ignore_ascii_case("grok")
+                    && event.timestamp_ms <= timestamp_ms
+                    && session_id
+                        .filter(|session_id| !session_id.is_empty())
+                        .map(|session_id| event.session_id == session_id)
+                        .unwrap_or(true)
+            })
+            .max_by(|(_, left), (_, right)| {
+                left.timestamp_ms
+                    .cmp(&right.timestamp_ms)
+                    .then_with(|| left.seq.cmp(&right.seq))
+            })
+            .map(|(idx, _)| idx)?;
+        Some(self.content_at(idx))
+    }
+
+    fn content_at(&self, idx: usize) -> EventContent {
         let event = &self.events[idx];
         let (speaker, recipient) = speakers(event.event_type, &event.source, &event.target);
-        Some(EventContent {
+        EventContent {
             event_id: event.event_id.clone(),
             exchange_id: event.exchange_id.clone(),
             session_id: event.session_id.clone(),
@@ -268,7 +305,7 @@ impl Store {
             duration_ms: event.duration_ms,
             error: event.error.clone(),
             content: event.content.clone(),
-        })
+        }
     }
 
     pub(crate) fn widget_snapshot(&self) -> WidgetSnapshot {

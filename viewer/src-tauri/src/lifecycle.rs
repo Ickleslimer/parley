@@ -3,11 +3,12 @@ use std::ffi::OsString;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{
-    App, AppHandle, Manager, PhysicalPosition, PhysicalSize, Runtime, WebviewWindow, Window,
-    WindowEvent,
+    App, AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Runtime, WebviewWindow,
+    Window, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_desktop_underlay::DesktopUnderlayExt;
@@ -21,6 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::launch::{resolve_initial_source, LaunchOptions, SourceOrigin};
+use crate::peer_health;
 use crate::runtime::{
     calculate_placement, AppState, MonitorInfo, UnderlayAction, UnderlayState, WorkArea,
 };
@@ -33,12 +35,20 @@ const MENU_OPEN: &str = "open-transcript";
 const MENU_SELECT: &str = "select-log";
 const MENU_WIDGET: &str = "widget-visible";
 const MENU_AUTOSTART: &str = "launch-at-login";
+const MENU_HEALTH_MUTED: &str = "peer-health-muted";
+const MENU_HEALTH_TEST: &str = "peer-health-test";
+const MENU_HEALTH_HANDOFF: &str = "peer-health-handoff";
 const MENU_EXIT: &str = "exit";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PEER_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct TrayControls<R: Runtime> {
     widget_visible: CheckMenuItem<R>,
     launch_at_login: CheckMenuItem<R>,
+    health_muted: CheckMenuItem<R>,
+    health_handoff: MenuItem<R>,
+    base_icon: Option<Image<'static>>,
+    unread_icon: Option<Image<'static>>,
 }
 
 pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
@@ -322,6 +332,7 @@ pub fn detach_widget<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 
 fn create_tray(app: &App) -> tauri::Result<()> {
     let settings = app.state::<AppState>().settings().viewer;
+    let (unread_count, muted) = peer_health::tray_state();
     let open = MenuItem::with_id(app, MENU_OPEN, "Open Transcript", true, None::<&str>)?;
     let select = MenuItem::with_id(app, MENU_SELECT, "Select Log...", true, None::<&str>)?;
     let widget_visible = CheckMenuItem::with_id(
@@ -340,7 +351,30 @@ fn create_tray(app: &App) -> tauri::Result<()> {
         settings.launch_at_login,
         None::<&str>,
     )?;
+    let health_muted = CheckMenuItem::with_id(
+        app,
+        MENU_HEALTH_MUTED,
+        "Mute incident chime",
+        true,
+        muted,
+        None::<&str>,
+    )?;
+    let health_test = MenuItem::with_id(
+        app,
+        MENU_HEALTH_TEST,
+        "Test Two Chairs chime",
+        true,
+        None::<&str>,
+    )?;
+    let health_handoff = MenuItem::with_id(
+        app,
+        MENU_HEALTH_HANDOFF,
+        handoff_menu_label(unread_count),
+        true,
+        None::<&str>,
+    )?;
     let separator = PredefinedMenuItem::separator(app)?;
+    let health_separator = PredefinedMenuItem::separator(app)?;
     let exit = MenuItem::with_id(app, MENU_EXIT, "Exit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
@@ -350,12 +384,20 @@ fn create_tray(app: &App) -> tauri::Result<()> {
             &widget_visible,
             &launch_at_login,
             &separator,
+            &health_handoff,
+            &health_muted,
+            &health_test,
+            &health_separator,
             &exit,
         ],
     )?;
+    let base_icon = app
+        .default_window_icon()
+        .map(|icon| icon.clone().to_owned());
+    let unread_icon = base_icon.as_ref().map(badged_tray_icon);
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
-        .tooltip("Parley Conversation Viewer")
+        .tooltip(tray_tooltip(unread_count))
         .show_menu_on_left_click(true)
         .on_menu_event(handle_tray_menu)
         .on_tray_icon_event(|tray, event| {
@@ -369,13 +411,21 @@ fn create_tray(app: &App) -> tauri::Result<()> {
                 let _ = show_detail(tray.app_handle());
             }
         });
-    if let Some(icon) = app.default_window_icon().cloned() {
+    if let Some(icon) = if unread_count > 0 {
+        unread_icon.clone()
+    } else {
+        base_icon.clone()
+    } {
         builder = builder.icon(icon);
     }
     builder.build(app)?;
     app.manage(TrayControls {
         widget_visible,
         launch_at_login,
+        health_muted,
+        health_handoff,
+        base_icon,
+        unread_icon,
     });
     Ok(())
 }
@@ -399,6 +449,32 @@ fn handle_tray_menu<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEven
             if let Err(error) = set_launch_at_login(app, enabled) {
                 app.state::<AppState>().set_runtime_error(error);
                 sync_autostart_check(app);
+            }
+        }
+        MENU_HEALTH_MUTED => {
+            let muted = !peer_health::tray_state().1;
+            let worker_app = app.clone();
+            thread::spawn(move || {
+                if let Err(error) = peer_health::set_muted(muted) {
+                    worker_app
+                        .state::<AppState>()
+                        .set_runtime_error(format!("failed to update peer-health mute: {error}"));
+                }
+                sync_peer_health_tray(&worker_app);
+            });
+        }
+        MENU_HEALTH_TEST => {
+            if let Err(error) = peer_health::test_chime() {
+                app.state::<AppState>()
+                    .set_runtime_error(format!("failed to request peer-health chime: {error}"));
+            }
+        }
+        MENU_HEALTH_HANDOFF => {
+            if let Err(error) = show_detail(app) {
+                app.state::<AppState>().set_runtime_error(error);
+            } else if let Err(error) = app.emit_to(DETAIL_LABEL, "peer-health-open-handoff", ()) {
+                app.state::<AppState>()
+                    .set_runtime_error(format!("failed to open latest handoff: {error}"));
             }
         }
         MENU_EXIT => exit_app(app),
@@ -425,6 +501,7 @@ fn initialize_autostart<R: Runtime>(app: &AppHandle<R>) {
 fn spawn_supervisor(app: AppHandle) {
     thread::spawn(move || {
         let started = Instant::now();
+        let mut last_peer_health_poll = None;
         while !app.state::<AppState>().should_stop() {
             let state = app.state::<AppState>();
             state.engine.poll();
@@ -438,6 +515,13 @@ fn spawn_supervisor(app: AppHandle) {
                     }
                 }
                 UnderlayAction::None => {}
+            }
+            if last_peer_health_poll
+                .map(|last: Instant| last.elapsed() >= PEER_HEALTH_INTERVAL)
+                .unwrap_or(true)
+            {
+                sync_peer_health_tray(&app);
+                last_peer_health_poll = Some(Instant::now());
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -829,6 +913,70 @@ fn sync_autostart_check<R: Runtime>(app: &AppHandle<R>) {
     let _ = controls.launch_at_login.set_checked(checked);
 }
 
+fn sync_peer_health_tray<R: Runtime>(app: &AppHandle<R>) {
+    let Some(controls) = app.try_state::<TrayControls<R>>() else {
+        return;
+    };
+    let (unread_count, muted) = peer_health::tray_state();
+    let _ = controls.health_muted.set_checked(muted);
+    let _ = controls
+        .health_handoff
+        .set_text(handoff_menu_label(unread_count));
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_tooltip(Some(tray_tooltip(unread_count)));
+        let icon = if unread_count > 0 {
+            controls.unread_icon.clone()
+        } else {
+            controls.base_icon.clone()
+        };
+        if let Some(icon) = icon {
+            let _ = tray.set_icon(Some(icon));
+        }
+    }
+}
+
+fn handoff_menu_label(unread_count: u64) -> String {
+    if unread_count == 0 {
+        "Open Latest Handoff".to_string()
+    } else {
+        format!("Open Latest Handoff ({unread_count} unread)")
+    }
+}
+
+fn tray_tooltip(unread_count: u64) -> String {
+    if unread_count == 0 {
+        "Parley Conversation Viewer".to_string()
+    } else {
+        format!("Parley Conversation Viewer · {unread_count} unread incident(s)")
+    }
+}
+
+fn badged_tray_icon(base: &Image<'_>) -> Image<'static> {
+    let width = base.width();
+    let height = base.height();
+    let mut rgba = base.rgba().to_vec();
+    let radius = (width.min(height) / 5).max(2);
+    let center_x = width.saturating_sub(radius + 1);
+    let center_y = radius + 1;
+    let radius_squared = i64::from(radius) * i64::from(radius);
+    for y in 0..height {
+        for x in 0..width {
+            let dx = i64::from(x) - i64::from(center_x);
+            let dy = i64::from(y) - i64::from(center_y);
+            if dx * dx + dy * dy <= radius_squared {
+                let offset = ((y * width + x) * 4) as usize;
+                if offset + 3 < rgba.len() {
+                    rgba[offset] = 238;
+                    rgba[offset + 1] = 75;
+                    rgba[offset + 2] = 86;
+                    rgba[offset + 3] = 255;
+                }
+            }
+        }
+    }
+    Image::new_owned(rgba, width, height)
+}
+
 fn env_flag(name: &str) -> bool {
     env::var(name)
         .map(|value| {
@@ -854,5 +1002,26 @@ mod tests {
         env::set_var(&key, "0");
         assert!(!env_flag(&key));
         env::remove_var(&key);
+    }
+
+    #[test]
+    fn tray_labels_are_quiet_until_incidents_are_unread() {
+        assert_eq!(handoff_menu_label(0), "Open Latest Handoff");
+        assert_eq!(handoff_menu_label(2), "Open Latest Handoff (2 unread)");
+        assert!(!tray_tooltip(0).contains("unread"));
+        assert!(tray_tooltip(1).contains("1 unread"));
+    }
+
+    #[test]
+    fn unread_badge_changes_only_a_bounded_icon_region() {
+        let base = Image::new_owned(vec![0; 16 * 16 * 4], 16, 16);
+        let badged = badged_tray_icon(&base);
+        let changed = badged
+            .rgba()
+            .chunks_exact(4)
+            .filter(|pixel| pixel[3] != 0)
+            .count();
+        assert!(changed > 0);
+        assert!(changed < 16 * 16 / 2);
     }
 }

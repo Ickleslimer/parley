@@ -239,15 +239,7 @@ impl RuntimePolicy {
                         .to_string(),
                 );
             }
-            let query_text = query.to_string_lossy();
-            grok_allows.push(format!("Bash(*{query_text}*)"));
-            if let Some(parent) = query.parent() {
-                for writer in ["parley-health-supervisor.exe", "parley-health-hook.exe"] {
-                    grok_denies.push(format!("Bash(*{}*)", parent.join(writer).to_string_lossy()));
-                }
-            }
-            grok_denies.push("Bash(*parley-health-supervisor.exe*)".to_string());
-            grok_denies.push("Bash(*parley-health-hook.exe*)".to_string());
+            grok_allows = add_health_tool_rules(query, &mut grok_denies);
         }
 
         Ok(Self {
@@ -505,6 +497,19 @@ fn hardened_grok_denies() -> Vec<String> {
         .collect()
 }
 
+fn add_health_tool_rules(query: &Path, denies: &mut Vec<String>) -> Vec<String> {
+    let query_text = query.to_string_lossy();
+    let allows = vec![format!("Bash(*{query_text}*)")];
+    if let Some(parent) = query.parent() {
+        for writer in ["parley-health-supervisor.exe", "parley-health-hook.exe"] {
+            denies.push(format!("Bash(*{}*)", parent.join(writer).to_string_lossy()));
+        }
+    }
+    denies.push("Bash(*parley-health-supervisor.exe*)".to_string());
+    denies.push("Bash(*parley-health-hook.exe*)".to_string());
+    allows
+}
+
 fn is_uuid(value: &str) -> bool {
     if value.len() != 36 {
         return false;
@@ -740,6 +745,50 @@ mod tests {
             })
             .unwrap_err()
             .contains("require session_id or resume_id"));
+    }
+
+    #[test]
+    fn health_query_rules_allow_only_query_and_deny_writer_images() {
+        let query = PathBuf::from(r"C:\Program Files\Parley\health\parley-health-query.exe");
+        let mut denies = hardened_grok_denies();
+        let allows = add_health_tool_rules(&query, &mut denies);
+
+        assert_eq!(allows, vec![format!("Bash(*{}*)", query.to_string_lossy())]);
+        for writer in ["parley-health-supervisor.exe", "parley-health-hook.exe"] {
+            assert!(denies.iter().any(|rule| rule.contains(writer)));
+            assert!(denies.iter().any(|rule| {
+                rule.contains(
+                    &query
+                        .parent()
+                        .unwrap()
+                        .join(writer)
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            }));
+        }
+        assert!(!allows.iter().any(|rule| {
+            rule.contains("parley-health-supervisor") || rule.contains("parley-health-hook")
+        }));
+    }
+
+    #[test]
+    fn locked_handoff_contract_names_exact_query_and_never_applies_to_other_harnesses() {
+        let query = PathBuf::from(r"C:\Parley Health\parley-health-query.exe");
+        let policy = RuntimePolicy {
+            grok_health_query_exe: Some(query.clone()),
+            grok_require_handoff_footer: true,
+            ..RuntimePolicy::default()
+        };
+        let mut prompt = "task".to_string();
+        policy.apply_handoff_contract("grok", &mut prompt);
+        assert!(prompt.contains(&format!("& \"{}\"", query.display())));
+        assert!(prompt.contains("continuity: not_authorized"));
+        assert!(prompt.contains("Stale or unavailable evidence never means the peer is down"));
+
+        let mut other = "task".to_string();
+        policy.apply_handoff_contract("codex", &mut other);
+        assert_eq!(other, "task");
     }
 
     #[test]

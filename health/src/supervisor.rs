@@ -225,7 +225,10 @@ impl Supervisor {
 }
 
 pub fn run_forever() -> Result<(), HealthError> {
-    let _guard = crate::instance::acquire(r"Local\ParleyHealthSupervisor")?;
+    SHUTDOWN.store(false, Ordering::SeqCst);
+    let _guard = crate::instance::acquire(crate::instance::SUPERVISOR_MUTEX)?;
+    let shutdown_event =
+        crate::instance::ShutdownEvent::create(crate::instance::SUPERVISOR_SHUTDOWN_EVENT)?;
     let paths = HealthPaths::from_env();
     let mut supervisor = Supervisor::open(paths)?;
     let sampler = AppServerSampler::new();
@@ -236,7 +239,7 @@ pub fn run_forever() -> Result<(), HealthError> {
         supervisor.set_sound(Box::new(crate::sound::WindowsSound::from_install()));
         install_shutdown_handler()?;
     }
-    while !shutdown_requested() {
+    while !shutdown_requested() && !shutdown_event.is_signaled() {
         let current_ms = now_ms();
         if current_ms >= next_sample_ms {
             let _ = supervisor.poll_sampler(&sampler, current_ms);

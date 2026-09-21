@@ -93,6 +93,20 @@ impl EventEngine {
         self.lock().store.event_content(event_id)
     }
 
+    pub fn response_for_exchange(&self, exchange_id: &str) -> Option<EventContent> {
+        self.lock().store.response_for_exchange(exchange_id)
+    }
+
+    pub fn latest_grok_response_before(
+        &self,
+        timestamp_ms: u64,
+        session_id: Option<&str>,
+    ) -> Option<EventContent> {
+        self.lock()
+            .store
+            .latest_grok_response_before(timestamp_ms, session_id)
+    }
+
     pub fn widget_snapshot(&self) -> WidgetSnapshot {
         self.lock().store.widget_snapshot()
     }
