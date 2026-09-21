@@ -412,10 +412,10 @@ fn sanitizer_includes_and_excludes_the_required_classes() {
 
 #[test]
 fn json_parser_combines_surrogate_pairs_and_rejects_unpaired_surrogates() {
-    let parsed = super::parse::parse_json(r#"{"text":"\uD83D\uDE00"}"#).unwrap();
+    let parsed = super::parse::parse_json(r#"{"text":"\uD83D\uDE00\b\f"}"#).unwrap();
     assert_eq!(
         parsed.get("text").and_then(crate::json::Json::as_str),
-        Some("😀")
+        Some("😀\u{0008}\u{000c}")
     );
     assert!(super::parse::parse_json(r#"{"text":"\uD83D"}"#).is_err());
     assert!(super::parse::parse_json(r#"{"text":"\uDE00"}"#).is_err());

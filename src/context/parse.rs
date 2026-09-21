@@ -151,6 +151,8 @@ impl<'a> Parser<'a> {
                     b'"' => out.push('"'),
                     b'\\' => out.push('\\'),
                     b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000c}'),
                     b'n' => out.push('\n'),
                     b'r' => out.push('\r'),
                     b't' => out.push('\t'),
