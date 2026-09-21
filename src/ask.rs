@@ -493,56 +493,63 @@ pub(crate) fn run_prepared_with_receipt_controlled(
     let timeouts = Timeouts::from_env();
     let mut invocation_files = InvocationFiles::default();
     if let Some(guarded_launch) = guarded_launch {
-        let max_age = timeouts.overall.saturating_add(Duration::from_secs(300));
-        if let Err(error) = cleanup_stale_agent_profile_files(max_age) {
-            return Err(preflight_failure(
-                req,
-                &resolved.text,
-                exchange_id,
-                "lane_preflight_error",
-                &format!("guarded parent-profile cleanup failed; agent was not started: {error}"),
-            ));
-        }
-        let profile = match AgentProfileFile::create(&guarded_launch.parent_profile_contents()) {
-            Ok(profile) => profile,
-            Err(error) => {
+        let profile_path = if guarded_launch.has_children() {
+            let max_age = timeouts.overall.saturating_add(Duration::from_secs(300));
+            if let Err(error) = cleanup_stale_agent_profile_files(max_age) {
                 return Err(preflight_failure(
                     req,
                     &resolved.text,
                     exchange_id,
                     "lane_preflight_error",
                     &format!(
-                        "guarded parent-profile creation failed; agent was not started: {error}"
+                        "guarded parent-profile cleanup failed; agent was not started: {error}"
                     ),
                 ));
             }
-        };
-        invocation_files.agent_profile = Some(profile);
-        let profile_path = match invocation_files
-            .agent_profile
-            .as_ref()
-            .and_then(|profile| profile.path().to_str())
-        {
-            Some(path) => path.to_string(),
-            None => {
-                let suffix = invocation_files
-                    .cleanup()
-                    .err()
-                    .map(|error| format!("; temporary-file cleanup also failed: {error}"))
-                    .unwrap_or_default();
-                return Err(preflight_failure(
-                    req,
-                    &resolved.text,
-                    exchange_id,
-                    "lane_preflight_error",
-                    &format!(
-                        "guarded parent-profile path is not valid Unicode; agent was not started{suffix}"
-                    ),
-                ));
+            let profile = match AgentProfileFile::create(&guarded_launch.parent_profile_contents())
+            {
+                Ok(profile) => profile,
+                Err(error) => {
+                    return Err(preflight_failure(
+                        req,
+                        &resolved.text,
+                        exchange_id,
+                        "lane_preflight_error",
+                        &format!(
+                            "guarded parent-profile creation failed; agent was not started: {error}"
+                        ),
+                    ));
+                }
+            };
+            invocation_files.agent_profile = Some(profile);
+            match invocation_files
+                .agent_profile
+                .as_ref()
+                .and_then(|profile| profile.path().to_str())
+            {
+                Some(path) => Some(PathBuf::from(path)),
+                None => {
+                    let suffix = invocation_files
+                        .cleanup()
+                        .err()
+                        .map(|error| format!("; temporary-file cleanup also failed: {error}"))
+                        .unwrap_or_default();
+                    return Err(preflight_failure(
+                        req,
+                        &resolved.text,
+                        exchange_id,
+                        "lane_preflight_error",
+                        &format!(
+                            "guarded parent-profile path is not valid Unicode; agent was not started{suffix}"
+                        ),
+                    ));
+                }
             }
+        } else {
+            None
         };
-        if let Err(error) = guarded_launch
-            .configure_invocation(&mut invocation, PathBuf::from(profile_path).as_path())
+        if let Err(error) =
+            guarded_launch.configure_invocation(&mut invocation, profile_path.as_deref())
         {
             let suffix = invocation_files
                 .cleanup()
@@ -676,7 +683,7 @@ pub(crate) fn run_prepared_with_receipt_controlled(
     };
     let mut active_grants = match guarded_launch {
         Some(guarded_launch) => match guarded_launch.activate(timeouts.overall) {
-            Ok(grants) => Some(grants),
+            Ok(grants) => grants,
             Err(error) => {
                 let abort = resolved
                     .stateful

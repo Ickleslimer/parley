@@ -165,14 +165,11 @@ impl JobRuntime {
         };
         let guarded_launch =
             GuardedSubagentLaunch::from_plan(&spec.job_id, spec.lane_plan.as_ref(), &policy)?;
-        request.allow_subagents = guarded_launch.is_some();
-        if guarded_launch.is_some() {
-            append_parent_contract(
-                &mut request.prompt,
-                spec.lane_plan
-                    .as_ref()
-                    .expect("guarded launch requires lane plan"),
-            );
+        request.allow_subagents = guarded_launch
+            .as_ref()
+            .is_some_and(GuardedSubagentLaunch::has_children);
+        if let Some(plan) = &spec.lane_plan {
+            append_parent_contract(&mut request.prompt, plan);
         }
         spec.request = request;
 

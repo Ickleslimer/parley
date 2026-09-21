@@ -53,9 +53,6 @@ impl GuardedSubagentLaunch {
             .iter()
             .filter(|lane| lane.owner == LaneOwner::GrokChild)
             .collect::<Vec<_>>();
-        if children.is_empty() {
-            return Ok(None);
-        }
         children.sort_by(|left, right| left.lane_id.cmp(&right.lane_id));
         let guarded = policy.guarded_subagents().ok_or_else(|| {
             "Grok child lanes require PARLEY_GROK_SUBAGENT_MODE=guarded".to_string()
@@ -128,6 +125,10 @@ impl GuardedSubagentLaunch {
         }))
     }
 
+    pub(crate) fn has_children(&self) -> bool {
+        !self.children.is_empty()
+    }
+
     pub(crate) fn parent_profile_contents(&self) -> String {
         parent_agent_profile()
     }
@@ -135,23 +136,18 @@ impl GuardedSubagentLaunch {
     pub(crate) fn configure_invocation(
         &self,
         invocation: &mut Invocation,
-        parent_profile: &Path,
+        parent_profile: Option<&Path>,
     ) -> Result<(), String> {
         if !invocation.command.eq_ignore_ascii_case("grok") {
             return Err("guarded subagents are supported only for Grok".to_string());
         }
-        if !parent_profile.is_absolute() {
-            return Err("guarded parent profile path must be absolute".to_string());
-        }
-        let parent_profile = parent_profile
-            .to_str()
-            .ok_or_else(|| "guarded parent profile path is not valid Unicode".to_string())?;
         for argument in &invocation.args {
             let lower = argument.to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
-                "--agents" | "--agent" | "--tools" | "--disallowed-tools" | "--no-subagents"
-            ) || lower.starts_with("--agents=")
+                "--agents" | "--agent" | "--tools" | "--disallowed-tools"
+            ) || (lower == "--no-subagents" && self.has_children())
+                || lower.starts_with("--agents=")
                 || lower.starts_with("--agent=")
                 || lower.starts_with("--tools=")
                 || lower.starts_with("--disallowed-tools=")
@@ -167,14 +163,36 @@ impl GuardedSubagentLaunch {
             .position(|argument| argument == "--no-auto-update")
             .map(|index| index + 1)
             .unwrap_or(0);
-        let mut immutable_arguments = vec![
-            "--agents".to_string(),
-            agent_definitions_json(),
-            "--agent".to_string(),
-            parent_profile.to_string(),
-            "--disallowed-tools".to_string(),
-            PARENT_DENIES.to_string(),
-        ];
+        let mut immutable_arguments = Vec::new();
+        if self.has_children() {
+            let parent_profile = parent_profile
+                .ok_or_else(|| "guarded child launch requires a parent profile path".to_string())?;
+            if !parent_profile.is_absolute() {
+                return Err("guarded parent profile path must be absolute".to_string());
+            }
+            let parent_profile = parent_profile
+                .to_str()
+                .ok_or_else(|| "guarded parent profile path is not valid Unicode".to_string())?;
+            immutable_arguments.extend([
+                "--agents".to_string(),
+                agent_definitions_json(),
+                "--agent".to_string(),
+                parent_profile.to_string(),
+                "--disallowed-tools".to_string(),
+                PARENT_DENIES.to_string(),
+            ]);
+        } else {
+            if parent_profile.is_some() {
+                return Err("parent-only lane launch must not select an agent profile".to_string());
+            }
+            if !invocation
+                .args
+                .iter()
+                .any(|argument| argument == "--no-subagents")
+            {
+                immutable_arguments.push("--no-subagents".to_string());
+            }
+        }
         append_permission_allows(
             &mut immutable_arguments,
             &self.parent_cwd,
@@ -196,6 +214,9 @@ impl GuardedSubagentLaunch {
         invocation
             .args
             .splice(insertion..insertion, immutable_arguments);
+        if !self.has_children() {
+            return Ok(());
+        }
         let state_dir = self
             .state_dir
             .to_str()
@@ -223,7 +244,10 @@ impl GuardedSubagentLaunch {
         Ok(())
     }
 
-    pub(crate) fn activate(&self, overall_timeout: Duration) -> Result<GrantSet, String> {
+    pub(crate) fn activate(&self, overall_timeout: Duration) -> Result<Option<GrantSet>, String> {
+        if !self.has_children() {
+            return Ok(None);
+        }
         let issued_at_ms = now_ms()?;
         let lifetime_ms = overall_timeout
             .saturating_add(Duration::from_secs(300))
@@ -251,7 +275,7 @@ impl GuardedSubagentLaunch {
                 expires_at_ms,
             });
         }
-        GrantSet::create(&self.state_dir, &drafts)
+        GrantSet::create(&self.state_dir, &drafts).map(Some)
     }
 }
 
@@ -292,7 +316,16 @@ pub(crate) fn append_parent_contract(prompt: &mut String, plan: &LanePlan) {
     let mut lanes = plan.lanes.iter().collect::<Vec<_>>();
     lanes.sort_by(|left, right| left.lane_id.cmp(&right.lane_id));
     let mut contract = String::from("\n\nTWO CHAIRS PARALLEL LANE CONTRACT\n");
-    contract.push_str("The lane manifest below is an immutable execution boundary, not authority to expand the task. The integration worktree remains read-only. Spawn each declared Grok child exactly once with its exact subagent_type, cwd, isolation=none, and no model, effort, tool, MCP, sandbox, hook, resume, or permission override. Child prompts must repeat only the bounded assignment and exact granted paths.\n");
+    contract.push_str("The lane manifest below is an immutable execution boundary, not authority to expand the task. The integration worktree remains read-only.\n");
+    if plan
+        .lanes
+        .iter()
+        .any(|lane| lane.owner == LaneOwner::GrokChild)
+    {
+        contract.push_str("Spawn each declared Grok child exactly once with its exact subagent_type, cwd, isolation=none, and no model, effort, tool, MCP, sandbox, hook, resume, or permission override. Child prompts must repeat only the bounded assignment and exact granted paths.\n");
+    } else {
+        contract.push_str("No Grok child lane is declared. Do not spawn a subagent. Perform only the bounded Grok-parent assignment in its exact worktree and grants.\n");
+    }
     contract.push_str(&format!("base_commit: {}\n", plan.base_commit));
     contract.push_str(&format!(
         "integration_worktree: {}\n",
@@ -318,7 +351,7 @@ pub(crate) fn append_parent_contract(prompt: &mut String, plan: &LanePlan) {
             }
         }
     }
-    contract.push_str("The final response must enumerate every child ID, role, branch/worktree, granted paths, changed paths, tests, failures or denials, and the parent\'s independent review. Do not claim a child result you did not receive.\n");
+    contract.push_str("The final response must enumerate every declared lane, role, branch/worktree, granted paths, changed paths, tests, failures or denials, and the parent\'s independent review. For child lanes, include every child ID and do not claim a result you did not receive.\n");
     let handoff_marker = "\n\nTWO CHAIRS LOCKED RESPONSE CONTRACT\n";
     if let Some(index) = prompt.rfind(handoff_marker) {
         prompt.insert_str(index, &contract);
@@ -534,6 +567,21 @@ mod tests {
         }
     }
 
+    fn child_launch() -> GuardedSubagentLaunch {
+        let mut launch = launch();
+        launch.children.push(ChildSpec {
+            grant_id: "job-c0".to_string(),
+            lane_id: "child".to_string(),
+            role: ChildRole::Writer,
+            cwd: PathBuf::from(r"C:\repo\child"),
+            writable_paths: vec![StoredPathGrant {
+                kind: GrantKind::Tree,
+                path: "src/jobs".to_string(),
+            }],
+        });
+        launch
+    }
+
     #[test]
     fn agent_definitions_are_closed_and_inherit_the_model() {
         let value = Json::parse(&agent_definitions_json()).unwrap();
@@ -585,8 +633,8 @@ mod tests {
                 "task".to_string(),
             ],
         );
-        launch()
-            .configure_invocation(&mut invocation, Path::new(r"C:\Temp\parent.md"))
+        child_launch()
+            .configure_invocation(&mut invocation, Some(Path::new(r"C:\Temp\parent.md")))
             .unwrap();
         assert!(invocation
             .args
@@ -614,35 +662,64 @@ mod tests {
     #[test]
     fn invocation_rejects_preexisting_authority_switches() {
         let mut invocation = Invocation::new("grok", vec!["--tools=all".to_string()]);
-        assert!(launch()
-            .configure_invocation(&mut invocation, Path::new(r"C:\Temp\parent.md"))
+        assert!(child_launch()
+            .configure_invocation(&mut invocation, Some(Path::new(r"C:\Temp\parent.md")))
             .is_err());
     }
 
     #[test]
     fn invocation_rejects_relative_parent_profiles() {
         let mut invocation = Invocation::new("grok", vec!["--no-auto-update".to_string()]);
-        assert!(launch()
-            .configure_invocation(&mut invocation, Path::new("parent.md"))
+        assert!(child_launch()
+            .configure_invocation(&mut invocation, Some(Path::new("parent.md")))
             .is_err());
     }
 
     #[test]
+    fn parent_only_launch_keeps_subagents_off_and_injects_exact_lane_rules() {
+        let mut invocation = Invocation::new(
+            "grok",
+            vec!["--no-auto-update".to_string(), "--no-subagents".to_string()],
+        );
+        launch()
+            .configure_invocation(&mut invocation, None)
+            .unwrap();
+        assert_eq!(
+            invocation
+                .args
+                .iter()
+                .filter(|argument| argument.as_str() == "--no-subagents")
+                .count(),
+            1
+        );
+        assert!(!invocation
+            .args
+            .iter()
+            .any(|argument| argument == "--agents"));
+        assert!(!invocation.args.iter().any(|argument| argument == "--agent"));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|argument| argument == "Edit(C:/repo/parent/README.md)"));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|argument| argument == "Write(C:/repo/parent/README.md)"));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|argument| argument == "Edit(C:/repo/integration/**)"));
+        assert!(!invocation
+            .env
+            .contains_key("GROK_SUBAGENT_MODEL_INHERITANCE"));
+    }
+
+    #[test]
     fn writer_grants_add_exact_dont_ask_allows_and_protected_root_denies() {
-        let mut launch = launch();
-        launch.children.push(ChildSpec {
-            grant_id: "job-c0".to_string(),
-            lane_id: "child".to_string(),
-            role: ChildRole::Writer,
-            cwd: PathBuf::from(r"C:\repo\child"),
-            writable_paths: vec![StoredPathGrant {
-                kind: GrantKind::Tree,
-                path: "src/jobs".to_string(),
-            }],
-        });
+        let launch = child_launch();
         let mut invocation = Invocation::new("grok", vec!["--no-auto-update".to_string()]);
         launch
-            .configure_invocation(&mut invocation, Path::new(r"C:\Temp\parent.md"))
+            .configure_invocation(&mut invocation, Some(Path::new(r"C:\Temp\parent.md")))
             .unwrap();
         assert!(invocation
             .args
