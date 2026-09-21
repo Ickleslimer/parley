@@ -145,6 +145,7 @@ pub(crate) struct GuardedSubagentPolicy {
     pub(crate) max_writers: usize,
     pub(crate) model: String,
     pub(crate) reasoning_effort: String,
+    typed_roles_ready: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -284,6 +285,14 @@ impl RuntimePolicy {
                 ))
             }
         };
+        let typed_roles_ready =
+            env_bool("PARLEY_GROK_SUBAGENT_TYPED_ROLES_READY")?.unwrap_or(false);
+        if typed_roles_ready && grok_subagent_mode != GrokSubagentMode::Guarded {
+            return Err(
+                "PARLEY_GROK_SUBAGENT_TYPED_ROLES_READY requires PARLEY_GROK_SUBAGENT_MODE=guarded"
+                    .to_string(),
+            );
+        }
         let guarded_subagents = if grok_subagent_mode == GrokSubagentMode::Guarded {
             let lane_state_dir = env::var_os("PARLEY_LANE_STATE_DIR")
                 .map(PathBuf::from)
@@ -349,6 +358,7 @@ impl RuntimePolicy {
                 max_writers,
                 model,
                 reasoning_effort,
+                typed_roles_ready,
             })
         } else {
             None
@@ -663,6 +673,16 @@ impl RuntimePolicy {
 
     pub(crate) fn guarded_subagents(&self) -> Option<&GuardedSubagentPolicy> {
         self.guarded_subagents.as_ref()
+    }
+
+    pub(crate) fn require_grok_child_lanes_ready(&self) -> Result<(), String> {
+        let guarded = self.guarded_subagents.as_ref().ok_or_else(|| {
+            "Grok child lanes require PARLEY_GROK_SUBAGENT_MODE=guarded".to_string()
+        })?;
+        if !guarded.typed_roles_ready {
+            return Err("native Grok child lanes are disabled: typed subagent roles have not passed the locked-profile capability canary; use zero grok_child lanes until the profile is revalidated".to_string());
+        }
+        Ok(())
     }
 
     pub(crate) fn requires_handoff_footer(&self) -> bool {
@@ -1348,6 +1368,31 @@ mod tests {
         assert!(denies
             .iter()
             .any(|rule| rule.contains("parley-lane-hook.exe")));
+    }
+
+    #[test]
+    fn native_child_lanes_require_an_explicit_capability_canary() {
+        let mut policy = RuntimePolicy::default();
+        assert!(policy
+            .require_grok_child_lanes_ready()
+            .unwrap_err()
+            .contains("require PARLEY_GROK_SUBAGENT_MODE=guarded"));
+
+        policy.guarded_subagents = Some(GuardedSubagentPolicy {
+            lane_state_dir: PathBuf::from(r"C:\state\lanes"),
+            hook_exe: PathBuf::from(r"C:\Program Files\Parley\parley-lane-hook.exe"),
+            max_writers: 2,
+            model: "grok-4.7".to_string(),
+            reasoning_effort: "xhigh".to_string(),
+            typed_roles_ready: false,
+        });
+        assert!(policy
+            .require_grok_child_lanes_ready()
+            .unwrap_err()
+            .contains("typed subagent roles have not passed"));
+
+        policy.guarded_subagents.as_mut().unwrap().typed_roles_ready = true;
+        assert!(policy.require_grok_child_lanes_ready().is_ok());
     }
 
     #[test]

@@ -222,6 +222,9 @@ pub(crate) fn validate(
             "locked write jobs require exactly one codex lane, one grok_parent lane, and zero to two grok_child lanes (got {codex_count}/{parent_count}/{child_count})"
         ));
     }
+    if child_count > 0 {
+        policy.require_grok_child_lanes_ready()?;
+    }
     let target = policy.validate_spawn_cwd(target_cwd)?;
     let parent = parent_cwd
         .as_ref()
