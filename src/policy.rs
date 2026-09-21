@@ -645,30 +645,104 @@ fn add_health_tool_rules(
 }
 
 fn powershell_direct_command(path: &Path) -> Result<String, String> {
-    let original = path.to_string_lossy();
-    let text = if let Some(rest) = original.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = original.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        original.into_owned()
+    let direct = command_path_text(path);
+    if is_matcher_safe_command(&direct) {
+        return Ok(direct);
+    }
+
+    #[cfg(windows)]
+    let text = {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "PARLEY_GROK_HEALTH_QUERY_EXE has no parent directory".to_string())?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| "PARLEY_GROK_HEALTH_QUERY_EXE has no executable filename".to_string())?;
+        let candidate = windows_short_path(parent)?.join(file_name);
+        let resolved = fs::canonicalize(&candidate).map_err(|error| {
+            format!(
+                "resolve matcher-safe PARLEY_GROK_HEALTH_QUERY_EXE {}: {error}",
+                candidate.display()
+            )
+        })?;
+        if !paths_equal(&resolved, path) {
+            return Err(
+                "matcher-safe PARLEY_GROK_HEALTH_QUERY_EXE does not resolve to the configured file"
+                    .to_string(),
+            );
+        }
+        command_path_text(&candidate)
     };
+    #[cfg(not(windows))]
+    let text = direct;
+
     if text.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
         return Err(
             "PARLEY_GROK_HEALTH_QUERY_EXE contains an unsafe control character".to_string(),
         );
     }
-
-    let mut command = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '\\' | '/' | ':' | '.' | '_' | '-') {
-            command.push(ch);
-        } else {
-            command.push('`');
-            command.push(ch);
-        }
+    if !is_matcher_safe_command(&text) {
+        return Err(
+            "PARLEY_GROK_HEALTH_QUERY_EXE has no matcher-safe path without spaces or shell syntax"
+                .to_string(),
+        );
     }
-    Ok(command)
+    Ok(text)
+}
+
+fn command_path_text(path: &Path) -> String {
+    let original = path.to_string_lossy();
+    if let Some(rest) = original.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = original.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        original.into_owned()
+    }
+}
+
+fn is_matcher_safe_command(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '\\' | '/' | ':' | '.' | '_' | '-' | '~')
+        })
+}
+
+#[cfg(windows)]
+fn windows_short_path(path: &Path) -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::ptr;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(long_path: *const u16, short_path: *mut u16, buffer_len: u32) -> u32;
+    }
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let required = unsafe { GetShortPathNameW(wide.as_ptr(), ptr::null_mut(), 0) };
+    if required == 0 {
+        return Err(format!(
+            "resolve short PARLEY_GROK_HEALTH_QUERY_EXE parent {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut output = vec![0_u16; required as usize];
+    let written = unsafe { GetShortPathNameW(wide.as_ptr(), output.as_mut_ptr(), required) };
+    if written == 0 || written >= required {
+        return Err(format!(
+            "resolve short PARLEY_GROK_HEALTH_QUERY_EXE parent {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    output.truncate(written as usize);
+    Ok(PathBuf::from(OsString::from_wide(&output)))
 }
 
 fn is_uuid(value: &str) -> bool {
@@ -1051,17 +1125,15 @@ mod tests {
 
     #[test]
     fn health_query_rules_allow_only_query_and_deny_writer_images() {
-        let query = PathBuf::from(r"C:\Program Files\Parley\health\parley-health-query.exe");
+        let query = PathBuf::from(r"C:\PARLEY~1\health\parley-health-query.exe");
         let mut denies = hardened_grok_denies();
         let (allows, command) = add_health_tool_rules(&query, &mut denies).unwrap();
 
-        assert_eq!(
-            command,
-            r"C:\Program` Files\Parley\health\parley-health-query.exe"
-        );
+        assert_eq!(command, query.to_string_lossy());
         assert_eq!(allows, vec![format!("Bash({command})")]);
         assert!(!allows[0].contains('*'));
         assert!(!allows[0].contains("& \""));
+        assert!(!allows[0].contains(' '));
         for writer in ["parley-health-supervisor.exe", "parley-health-hook.exe"] {
             assert!(denies.iter().any(|rule| rule.contains(writer)));
             assert!(denies.iter().any(|rule| {
@@ -1082,7 +1154,7 @@ mod tests {
 
     #[test]
     fn locked_handoff_contract_names_exact_query_and_never_applies_to_other_harnesses() {
-        let query = PathBuf::from(r"C:\Parley Health\parley-health-query.exe");
+        let query = PathBuf::from(r"C:\PARLEY~1\parley-health-query.exe");
         let command = powershell_direct_command(&query).unwrap();
         let policy = RuntimePolicy {
             grok_health_query_command: Some(command.clone()),
