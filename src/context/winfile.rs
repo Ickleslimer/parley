@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::error::{ContextError, ErrorKind};
 
@@ -85,6 +85,9 @@ pub(crate) fn refuse_reparse_chain(path: &Path) -> Result<(), ContextError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
         let metadata = match std::fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -192,5 +195,27 @@ fn apply_share_all(_options: &mut OpenOptions) {
     {
         use std::os::windows::fs::OpenOptionsExt;
         _options.share_mode(SHARE_ALL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    #[cfg(windows)]
+    fn canonical_extended_paths_check_real_components_not_the_prefix() {
+        let directory = std::env::temp_dir().join(format!(
+            "parley-reparse-prefix-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(directory.join("nested")).unwrap();
+        let canonical = std::fs::canonicalize(directory.join("nested")).unwrap();
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        refuse_reparse_chain(&canonical).unwrap();
     }
 }
