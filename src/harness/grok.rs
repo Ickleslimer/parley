@@ -12,13 +12,26 @@ impl Harness for GrokHarness {
         let policy = RuntimePolicy::from_env()?;
         Ok(Invocation::new(
             "grok",
-            build_args(request, policy.grok_denies(), policy.grok_allows()),
+            build_args(
+                request,
+                policy.grok_denies(),
+                policy.grok_allows(),
+                policy.grok_subagents_disabled(),
+            ),
         ))
     }
 }
 
-fn build_args(request: &Request, denies: &[String], allows: &[String]) -> Vec<String> {
+fn build_args(
+    request: &Request,
+    denies: &[String],
+    allows: &[String],
+    disable_subagents: bool,
+) -> Vec<String> {
     let mut args = vec!["--no-auto-update".to_string()];
+    if disable_subagents {
+        args.push("--no-subagents".to_string());
+    }
     if let Some(prompt) = &request.prompt {
         args.extend(["--single".to_string(), prompt.clone()]);
         args.extend([
@@ -101,11 +114,13 @@ mod tests {
             &req,
             &["WebSearch".to_string()],
             &["Bash(*parley-health-query.exe*)".to_string()],
+            true,
         );
         assert_eq!(
             args,
             vec![
                 "--no-auto-update",
+                "--no-subagents",
                 "--single",
                 "review this",
                 "--output-format",
@@ -135,7 +150,7 @@ mod tests {
         req.resume_id = Some("latest".to_string());
         req.yolo = true;
         req.passthrough = vec!["--verbose".to_string()];
-        let args = build_args(&req, &[], &[]);
+        let args = build_args(&req, &[], &[], false);
         assert!(args.iter().any(|arg| arg == "--continue"));
         assert!(args.iter().any(|arg| arg == "--always-approve"));
         assert!(args.ends_with(&["--verbose".to_string()]));

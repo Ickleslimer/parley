@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::context::{ContextMode, ContextRecovery};
 
@@ -121,6 +122,7 @@ pub(crate) struct RuntimePolicy {
     mcp_default_yolo: bool,
     disable_yolo: bool,
     grok_locked_model: Option<String>,
+    grok_locked_version: Option<String>,
     grok_locked_reasoning_effort: Option<String>,
     grok_locked_permission_mode: Option<String>,
     grok_require_session_id: bool,
@@ -129,9 +131,18 @@ pub(crate) struct RuntimePolicy {
     grok_allows: Vec<String>,
     grok_health_query_command: Option<String>,
     grok_require_handoff_footer: bool,
+    grok_subagent_mode: GrokSubagentMode,
     context_locked_source: Option<String>,
     context_locked_mode: Option<ContextMode>,
     context_require_explicit_session: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GrokSubagentMode {
+    #[default]
+    Unspecified,
+    Off,
+    Guarded,
 }
 
 pub(crate) struct PolicyRequest<'a> {
@@ -165,6 +176,7 @@ impl Default for RuntimePolicy {
             mcp_default_yolo: true,
             disable_yolo: false,
             grok_locked_model: None,
+            grok_locked_version: None,
             grok_locked_reasoning_effort: None,
             grok_locked_permission_mode: None,
             grok_require_session_id: false,
@@ -173,6 +185,7 @@ impl Default for RuntimePolicy {
             grok_allows: Vec::new(),
             grok_health_query_command: None,
             grok_require_handoff_footer: false,
+            grok_subagent_mode: GrokSubagentMode::Unspecified,
             context_locked_source: None,
             context_locked_mode: None,
             context_require_explicit_session: false,
@@ -216,6 +229,7 @@ impl RuntimePolicy {
         };
 
         let grok_locked_model = env_nonempty("PARLEY_GROK_LOCKED_MODEL");
+        let grok_locked_version = env_nonempty("PARLEY_GROK_LOCKED_VERSION");
         let grok_locked_reasoning_effort = env_nonempty("PARLEY_GROK_LOCKED_REASONING_EFFORT")
             .map(|value| normalize_reasoning_effort(&value))
             .transpose()?;
@@ -245,6 +259,20 @@ impl RuntimePolicy {
         };
         let grok_require_handoff_footer =
             env_bool("PARLEY_GROK_REQUIRE_HANDOFF_FOOTER")?.unwrap_or(false);
+        let grok_subagent_mode = match env_nonempty("PARLEY_GROK_SUBAGENT_MODE")
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None => GrokSubagentMode::Unspecified,
+            Some("off") => GrokSubagentMode::Off,
+            Some("guarded") => GrokSubagentMode::Guarded,
+            Some(value) => {
+                return Err(format!(
+                    "PARLEY_GROK_SUBAGENT_MODE must be off or guarded, got {value}"
+                ))
+            }
+        };
         let context_locked_source =
             env_nonempty("PARLEY_CONTEXT_LOCKED_SOURCE").map(|value| value.to_ascii_lowercase());
         let context_locked_mode = env_nonempty("PARLEY_CONTEXT_LOCKED_MODE")
@@ -277,6 +305,7 @@ impl RuntimePolicy {
             mcp_default_yolo: env_bool("PARLEY_MCP_DEFAULT_YOLO")?.unwrap_or(true),
             disable_yolo: env_bool("PARLEY_DISABLE_YOLO")?.unwrap_or(false),
             grok_locked_model,
+            grok_locked_version,
             grok_locked_reasoning_effort,
             grok_locked_permission_mode,
             grok_require_session_id: env_bool("PARLEY_GROK_REQUIRE_SESSION_ID")?.unwrap_or(false),
@@ -285,6 +314,7 @@ impl RuntimePolicy {
             grok_allows,
             grok_health_query_command,
             grok_require_handoff_footer,
+            grok_subagent_mode,
             context_locked_source,
             context_locked_mode,
             context_require_explicit_session,
@@ -319,6 +349,10 @@ impl RuntimePolicy {
                 return Err("--reasoning-effort is only supported for Grok".to_string());
             }
             return Ok(());
+        }
+
+        if let Some(expected) = &self.grok_locked_version {
+            validate_grok_version(expected)?;
         }
 
         if let Some(flag) = grok_passthrough_control(passthrough) {
@@ -534,6 +568,10 @@ impl RuntimePolicy {
         &self.grok_allows
     }
 
+    pub(crate) fn grok_subagents_disabled(&self) -> bool {
+        self.grok_subagent_mode == GrokSubagentMode::Off
+    }
+
     pub(crate) fn requires_handoff_footer(&self) -> bool {
         self.grok_require_handoff_footer
     }
@@ -606,16 +644,65 @@ fn grok_passthrough_control(args: &[String]) -> Option<&str> {
     args.iter().find_map(|arg| {
         matches!(
             arg.as_str(),
-            "-m" | "--model" | "--effort" | "--reasoning-effort"
+            "-m" | "--model"
+                | "--effort"
+                | "--reasoning-effort"
+                | "--agents"
+                | "--agent"
+                | "--tools"
+                | "--disallowed-tools"
+                | "--sandbox"
+                | "--no-subagents"
         )
         .then_some(arg.as_str())
         .or_else(|| {
-            ["--model=", "--effort=", "--reasoning-effort="]
-                .iter()
-                .any(|prefix| arg.starts_with(prefix))
-                .then_some(arg.as_str())
+            [
+                "--model=",
+                "--effort=",
+                "--reasoning-effort=",
+                "--agents=",
+                "--agent=",
+                "--tools=",
+                "--disallowed-tools=",
+                "--sandbox=",
+            ]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix))
+            .then_some(arg.as_str())
         })
     })
+}
+
+fn validate_grok_version(expected: &str) -> Result<(), String> {
+    let output = Command::new("grok")
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("failed to run grok --version: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "grok --version failed with status {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version_matches(expected, &actual) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Grok CLI version is locked to {expected}; found {actual}"
+        ))
+    }
+}
+
+fn version_matches(expected: &str, actual: &str) -> bool {
+    let expected = expected.trim();
+    let actual = actual.trim();
+    actual == expected
+        || actual
+            .strip_prefix(expected)
+            .is_some_and(|suffix| suffix.starts_with(char::is_whitespace))
 }
 
 fn hardened_grok_denies() -> Vec<String> {
@@ -1222,6 +1309,12 @@ mod tests {
             vec!["-m".to_string(), "grok-4.5".to_string()],
             vec!["--effort=low".to_string()],
             vec!["--reasoning-effort".to_string(), "high".to_string()],
+            vec!["--agents={}".to_string()],
+            vec!["--agent".to_string(), "writer".to_string()],
+            vec!["--tools".to_string(), "Edit".to_string()],
+            vec!["--disallowed-tools=Bash".to_string()],
+            vec!["--sandbox".to_string(), "none".to_string()],
+            vec!["--no-subagents".to_string()],
         ] {
             let mut model = Some("grok-4.6".to_string());
             let mut effort = Some("xhigh".to_string());
@@ -1240,6 +1333,21 @@ mod tests {
                 .unwrap_err()
                 .contains("not passthrough"));
         }
+    }
+
+    #[test]
+    fn locked_version_accepts_channel_suffix_only() {
+        let expected = "grok 1.0.40 (eb1a2256660d)";
+        assert!(version_matches(expected, expected));
+        assert!(version_matches(
+            expected,
+            "grok 1.0.40 (eb1a2256660d) [stable]"
+        ));
+        assert!(!version_matches(expected, "grok 1.0.41 (different)"));
+        assert!(!version_matches(
+            expected,
+            "grok 1.0.40 (eb1a2256660d)-evil"
+        ));
     }
 
     #[test]
