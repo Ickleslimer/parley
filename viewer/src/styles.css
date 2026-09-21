@@ -510,7 +510,9 @@ select {
 .pager-meta,
 .panel-empty,
 .record-meta,
-.record-flag {
+.record-flag,
+.record-source,
+.source-diagnostics {
   margin: 0;
   color: var(--muted);
   font-size: 12px;
@@ -575,7 +577,7 @@ select {
 }
 
 .detail-footer {
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  grid-template-columns: minmax(260px, 1.2fr) minmax(0, 0.8fr) minmax(0, 1fr);
 }
 
 .panel {
@@ -652,6 +654,57 @@ select {
 .record-flag {
   color: var(--accent);
   font-weight: 650;
+}
+
+.record-source,
+.source-path,
+.source-diagnostics {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.record-source,
+.source-diagnostics {
+  color: rgb(180 188 208 / 72%);
+  font-size: 11px;
+}
+
+.source-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.source-record {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 8px;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel-2);
+}
+
+.source-path {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.source-record .record-meta,
+.source-record .source-diagnostics {
+  grid-column: 1;
+}
+
+.source-remove {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  align-self: start;
+  font-size: 11px;
+  padding: 3px 7px;
 }
 
 .record-link {

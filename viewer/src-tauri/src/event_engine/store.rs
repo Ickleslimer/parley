@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use super::excerpt::{excerpt, window_from};
+use super::excerpt::{excerpt, parse_context_diagnostics, window_from};
+use super::keys::KeyContext;
 use super::parse::ParsedEvent;
 use super::types::{
-    clamp_page_limit, speakers, EventContent, EventType, ExchangePage, ExchangeSummary,
-    MessagePreview, SearchHit, SearchPage, SessionPage, SessionSummary, WidgetSnapshot,
-    PENDING_LABEL,
+    clamp_page_limit, speakers, EventContent, EventType, ExchangeSummary, MessagePreview,
+    SearchHit, SessionSummary, PENDING_LABEL,
 };
 
 #[derive(Clone, Debug)]
@@ -71,6 +71,18 @@ impl Store {
 
     pub(crate) fn last_event_timestamp_ms(&self) -> Option<u64> {
         self.events.iter().map(|event| event.timestamp_ms).max()
+    }
+
+    pub(crate) fn contains_event(&self, event_id: &str) -> bool {
+        self.by_event_id.contains_key(event_id)
+    }
+
+    pub(crate) fn contains_exchange(&self, exchange_id: &str) -> bool {
+        self.exchanges.contains_key(exchange_id)
+    }
+
+    pub(crate) fn contains_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
     }
 
     pub(crate) fn insert(&mut self, parsed: ParsedEvent) -> bool {
@@ -169,104 +181,76 @@ impl Store {
         }
     }
 
-    pub(crate) fn session_page(&self, cursor: Option<u64>, limit: usize) -> SessionPage {
-        let mut items: Vec<SessionSummary> = self
-            .sessions
+    pub(crate) fn all_session_summaries(&self, keys: KeyContext<'_>) -> Vec<SessionSummary> {
+        self.sessions
             .values()
-            .map(|session| self.session_summary(session))
-            .collect();
-        items.sort_by(|left, right| {
-            right
-                .latest_timestamp_ms
-                .cmp(&left.latest_timestamp_ms)
-                .then_with(|| left.session_id.cmp(&right.session_id))
-        });
-        page(items, cursor, limit, |items, next, total| SessionPage {
-            items,
-            next_cursor: next,
-            total,
-        })
+            .map(|session| self.session_summary(session, keys))
+            .collect()
     }
 
-    pub(crate) fn exchange_page(
+    pub(crate) fn all_exchange_summaries(
         &self,
         session_id: &str,
-        cursor: Option<u64>,
-        limit: usize,
-    ) -> ExchangePage {
-        let mut items: Vec<ExchangeSummary> = self
-            .exchanges
+        keys: KeyContext<'_>,
+    ) -> Vec<ExchangeSummary> {
+        self.exchanges
             .values()
             .filter(|exchange| exchange.session_id == session_id)
-            .map(|exchange| self.exchange_summary(exchange))
-            .collect();
-        items.sort_by(|left, right| {
-            right
-                .timestamp_ms
-                .cmp(&left.timestamp_ms)
-                .then_with(|| left.exchange_id.cmp(&right.exchange_id))
-        });
-        page(items, cursor, limit, |items, next, total| ExchangePage {
-            items,
-            next_cursor: next,
-            total,
-        })
+            .map(|exchange| self.exchange_summary(exchange, keys))
+            .collect()
     }
 
-    pub(crate) fn search(&self, query: &str, cursor: Option<u64>, limit: usize) -> SearchPage {
+    pub(crate) fn all_search_hits(&self, query: &str, keys: KeyContext<'_>) -> Vec<SearchHit> {
         let query = query.trim();
         if query.is_empty() {
-            return SearchPage {
-                items: Vec::new(),
-                next_cursor: None,
-                total: 0,
-            };
+            return Vec::new();
         }
-        let mut items: Vec<SearchHit> = self
-            .events
+        self.events
             .iter()
             .filter_map(|event| {
                 let text = preview_text(event);
                 let match_offset = find_ignore_case(text, query)?;
                 Some(SearchHit {
+                    event_key: keys.event_key(&event.event_id),
+                    exchange_key: keys.exchange_key(&event.exchange_id),
+                    session_key: keys.session_key(&event.session_id),
                     event_id: event.event_id.clone(),
                     exchange_id: event.exchange_id.clone(),
                     session_id: event.session_id.clone(),
+                    source_path: keys.path.to_string(),
                     event_type: event.event_type,
                     timestamp_ms: event.timestamp_ms,
                     excerpt: window_from(text, match_offset),
                     match_offset: match_offset as u64,
                 })
             })
-            .collect();
-        items.sort_by(|left, right| {
-            right
-                .timestamp_ms
-                .cmp(&left.timestamp_ms)
-                .then_with(|| left.event_id.cmp(&right.event_id))
-        });
-        page(items, cursor, limit, |items, next, total| SearchPage {
-            items,
-            next_cursor: next,
-            total,
-        })
+            .collect()
     }
 
-    pub(crate) fn event_content(&self, event_id: &str) -> Option<EventContent> {
+    pub(crate) fn event_content(
+        &self,
+        event_id: &str,
+        keys: KeyContext<'_>,
+    ) -> Option<EventContent> {
         let idx = *self.by_event_id.get(event_id)?;
-        Some(self.content_at(idx))
+        Some(self.content_at(idx, keys))
     }
 
-    pub(crate) fn response_for_exchange(&self, exchange_id: &str) -> Option<EventContent> {
+    pub(crate) fn response_for_exchange(
+        &self,
+        exchange_id: &str,
+        keys: KeyContext<'_>,
+    ) -> Option<EventContent> {
         let exchange = self.exchanges.get(exchange_id)?;
         let idx = exchange.completion_idx?;
-        (self.events[idx].event_type == EventType::Response).then(|| self.content_at(idx))
+        (self.events[idx].event_type == EventType::Response).then(|| self.content_at(idx, keys))
     }
 
     pub(crate) fn latest_grok_response_before(
         &self,
         timestamp_ms: u64,
         session_id: Option<&str>,
+        keys: KeyContext<'_>,
     ) -> Option<EventContent> {
         let idx = self
             .events
@@ -287,16 +271,20 @@ impl Store {
                     .then_with(|| left.seq.cmp(&right.seq))
             })
             .map(|(idx, _)| idx)?;
-        Some(self.content_at(idx))
+        Some(self.content_at(idx, keys))
     }
 
-    fn content_at(&self, idx: usize) -> EventContent {
+    fn content_at(&self, idx: usize, keys: KeyContext<'_>) -> EventContent {
         let event = &self.events[idx];
         let (speaker, recipient) = speakers(event.event_type, &event.source, &event.target);
         EventContent {
+            event_key: keys.event_key(&event.event_id),
+            exchange_key: keys.exchange_key(&event.exchange_id),
+            session_key: keys.session_key(&event.session_id),
             event_id: event.event_id.clone(),
             exchange_id: event.exchange_id.clone(),
             session_id: event.session_id.clone(),
+            source_path: keys.path.to_string(),
             event_type: event.event_type,
             speaker,
             recipient,
@@ -305,21 +293,13 @@ impl Store {
             duration_ms: event.duration_ms,
             error: event.error.clone(),
             content: event.content.clone(),
+            context: parse_context_diagnostics(&event.content, &event.exchange_id),
         }
     }
 
-    pub(crate) fn widget_snapshot(&self) -> WidgetSnapshot {
-        let Some(exchange) = self.newest_exchange() else {
-            return WidgetSnapshot::empty();
-        };
-        let summary = self.exchange_summary(exchange);
-        WidgetSnapshot {
-            session_id: Some(summary.session_id),
-            exchange_id: Some(summary.exchange_id),
-            request: summary.request,
-            completion: summary.completion,
-            pending_label: summary.pending_label,
-        }
+    pub(crate) fn newest_exchange_summary(&self, keys: KeyContext<'_>) -> Option<ExchangeSummary> {
+        self.newest_exchange()
+            .map(|exchange| self.exchange_summary(exchange, keys))
     }
 
     fn newest_exchange(&self) -> Option<&ExchangeAcc> {
@@ -330,17 +310,17 @@ impl Store {
         })
     }
 
-    fn session_summary(&self, session: &SessionAcc) -> SessionSummary {
+    fn session_summary(&self, session: &SessionAcc, keys: KeyContext<'_>) -> SessionSummary {
         let exchange = self.exchanges.get(&session.latest_exchange_id);
         let (latest_source, latest_target, latest_excerpt, excerpt_extracted) = exchange
             .map(|exchange| {
                 let preview = exchange
                     .request_idx
-                    .map(|idx| self.preview(&self.events[idx]))
+                    .map(|idx| self.preview(&self.events[idx], keys))
                     .or_else(|| {
                         exchange
                             .completion_idx
-                            .map(|idx| self.preview(&self.events[idx]))
+                            .map(|idx| self.preview(&self.events[idx], keys))
                     });
                 let source_target = exchange
                     .request_idx
@@ -362,7 +342,9 @@ impl Store {
             })
             .unwrap_or_default();
         SessionSummary {
+            session_key: keys.session_key(&session.session_id),
             session_id: session.session_id.clone(),
+            source_path: keys.path.to_string(),
             exchange_count: session.exchange_count,
             latest_timestamp_ms: session.latest_timestamp_ms,
             latest_source,
@@ -372,21 +354,24 @@ impl Store {
         }
     }
 
-    fn exchange_summary(&self, exchange: &ExchangeAcc) -> ExchangeSummary {
+    fn exchange_summary(&self, exchange: &ExchangeAcc, keys: KeyContext<'_>) -> ExchangeSummary {
         let request = exchange
             .request_idx
-            .map(|idx| self.preview(&self.events[idx]));
+            .map(|idx| self.preview(&self.events[idx], keys));
         let completion = exchange
             .completion_idx
-            .map(|idx| self.preview(&self.events[idx]));
+            .map(|idx| self.preview(&self.events[idx], keys));
         let pending_label = if request.is_some() && completion.is_none() {
             Some(PENDING_LABEL.to_string())
         } else {
             None
         };
         ExchangeSummary {
+            exchange_key: keys.exchange_key(&exchange.exchange_id),
+            session_key: keys.session_key(&exchange.session_id),
             exchange_id: exchange.exchange_id.clone(),
             session_id: exchange.session_id.clone(),
+            source_path: keys.path.to_string(),
             timestamp_ms: exchange.timestamp_ms,
             request,
             completion,
@@ -394,11 +379,16 @@ impl Store {
         }
     }
 
-    fn preview(&self, event: &StoredEvent) -> MessagePreview {
+    fn preview(&self, event: &StoredEvent, keys: KeyContext<'_>) -> MessagePreview {
         let (speaker, recipient) = speakers(event.event_type, &event.source, &event.target);
         let text = preview_text(event);
-        let (excerpt, excerpt_extracted) = excerpt(text, event.event_type == EventType::Request);
+        let (excerpt, excerpt_extracted) = excerpt(
+            text,
+            event.event_type == EventType::Request,
+            &event.exchange_id,
+        );
         MessagePreview {
+            event_key: keys.event_key(&event.event_id),
             event_id: event.event_id.clone(),
             event_type: event.event_type,
             speaker,
@@ -420,7 +410,7 @@ fn preview_text(event: &StoredEvent) -> &str {
     }
 }
 
-fn page<T: Clone, R>(
+pub(crate) fn page<T: Clone, R>(
     items: Vec<T>,
     cursor: Option<u64>,
     limit: usize,

@@ -8,11 +8,24 @@ export interface Diagnostics {
   unsupportedRecords: number;
   duplicateEvents: number;
   ioErrors: number;
+  aliasCollisions: number;
   lastError: string | null;
 }
 
+export interface SourceStatus {
+  path: string;
+  identity: string;
+  sourceState: SourceState;
+  generation: number;
+  bytesRead: number;
+  sessionCount: number;
+  exchangeCount: number;
+  lastEventTimestampMs: number | null;
+  diagnostics: Diagnostics;
+  aliasOf: string | null;
+}
+
 export interface ViewerStatus {
-  sourcePath: string | null;
   sourceState: SourceState;
   generation: number;
   bytesRead: number;
@@ -23,10 +36,13 @@ export interface ViewerStatus {
   underlayState: UnderlayState;
   widgetVisible: boolean;
   diagnostics: Diagnostics;
+  sources: SourceStatus[];
 }
 
 export interface SessionSummary {
+  sessionKey: string;
   sessionId: string;
+  sourcePath: string;
   exchangeCount: number;
   latestTimestampMs: number;
   latestSource: string;
@@ -42,6 +58,7 @@ export interface SessionPage {
 }
 
 export interface MessagePreview {
+  eventKey: string;
   eventId: string;
   eventType: "request" | "response" | "error";
   speaker: string;
@@ -54,8 +71,11 @@ export interface MessagePreview {
 }
 
 export interface ExchangeSummary {
+  exchangeKey: string;
+  sessionKey: string;
   exchangeId: string;
   sessionId: string;
+  sourcePath: string;
   timestampMs: number;
   request: MessagePreview | null;
   completion: MessagePreview | null;
@@ -69,9 +89,13 @@ export interface ExchangePage {
 }
 
 export interface SearchHit {
+  eventKey: string;
+  exchangeKey: string;
+  sessionKey: string;
   eventId: string;
   exchangeId: string;
   sessionId: string;
+  sourcePath: string;
   eventType: "request" | "response" | "error";
   timestampMs: number;
   excerpt: string;
@@ -85,9 +109,13 @@ export interface SearchPage {
 }
 
 export interface EventContent {
+  eventKey: string;
+  exchangeKey: string;
+  sessionKey: string;
   eventId: string;
   exchangeId: string;
   sessionId: string;
+  sourcePath: string;
   eventType: "request" | "response" | "error";
   speaker: string;
   recipient: string;
@@ -96,9 +124,23 @@ export interface EventContent {
   durationMs: number | null;
   error: string | null;
   content: string;
+  context: ContextDiagnostics | null;
+}
+
+export interface ContextDiagnostics {
+  source: string | null;
+  mode: string | null;
+  fromOffset: number | null;
+  toOffset: number | null;
+  recordCount: number | null;
+  characterCount: number | null;
+  truncated: boolean | null;
+  recovery: string | null;
 }
 
 export interface WidgetSnapshot {
+  sessionKey: string | null;
+  exchangeKey: string | null;
   sessionId: string | null;
   exchangeId: string | null;
   request: MessagePreview | null;
@@ -114,6 +156,7 @@ export interface MonitorInfo {
 
 export interface ViewerSettings {
   selectedLog: string | null;
+  selectedLogs: string[];
   monitorId: string | null;
   corner: Corner;
   offsetX: number;
@@ -125,6 +168,7 @@ export interface ViewerSettings {
 
 export const DEFAULT_SETTINGS: ViewerSettings = {
   selectedLog: null,
+  selectedLogs: [],
   monitorId: null,
   corner: "bottom-right",
   offsetX: 24,
@@ -228,6 +272,7 @@ export interface HandoffSelection {
   label: string;
   incidentId: string | null;
   exactUndelivered: boolean;
+  diagnostic: string | null;
 }
 
 export const DEFAULT_PEER_HEALTH_DIAGNOSTICS: PeerHealthDiagnostics = {

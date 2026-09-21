@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::source::{open_shared_read, MAX_PHYSICAL_LINE, SHARE_DELETE, SHARE_READ, SHARE_WRITE};
 use super::*;
-use crate::event_engine::types::PENDING_LABEL;
+use crate::event_engine::types::{IdMatch, PENDING_LABEL};
 
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -101,6 +101,20 @@ fn watching_engine(log: &TempLog) -> EventEngine {
     engine
 }
 
+fn unique_event(engine: &EventEngine, event_id: &str) -> EventContent {
+    match engine.match_event_id(event_id) {
+        IdMatch::Unique(content) => content,
+        other => panic!("expected unique event {event_id}, got {other:?}"),
+    }
+}
+
+fn session_key(engine: &EventEngine, session_id: &str) -> String {
+    match engine.match_session_id(session_id) {
+        IdMatch::Unique(key) => key,
+        other => panic!("expected unique session {session_id}, got {other:?}"),
+    }
+}
+
 fn assert_send_sync<T: Send + Sync>() {}
 
 #[test]
@@ -168,20 +182,29 @@ fn selects_exact_exchange_response_and_latest_preceding_grok_reply() {
     let engine = watching_engine(&log);
 
     assert_eq!(
-        engine.response_for_exchange("exchange-a").unwrap().event_id,
+        engine
+            .match_exchange_response("exchange-a")
+            .unique()
+            .unwrap()
+            .event_id,
         "response-a"
     );
-    assert!(engine.response_for_exchange("exchange-error").is_none());
+    assert!(engine
+        .match_exchange_response("exchange-error")
+        .unique()
+        .is_none());
     assert_eq!(
         engine
-            .latest_grok_response_before(26, Some("session-a"))
+            .match_latest_grok_response_before(26, Some("session-a"))
+            .unique()
             .unwrap()
             .event_id,
         "response-a"
     );
     assert_eq!(
         engine
-            .latest_grok_response_before(26, None)
+            .match_latest_grok_response_before(26, None)
+            .unique()
             .unwrap()
             .event_id,
         "response-b"
@@ -220,7 +243,6 @@ fn status_and_pages_serialize_with_contract_camel_case() {
     let engine = watching_engine(&log);
     let status = serde_json::to_value(engine.status()).unwrap();
     for key in [
-        "sourcePath",
         "sourceState",
         "generation",
         "bytesRead",
@@ -228,9 +250,11 @@ fn status_and_pages_serialize_with_contract_camel_case() {
         "exchangeCount",
         "lastEventTimestampMs",
         "diagnostics",
+        "sources",
     ] {
         assert!(status.get(key).is_some(), "missing {key}");
     }
+    assert_eq!(status["sources"].as_array().unwrap().len(), 1);
     let diagnostics = status["diagnostics"].as_object().unwrap();
     for key in [
         "malformedLines",
@@ -238,6 +262,7 @@ fn status_and_pages_serialize_with_contract_camel_case() {
         "unsupportedRecords",
         "duplicateEvents",
         "ioErrors",
+        "aliasCollisions",
         "lastError",
     ] {
         assert!(diagnostics.contains_key(key), "missing {key}");
@@ -247,14 +272,18 @@ fn status_and_pages_serialize_with_contract_camel_case() {
     assert!(sessions.get("nextCursor").is_some());
     assert!(sessions["items"][0].get("excerptExtracted").is_some());
 
-    let content = serde_json::to_value(engine.event_content("event-1").unwrap()).unwrap();
+    let content = serde_json::to_value(unique_event(&engine, "event-1")).unwrap();
     let object = content.as_object().unwrap();
     assert!(!object.contains_key("model"));
     assert!(!object.contains_key("reasoning"));
     for key in [
+        "eventKey",
+        "exchangeKey",
+        "sessionKey",
         "eventId",
         "exchangeId",
         "sessionId",
+        "sourcePath",
         "eventType",
         "speaker",
         "recipient",
@@ -263,9 +292,11 @@ fn status_and_pages_serialize_with_contract_camel_case() {
         "durationMs",
         "error",
         "content",
+        "context",
     ] {
         assert!(object.contains_key(key), "missing {key}");
     }
+    assert!(engine.event_content("event-1").is_none());
 }
 
 #[test]
@@ -316,7 +347,7 @@ fn skips_malformed_and_unsupported_records() {
     assert_eq!(status.diagnostics.malformed_lines, 2);
     assert_eq!(status.diagnostics.unsupported_records, 2);
     assert_eq!(status.exchange_count, 1);
-    assert_eq!(engine.event_content("ok-1").unwrap().content, "keep");
+    assert_eq!(unique_event(&engine, "ok-1").content, "keep");
 }
 
 #[test]
@@ -345,10 +376,7 @@ fn skips_oversized_physical_lines_then_parses_the_next_record() {
     let status = engine.status();
     assert_eq!(status.diagnostics.oversized_lines, 1);
     assert!(status.bytes_read > MAX_PHYSICAL_LINE as u64);
-    assert_eq!(
-        engine.event_content("after-oversize").unwrap().content,
-        "survived"
-    );
+    assert_eq!(unique_event(&engine, "after-oversize").content, "survived");
 }
 
 #[test]
@@ -368,7 +396,7 @@ fn accepts_utf8_bom_and_crlf_line_endings() {
     log.write(&bytes);
 
     let engine = watching_engine(&log);
-    let content = engine.event_content("bom-1").unwrap();
+    let content = unique_event(&engine, "bom-1");
     assert_eq!(content.content, "from bom");
     assert_eq!(engine.status().generation, 1);
 }
@@ -399,7 +427,7 @@ fn retains_partial_writes_and_split_unicode_until_a_complete_line() {
     log.append(&bytes[split_at + 1..]);
     log.append(b"\n");
     assert!(engine.poll());
-    assert_eq!(engine.event_content("cafe-1").unwrap().content, "café");
+    assert_eq!(unique_event(&engine, "cafe-1").content, "café");
     assert!(!engine.poll());
 }
 
@@ -418,7 +446,7 @@ fn deduplicates_event_ids_only_inside_one_generation() {
     write_lines(&log, &[first, dup]);
     let engine = watching_engine(&log);
     assert_eq!(engine.status().diagnostics.duplicate_events, 1);
-    assert_eq!(engine.event_content("same-id").unwrap().content, "first");
+    assert_eq!(unique_event(&engine, "same-id").content, "first");
     assert_eq!(engine.status().exchange_count, 1);
 
     let replacement = event_line("request", "same-id", "ex-c", Some("s-c"), Some("reborn"), 3);
@@ -428,7 +456,7 @@ fn deduplicates_event_ids_only_inside_one_generation() {
     let status = engine.status();
     assert_eq!(status.generation, 2);
     assert_eq!(status.diagnostics.duplicate_events, 1);
-    assert_eq!(engine.event_content("same-id").unwrap().content, "reborn");
+    assert_eq!(unique_event(&engine, "same-id").content, "reborn");
 }
 
 #[test]
@@ -466,8 +494,8 @@ fn rebuilds_on_truncation_and_in_place_replacement() {
     assert!(engine.poll());
     let status = engine.status();
     assert!(status.generation >= 2);
-    assert!(engine.event_content("old-1").is_none());
-    assert_eq!(engine.event_content("new-1").unwrap().content, "truncated");
+    assert!(engine.match_event_id("old-1").unique().is_none());
+    assert_eq!(unique_event(&engine, "new-1").content, "truncated");
 }
 
 #[test]
@@ -491,7 +519,7 @@ fn pairs_request_response_and_error_and_exposes_pending_label() {
         ],
     );
     let engine = watching_engine(&log);
-    let page = engine.exchange_page("s-1", None, 10);
+    let page = engine.exchange_page(&session_key(&engine, "s-1"), None, 10);
     assert_eq!(page.total, 3);
     assert_eq!(page.items[0].exchange_id, "ex-3");
     assert_eq!(page.items[0].pending_label.as_deref(), Some(PENDING_LABEL));
@@ -564,7 +592,7 @@ fn pages_sessions_exchanges_and_search_newest_first_with_clamped_limits() {
     let zero = engine.session_page(None, 0);
     assert_eq!(zero.items.len(), 1);
 
-    let exchanges = engine.exchange_page("session-3", None, 2);
+    let exchanges = engine.exchange_page(&session_key(&engine, "session-3"), None, 2);
     assert_eq!(exchanges.total, 3);
     assert_eq!(exchanges.items.len(), 2);
     assert_eq!(exchanges.items[0].exchange_id, "ex-3-3");
@@ -596,7 +624,7 @@ fn retrieves_exact_content_above_sixty_thousand_characters() {
         )],
     );
     let engine = watching_engine(&log);
-    let body = engine.event_content("huge-1").unwrap();
+    let body = unique_event(&engine, "huge-1");
     assert_eq!(body.content, content);
     assert_eq!(body.content.chars().count(), 70_012);
     assert!(!body.content.contains('\u{fffd}'));
@@ -636,10 +664,7 @@ fn shared_read_allows_writers_and_delete_access() {
 
     let engine = watching_engine(&log);
     assert_eq!(engine.status().source_state, SourceState::Watching);
-    assert_eq!(
-        engine.event_content("share-1").unwrap().content,
-        "while open"
-    );
+    assert_eq!(unique_event(&engine, "share-1").content, "while open");
 
     writer
         .write_all(
@@ -657,10 +682,7 @@ fn shared_read_allows_writers_and_delete_access() {
     writer.write_all(b"\n").unwrap();
     writer.flush().unwrap();
     assert!(engine.poll());
-    assert_eq!(
-        engine.event_content("share-2").unwrap().content,
-        "still writable"
-    );
+    assert_eq!(unique_event(&engine, "share-2").content, "still writable");
     drop(writer);
 
     let reader = open_shared_read(log.path()).unwrap();
@@ -700,5 +722,303 @@ fn missing_file_can_reappear_without_creating_it() {
     assert!(engine.poll());
     assert_eq!(engine.status().source_state, SourceState::Watching);
     assert_eq!(engine.status().generation, 1);
-    assert_eq!(engine.event_content("back-1").unwrap().content, "returned");
+    assert_eq!(unique_event(&engine, "back-1").content, "returned");
+}
+
+#[test]
+fn does_not_pair_across_sources_or_generations_and_uses_opaque_keys() {
+    let first = TempLog::new("multi-a");
+    let second = TempLog::new("multi-b");
+    write_lines(
+        &first,
+        &[
+            event_line(
+                "request",
+                "shared-event",
+                "shared-exchange",
+                Some("shared-session"),
+                Some("from-a"),
+                10,
+            ),
+            event_line(
+                "response",
+                "resp-a",
+                "shared-exchange",
+                Some("shared-session"),
+                Some("reply-a"),
+                11,
+            ),
+        ],
+    );
+    write_lines(
+        &second,
+        &[event_line(
+            "request",
+            "shared-event",
+            "shared-exchange",
+            Some("shared-session"),
+            Some("from-b"),
+            20,
+        )],
+    );
+    let engine = EventEngine::new();
+    engine
+        .set_sources(vec![
+            first.path().to_path_buf(),
+            second.path().to_path_buf(),
+        ])
+        .unwrap();
+    engine.poll();
+
+    let sessions = engine.session_page(None, 10);
+    assert_eq!(sessions.total, 2);
+    assert_eq!(sessions.items[0].session_id, "shared-session");
+    assert_eq!(sessions.items[0].latest_excerpt, "from-b");
+    assert_ne!(sessions.items[0].session_key, sessions.items[1].session_key);
+
+    let first_key = session_key_for(&sessions, first.path());
+    let first_page = engine.exchange_page(&first_key, None, 10);
+    assert_eq!(first_page.total, 1);
+    assert_eq!(
+        first_page.items[0].completion.as_ref().unwrap().excerpt,
+        "reply-a"
+    );
+
+    let second_key = session_key_for(&sessions, second.path());
+    let second_page = engine.exchange_page(&second_key, None, 10);
+    assert_eq!(second_page.total, 1);
+    assert_eq!(
+        second_page.items[0].pending_label.as_deref(),
+        Some(PENDING_LABEL)
+    );
+
+    assert!(matches!(
+        engine.match_event_id("shared-event"),
+        IdMatch::Ambiguous { count: 2, .. }
+    ));
+    let unique_a = unique_event_from(&engine, "resp-a");
+    assert_eq!(
+        engine.event_content(&unique_a.event_key).unwrap().content,
+        "reply-a"
+    );
+    assert!(engine.event_content("resp-a").is_none());
+    assert!(engine
+        .event_content(&first_page.items[0].exchange_key)
+        .is_none());
+    assert!(engine.response_for_exchange(&unique_a.event_key).is_none());
+    assert_eq!(engine.exchange_page(&unique_a.event_key, None, 10).total, 0);
+
+    let snapshot = engine.widget_snapshot();
+    assert_eq!(snapshot.exchange_id.as_deref(), Some("shared-exchange"));
+    assert_eq!(snapshot.request.as_ref().unwrap().excerpt, "from-b");
+}
+
+#[test]
+fn independent_replacement_truncation_and_missing_state() {
+    let stable = TempLog::new("stable");
+    let volatile = TempLog::new("volatile");
+    write_lines(
+        &stable,
+        &[event_line(
+            "request",
+            "stable-1",
+            "ex-stable",
+            Some("s-stable"),
+            Some("keep-me"),
+            1,
+        )],
+    );
+    write_lines(
+        &volatile,
+        &[event_line(
+            "request",
+            "volatile-1",
+            "ex-vol",
+            Some("s-vol"),
+            Some("old-vol"),
+            2,
+        )],
+    );
+    let engine = EventEngine::new();
+    engine
+        .set_sources(vec![
+            stable.path().to_path_buf(),
+            volatile.path().to_path_buf(),
+        ])
+        .unwrap();
+    engine.poll();
+    assert_eq!(engine.status().exchange_count, 2);
+
+    write_lines(
+        &volatile,
+        &[event_line(
+            "request",
+            "volatile-2",
+            "ex-vol-2",
+            Some("s-vol"),
+            Some("new-vol"),
+            3,
+        )],
+    );
+    assert!(engine.poll());
+    assert_eq!(unique_event(&engine, "stable-1").content, "keep-me");
+    assert!(engine.match_event_id("volatile-1").unique().is_none());
+    assert_eq!(unique_event(&engine, "volatile-2").content, "new-vol");
+
+    fs::remove_file(volatile.path()).unwrap();
+    assert!(engine.poll());
+    let statuses = engine.source_statuses();
+    assert_eq!(statuses[0].source_state, SourceState::Watching);
+    assert_eq!(statuses[1].source_state, SourceState::Missing);
+    assert_eq!(engine.status().source_state, SourceState::Degraded);
+    assert_eq!(unique_event(&engine, "stable-1").content, "keep-me");
+}
+
+#[test]
+fn alias_paths_are_deduplicated_and_diagnosed() {
+    let log = TempLog::new("alias");
+    write_lines(
+        &log,
+        &[event_line(
+            "request",
+            "alias-1",
+            "ex-alias",
+            Some("s-alias"),
+            Some("once"),
+            1,
+        )],
+    );
+    let engine = EventEngine::new();
+    engine
+        .set_sources(vec![log.path().to_path_buf(), log.path().to_path_buf()])
+        .unwrap();
+    engine.poll();
+    assert_eq!(engine.status().exchange_count, 1);
+    assert_eq!(engine.status().diagnostics.alias_collisions, 1);
+    let statuses = engine.source_statuses();
+    assert_eq!(statuses.len(), 2);
+    assert!(statuses[1].alias_of.is_some());
+    assert_eq!(unique_event(&engine, "alias-1").content, "once");
+}
+
+#[test]
+fn hard_link_aliases_are_deduplicated_by_file_identity() {
+    let log = TempLog::new("hard-link-source");
+    write_lines(
+        &log,
+        &[event_line(
+            "request",
+            "hard-link-1",
+            "ex-hard-link",
+            Some("s-hard-link"),
+            Some("once"),
+            1,
+        )],
+    );
+    let alias = log.path().with_file_name(format!(
+        "parley-viewer-event-engine-{}-{}-hard-link-alias.jsonl",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_file(&alias);
+    fs::hard_link(log.path(), &alias).unwrap();
+
+    let engine = EventEngine::new();
+    engine
+        .set_sources(vec![log.path().to_path_buf(), alias.clone()])
+        .unwrap();
+    engine.poll();
+    assert_eq!(engine.status().exchange_count, 1);
+    assert_eq!(engine.status().diagnostics.alias_collisions, 1);
+    assert!(engine.source_statuses()[1].alias_of.is_some());
+    assert_eq!(unique_event(&engine, "hard-link-1").content, "once");
+
+    fs::remove_file(alias).unwrap();
+}
+
+#[test]
+fn aggregate_order_is_timestamp_then_configured_source_then_key() {
+    let older = TempLog::new("order-a");
+    let newer_same_ts = TempLog::new("order-b");
+    write_lines(
+        &older,
+        &[event_line(
+            "request",
+            "a-1",
+            "ex-a",
+            Some("session-a"),
+            Some("aaa"),
+            50,
+        )],
+    );
+    write_lines(
+        &newer_same_ts,
+        &[event_line(
+            "request",
+            "b-1",
+            "ex-b",
+            Some("session-b"),
+            Some("bbb"),
+            50,
+        )],
+    );
+    let engine = EventEngine::new();
+    engine
+        .set_sources(vec![
+            older.path().to_path_buf(),
+            newer_same_ts.path().to_path_buf(),
+        ])
+        .unwrap();
+    engine.poll();
+    let sessions = engine.session_page(None, 10);
+    assert_eq!(sessions.items[0].session_id, "session-a");
+    assert_eq!(sessions.items[1].session_id, "session-b");
+}
+
+#[test]
+fn extracts_matching_context_marker_and_keeps_context_off_the_widget() {
+    let log = TempLog::new("framed");
+    let framed = format!(
+        "=== PARLEY_UNTRUSTED_CONTEXT_V1 exchange=ex-frame ===\nsource: codex\nmode: seed\nfrom_offset: 4\nto_offset: 8\nrecord_count: 2\ncharacter_count: 16\ntruncated: true\nrecovery: skip\n=== BEGIN_UNTRUSTED_TRANSCRIPT ===\ntask: historical\n=== END_UNTRUSTED_TRANSCRIPT ===\n=== PARLEY_CURRENT_REQUEST_V1 exchange=ex-frame ===\npolicy:\n  task: Current framed task\n"
+    );
+    write_lines(
+        &log,
+        &[event_line(
+            "request",
+            "frame-1",
+            "ex-frame",
+            Some("s-frame"),
+            Some(&framed),
+            9,
+        )],
+    );
+    let engine = watching_engine(&log);
+    let content = unique_event(&engine, "frame-1");
+    let context = content.context.expect("context diagnostics");
+    assert_eq!(context.source.as_deref(), Some("codex"));
+    assert_eq!(context.mode.as_deref(), Some("seed"));
+    assert_eq!(context.from_offset, Some(4));
+    assert_eq!(context.truncated, Some(true));
+    assert_eq!(context.recovery.as_deref(), Some("skip"));
+    let snapshot = engine.widget_snapshot();
+    assert_eq!(
+        snapshot.request.as_ref().unwrap().excerpt,
+        " Current framed task"
+    );
+    assert!(snapshot.request.as_ref().unwrap().excerpt_extracted);
+    let encoded = serde_json::to_value(&snapshot).unwrap();
+    assert!(encoded.get("context").is_none());
+}
+
+fn session_key_for(page: &SessionPage, path: &Path) -> String {
+    let path = path.to_string_lossy();
+    page.items
+        .iter()
+        .find(|session| session.source_path == path)
+        .map(|session| session.session_key.clone())
+        .unwrap_or_else(|| panic!("missing session for {path}"))
+}
+
+fn unique_event_from(engine: &EventEngine, event_id: &str) -> EventContent {
+    unique_event(engine, event_id)
 }

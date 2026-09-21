@@ -17,7 +17,6 @@ import {
 } from "./paging";
 
 const status = (overrides: Partial<ViewerStatus> = {}): ViewerStatus => ({
-  sourcePath: "C:\\\\a.jsonl",
   sourceState: "watching",
   generation: 1,
   bytesRead: 10,
@@ -33,8 +32,31 @@ const status = (overrides: Partial<ViewerStatus> = {}): ViewerStatus => ({
     unsupportedRecords: 0,
     duplicateEvents: 0,
     ioErrors: 0,
+    aliasCollisions: 0,
     lastError: null,
   },
+  sources: [
+    {
+      path: "C:\\\\a.jsonl",
+      identity: "c:\\\\a.jsonl",
+      sourceState: "watching",
+      generation: 1,
+      bytesRead: 10,
+      sessionCount: 2,
+      exchangeCount: 4,
+      lastEventTimestampMs: 8,
+      diagnostics: {
+        malformedLines: 0,
+        oversizedLines: 0,
+        unsupportedRecords: 0,
+        duplicateEvents: 0,
+        ioErrors: 0,
+        aliasCollisions: 0,
+        lastError: null,
+      },
+      aliasOf: null,
+    },
+  ],
   ...overrides,
 });
 
@@ -81,6 +103,19 @@ describe("paging state", () => {
     expect(dataRefreshPlan(current, status({ exchangeCount: 5 }))).toBe("refresh");
     expect(dataRefreshPlan(current, status({ bytesRead: 18 }))).toBe("refresh");
     expect(dataRefreshPlan(current, status({ generation: 2 }))).toBe("reset");
-    expect(dataRefreshPlan(current, status({ sourcePath: "C:\\\\b.jsonl" }))).toBe("reset");
+    expect(
+      dataRefreshPlan(
+        current,
+        status({
+          sources: [
+            {
+              ...current.sources[0]!,
+              path: "C:\\\\b.jsonl",
+              identity: "c:\\\\b.jsonl",
+            },
+          ],
+        }),
+      ),
+    ).toBe("reset");
   });
 });

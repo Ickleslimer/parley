@@ -14,7 +14,6 @@ import {
 } from "./labels";
 
 const status = (overrides: Partial<ViewerStatus> = {}): ViewerStatus => ({
-  sourcePath: null,
   sourceState: "none",
   generation: 0,
   bytesRead: 0,
@@ -30,8 +29,10 @@ const status = (overrides: Partial<ViewerStatus> = {}): ViewerStatus => ({
     unsupportedRecords: 0,
     duplicateEvents: 0,
     ioErrors: 0,
+    aliasCollisions: 0,
     lastError: null,
   },
+  sources: [],
   ...overrides,
 });
 

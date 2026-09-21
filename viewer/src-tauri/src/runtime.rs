@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde::Serialize;
 
-use crate::event_engine::{Diagnostics, EngineStatus, EventEngine, SourceState};
+use crate::event_engine::{Diagnostics, EngineStatus, EventEngine, SourceState, SourceStatus};
 use crate::settings::{save_settings, validate_source_path, Corner, SettingsFile, ViewerSettings};
 
 const MAX_ATTACH_ATTEMPTS: u8 = 6;
@@ -24,7 +24,6 @@ pub enum UnderlayState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewerStatus {
-    pub source_path: Option<String>,
     pub source_state: SourceState,
     pub generation: u64,
     pub bytes_read: u64,
@@ -35,6 +34,7 @@ pub struct ViewerStatus {
     pub underlay_state: UnderlayState,
     pub widget_visible: bool,
     pub diagnostics: Diagnostics,
+    pub sources: Vec<SourceStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -104,6 +104,7 @@ impl AppState {
         let current = self.settings();
         let mut next = incoming.sanitized();
         next.selected_log = current.viewer.selected_log;
+        next.selected_logs = current.viewer.selected_logs;
         next.launch_at_login = current.viewer.launch_at_login;
         let updated = SettingsFile {
             viewer: next.clone(),
@@ -115,17 +116,61 @@ impl AppState {
         Ok(next)
     }
 
-    pub fn set_source(&self, source: Option<PathBuf>, persist: bool) -> Result<(), String> {
-        let source = source.map(validate_source_path).transpose()?;
+    pub fn set_sources(&self, sources: Vec<PathBuf>, persist: bool) -> Result<(), String> {
+        let sources = sources
+            .into_iter()
+            .map(validate_source_path)
+            .collect::<Result<Vec<_>, _>>()?;
         if persist {
             let mut updated = self.settings();
-            updated.viewer.selected_log = source
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned());
+            updated.viewer.set_logs(
+                sources
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+            )?;
             save_settings(&self.settings_path, &updated)?;
             *self.lock_settings() = updated;
         }
-        self.engine.set_source(source)?;
+        self.engine.set_sources(sources)?;
+        self.engine.poll();
+        Ok(())
+    }
+
+    pub fn add_source(&self, source: PathBuf, persist: bool) -> Result<(), String> {
+        let source = validate_source_path(source)?;
+        let mut added = true;
+        if persist {
+            let mut updated = self.settings();
+            added = updated
+                .viewer
+                .add_log(source.to_string_lossy().into_owned())?;
+            if added {
+                save_settings(&self.settings_path, &updated)?;
+                *self.lock_settings() = updated;
+            }
+        }
+        if added {
+            self.engine.add_source(source)?;
+            self.engine.poll();
+        }
+        Ok(())
+    }
+
+    pub fn remove_source(&self, source: PathBuf, persist: bool) -> Result<(), String> {
+        let source = validate_source_path(source)?;
+        let mut removed = true;
+        if persist {
+            let mut updated = self.settings();
+            removed = updated.viewer.remove_log(&source.to_string_lossy())?;
+            if removed {
+                save_settings(&self.settings_path, &updated)?;
+                *self.lock_settings() = updated;
+            }
+        }
+        if removed {
+            self.engine.remove_source(&source)?;
+        }
         self.engine.poll();
         Ok(())
     }
@@ -146,7 +191,6 @@ impl AppState {
 
     pub fn status(&self) -> ViewerStatus {
         let EngineStatus {
-            source_path,
             source_state,
             generation,
             bytes_read,
@@ -154,13 +198,13 @@ impl AppState {
             exchange_count,
             last_event_timestamp_ms,
             mut diagnostics,
+            sources,
         } = self.engine.status();
         let runtime = self.lock_runtime();
         if let Some(error) = runtime.last_error.as_ref() {
             diagnostics.last_error = Some(error.clone());
         }
         ViewerStatus {
-            source_path,
             source_state,
             generation,
             bytes_read,
@@ -172,6 +216,7 @@ impl AppState {
             widget_visible: runtime.widget_requested
                 && runtime.underlay_state == UnderlayState::Attached,
             diagnostics,
+            sources,
         }
     }
 

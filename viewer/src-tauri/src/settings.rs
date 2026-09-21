@@ -33,6 +33,8 @@ pub enum Corner {
 #[serde(default, rename_all = "camelCase")]
 pub struct ViewerSettings {
     pub selected_log: Option<String>,
+    #[serde(default)]
+    pub selected_logs: Vec<String>,
     pub monitor_id: Option<String>,
     pub corner: Corner,
     pub offset_x: f64,
@@ -46,6 +48,7 @@ impl Default for ViewerSettings {
     fn default() -> Self {
         Self {
             selected_log: None,
+            selected_logs: Vec::new(),
             monitor_id: None,
             corner: Corner::BottomRight,
             offset_x: 24.0,
@@ -60,18 +63,64 @@ impl Default for ViewerSettings {
 impl ViewerSettings {
     pub fn sanitized(mut self) -> Self {
         let defaults = Self::default();
-        if self
-            .selected_log
-            .as_ref()
-            .is_some_and(|path| !Path::new(path).is_absolute())
-        {
-            self.selected_log = None;
-        }
+        self.migrate_logs();
         self.offset_x = sanitize_number(self.offset_x, defaults.offset_x, 0.0, MAX_OFFSET);
         self.offset_y = sanitize_number(self.offset_y, defaults.offset_y, 0.0, MAX_OFFSET);
         self.width = sanitize_number(self.width, defaults.width, MIN_WIDTH, MAX_DIMENSION);
         self.height = sanitize_number(self.height, defaults.height, MIN_HEIGHT, MAX_DIMENSION);
         self
+    }
+
+    pub fn set_logs(&mut self, logs: Vec<String>) -> Result<(), String> {
+        self.selected_logs = logs
+            .into_iter()
+            .map(|path| {
+                validate_source_path(PathBuf::from(path))
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.selected_log = self.selected_logs.first().cloned();
+        Ok(())
+    }
+
+    pub fn add_log(&mut self, path: String) -> Result<bool, String> {
+        let path = validate_source_path(PathBuf::from(path))?;
+        let rendered = path.to_string_lossy().into_owned();
+        let added = !self
+            .selected_logs
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&rendered));
+        if added {
+            self.selected_logs.push(rendered);
+        }
+        self.selected_log = self.selected_logs.first().cloned();
+        Ok(added)
+    }
+
+    pub fn remove_log(&mut self, path: &str) -> Result<bool, String> {
+        let path = validate_source_path(Path::new(path))?;
+        let rendered = path.to_string_lossy().into_owned();
+        let before = self.selected_logs.len();
+        self.selected_logs
+            .retain(|existing| !existing.eq_ignore_ascii_case(&rendered));
+        self.selected_log = self.selected_logs.first().cloned();
+        Ok(self.selected_logs.len() != before)
+    }
+
+    fn migrate_logs(&mut self) {
+        self.selected_logs
+            .retain(|path| Path::new(path).is_absolute());
+        if let Some(path) = self.selected_log.as_ref() {
+            if !Path::new(path).is_absolute() {
+                self.selected_log = None;
+            }
+        }
+        if self.selected_logs.is_empty() {
+            if let Some(path) = self.selected_log.clone() {
+                self.selected_logs = vec![path];
+            }
+        }
+        self.selected_log = self.selected_logs.first().cloned();
     }
 }
 
@@ -138,6 +187,8 @@ pub fn load_settings(path: &Path) -> Result<SettingsFile, String> {
 }
 
 pub fn save_settings(path: &Path, settings: &SettingsFile) -> Result<(), String> {
+    let mut settings = settings.clone();
+    settings.viewer.migrate_logs();
     let parent = path
         .parent()
         .ok_or_else(|| "settings path has no parent directory".to_string())?;
@@ -148,7 +199,7 @@ pub fn save_settings(path: &Path, settings: &SettingsFile) -> Result<(), String>
         .and_then(OsStr::to_str)
         .unwrap_or("settings.json");
     let temp_path = parent.join(format!(".{file_name}.{}.tmp", process::id()));
-    let bytes = serde_json::to_vec_pretty(settings)
+    let bytes = serde_json::to_vec_pretty(&settings)
         .map_err(|error| format!("failed to encode settings: {error}"))?;
     let write_result = (|| -> Result<(), String> {
         let mut file = File::create(&temp_path)
@@ -224,6 +275,7 @@ mod tests {
         .sanitized();
 
         assert_eq!(settings.selected_log, None);
+        assert!(settings.selected_logs.is_empty());
         assert_eq!(settings.offset_x, 0.0);
         assert_eq!(settings.offset_y, 24.0);
         assert_eq!(settings.width, MIN_WIDTH);
@@ -254,6 +306,47 @@ mod tests {
         assert_eq!(settings.viewer.offset_y, 24.0);
         assert_eq!(settings.viewer.width, DEFAULT_WIDTH);
         assert_eq!(settings.viewer.height, DEFAULT_HEIGHT);
+        assert_eq!(
+            settings.viewer.selected_logs,
+            vec![r"C:\logs\events.jsonl".to_string()]
+        );
+        assert_eq!(
+            settings.viewer.selected_log.as_deref(),
+            Some(r"C:\logs\events.jsonl")
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_selected_log_and_writes_both_fields() {
+        let settings = serde_json::from_str::<SettingsFile>(
+            r#"{
+                "selectedLog": "C:\\logs\\legacy.jsonl",
+                "monitorId": null,
+                "corner": "bottom-right",
+                "offsetX": 24.0,
+                "offsetY": 24.0,
+                "width": 560.0,
+                "height": 360.0,
+                "launchAtLogin": false
+            }"#,
+        )
+        .expect("legacy selected log should parse")
+        .sanitized();
+        assert_eq!(
+            settings.viewer.selected_logs,
+            vec![r"C:\logs\legacy.jsonl".to_string()]
+        );
+        assert_eq!(
+            settings.viewer.selected_log.as_deref(),
+            Some(r"C:\logs\legacy.jsonl")
+        );
+
+        let path = temp_settings_path();
+        save_settings(&path, &settings).expect("save should succeed");
+        let raw = fs::read_to_string(&path).expect("settings should be readable");
+        assert!(raw.contains("selectedLog"));
+        assert!(raw.contains("selectedLogs"));
+        fs::remove_dir_all(path.parent().unwrap()).expect("temp settings should be removable");
     }
 
     #[test]
@@ -277,11 +370,20 @@ mod tests {
     fn saves_and_replaces_settings_atomically() {
         let path = temp_settings_path();
         let mut first = SettingsFile::default();
-        first.viewer.selected_log = Some(r"C:\logs\first.jsonl".to_string());
+        first
+            .viewer
+            .set_logs(vec![r"C:\logs\first.jsonl".to_string()])
+            .unwrap();
         save_settings(&path, &first).expect("first save should succeed");
 
         let mut second = first.clone();
-        second.viewer.selected_log = Some(r"C:\logs\second.jsonl".to_string());
+        second
+            .viewer
+            .set_logs(vec![
+                r"C:\logs\second.jsonl".to_string(),
+                r"C:\logs\third.jsonl".to_string(),
+            ])
+            .unwrap();
         second.autostart_initialized = true;
         save_settings(&path, &second).expect("replacement save should succeed");
 

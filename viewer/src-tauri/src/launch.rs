@@ -5,7 +5,7 @@ use crate::settings::validate_source_path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LaunchOptions {
-    pub event_log: Option<PathBuf>,
+    pub event_logs: Vec<PathBuf>,
     pub show: bool,
     pub autostart: bool,
     pub exit: bool,
@@ -49,10 +49,8 @@ impl LaunchOptions {
     }
 
     fn set_event_log(&mut self, value: OsString) -> Result<(), String> {
-        if self.event_log.is_some() {
-            return Err("--event-log may be provided only once".to_string());
-        }
-        self.event_log = Some(validate_source_path(PathBuf::from(value))?);
+        let path = validate_source_path(PathBuf::from(value))?;
+        self.event_logs.push(path);
         Ok(())
     }
 }
@@ -66,36 +64,40 @@ pub enum SourceOrigin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InitialSource {
-    pub path: Option<PathBuf>,
+pub struct InitialSources {
+    pub paths: Vec<PathBuf>,
     pub origin: SourceOrigin,
 }
 
-pub fn resolve_initial_source(
+pub fn resolve_initial_sources(
     options: &LaunchOptions,
     environment: Option<OsString>,
-    saved: Option<&str>,
-) -> Result<InitialSource, String> {
-    if let Some(path) = options.event_log.as_ref() {
-        return Ok(InitialSource {
-            path: Some(path.clone()),
+    saved: &[String],
+) -> Result<InitialSources, String> {
+    if !options.event_logs.is_empty() {
+        return Ok(InitialSources {
+            paths: options.event_logs.clone(),
             origin: SourceOrigin::CommandLine,
         });
     }
     if let Some(path) = environment {
-        return Ok(InitialSource {
-            path: Some(validate_source_path(PathBuf::from(path))?),
+        return Ok(InitialSources {
+            paths: vec![validate_source_path(PathBuf::from(path))?],
             origin: SourceOrigin::Environment,
         });
     }
-    if let Some(path) = saved {
-        return Ok(InitialSource {
-            path: Some(validate_source_path(Path::new(path))?),
+    if !saved.is_empty() {
+        let mut paths = Vec::new();
+        for item in saved {
+            paths.push(validate_source_path(Path::new(item))?);
+        }
+        return Ok(InitialSources {
+            paths,
             origin: SourceOrigin::Saved,
         });
     }
-    Ok(InitialSource {
-        path: None,
+    Ok(InitialSources {
+        paths: Vec::new(),
         origin: SourceOrigin::None,
     })
 }
@@ -118,8 +120,8 @@ mod tests {
         ]))
         .expect("arguments should parse");
         assert_eq!(
-            options.event_log,
-            Some(PathBuf::from(r"C:\logs\events.jsonl"))
+            options.event_logs,
+            vec![PathBuf::from(r"C:\logs\events.jsonl")]
         );
         assert!(!options.show_detail());
 
@@ -143,13 +145,33 @@ mod tests {
         ]))
         .is_err());
         assert!(LaunchOptions::parse(args(&["parley-viewer.exe", "--event-log"])).is_err());
-        assert!(LaunchOptions::parse(args(&[
+        assert!(LaunchOptions::parse(args(&["parley-viewer.exe", "--unknown"])).is_err());
+    }
+
+    #[test]
+    fn repeated_event_log_arguments_replace_saved_sources() {
+        let options = LaunchOptions::parse(args(&[
             "parley-viewer.exe",
             "--event-log=C:\\one.jsonl",
-            "--event-log=C:\\two.jsonl",
+            "--event-log",
+            r"C:\two.jsonl",
         ]))
-        .is_err());
-        assert!(LaunchOptions::parse(args(&["parley-viewer.exe", "--unknown"])).is_err());
+        .expect("repeated event logs should parse");
+        assert_eq!(
+            options.event_logs,
+            vec![
+                PathBuf::from(r"C:\one.jsonl"),
+                PathBuf::from(r"C:\two.jsonl")
+            ]
+        );
+        let source = resolve_initial_sources(
+            &options,
+            Some(OsString::from(r"C:\env.jsonl")),
+            &[r"C:\saved.jsonl".to_string()],
+        )
+        .expect("cli sources should win");
+        assert_eq!(source.origin, SourceOrigin::CommandLine);
+        assert_eq!(source.paths, options.event_logs);
     }
 
     #[test]
@@ -157,30 +179,45 @@ mod tests {
         let options =
             LaunchOptions::parse(args(&["parley-viewer.exe", "--event-log=C:\\cli.jsonl"]))
                 .expect("arguments should parse");
-        let source = resolve_initial_source(
+        let source = resolve_initial_sources(
             &options,
             Some(OsString::from(r"C:\env.jsonl")),
-            Some(r"C:\saved.jsonl"),
+            &[r"C:\saved.jsonl".to_string()],
         )
         .expect("source should resolve");
         assert_eq!(source.origin, SourceOrigin::CommandLine);
-        assert_eq!(source.path, Some(PathBuf::from(r"C:\cli.jsonl")));
+        assert_eq!(source.paths, vec![PathBuf::from(r"C:\cli.jsonl")]);
 
-        let source = resolve_initial_source(
+        let source = resolve_initial_sources(
             &LaunchOptions::default(),
             Some(OsString::from(r"C:\env.jsonl")),
-            Some(r"C:\saved.jsonl"),
+            &[r"C:\saved.jsonl".to_string()],
         )
         .expect("source should resolve");
         assert_eq!(source.origin, SourceOrigin::Environment);
 
-        let source =
-            resolve_initial_source(&LaunchOptions::default(), None, Some(r"C:\saved.jsonl"))
-                .expect("source should resolve");
+        let source = resolve_initial_sources(
+            &LaunchOptions::default(),
+            None,
+            &[r"C:\saved.jsonl".to_string()],
+        )
+        .expect("source should resolve");
         assert_eq!(source.origin, SourceOrigin::Saved);
 
-        let source = resolve_initial_source(&LaunchOptions::default(), None, None)
+        let source = resolve_initial_sources(&LaunchOptions::default(), None, &[])
             .expect("source should resolve");
         assert_eq!(source.origin, SourceOrigin::None);
+
+        let saved = resolve_initial_sources(
+            &LaunchOptions::default(),
+            None,
+            &[
+                r"C:\saved-a.jsonl".to_string(),
+                r"C:\saved-b.jsonl".to_string(),
+            ],
+        )
+        .expect("saved list should resolve");
+        assert_eq!(saved.origin, SourceOrigin::Saved);
+        assert_eq!(saved.paths.len(), 2);
     }
 }

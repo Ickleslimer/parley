@@ -6,6 +6,7 @@ import type {
   PeerHealthSnapshot,
   SearchHit,
   SessionSummary,
+  SourceStatus,
   ViewerSettings,
   ViewerStatus,
 } from "../contracts";
@@ -23,6 +24,7 @@ import {
   formatRoute,
   formatRuntimeHealth,
   formatSourceLine,
+  formatSourceState,
   formatTimestamp,
 } from "./format";
 import { degradedBanner, loadErrorLabel } from "./labels";
@@ -67,11 +69,11 @@ interface DetailState {
   monitors: MonitorInfo[];
   sessions: SessionSummary[];
   sessionPaging: PagingState;
-  selectedSessionId: string | null;
+  selectedSessionKey: string | null;
   exchanges: ExchangeSummary[];
   exchangePaging: PagingState;
-  selectedExchangeId: string | null;
-  selectedEventId: string | null;
+  selectedExchangeKey: string | null;
+  selectedEventKey: string | null;
   search: SearchViewState;
   searchHits: SearchHit[];
   event: EventContent | null;
@@ -103,11 +105,11 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     monitors: [],
     sessions: [],
     sessionPaging: resetPaging(),
-    selectedSessionId: null,
+    selectedSessionKey: null,
     exchanges: [],
     exchangePaging: resetPaging(),
-    selectedExchangeId: null,
-    selectedEventId: null,
+    selectedExchangeKey: null,
+    selectedEventKey: null,
     search: createSearchState(),
     searchHits: [],
     event: null,
@@ -158,6 +160,13 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     nodes.widgetVisible.checked = state.status?.widgetVisible === true;
     nodes.launchAtLogin.checked = state.settings.launchAtLogin;
     nodes.selectLog.disabled = state.selectingLog;
+    renderSourceList(
+      nodes.sourceList,
+      nodes.sourceEmpty,
+      state.status?.sources ?? [],
+      state.selectingLog,
+      (path) => void removeSource(path),
+    );
     nodes.saveSettings.disabled = state.savingSettings;
     nodes.exit.disabled = state.exiting;
     if (!state.settingsDirty) {
@@ -169,8 +178,8 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     setText(nodes.sessionMeta, pageRangeLabel(state.sessionPaging));
     nodes.sessionPrev.disabled = !canGoPrevious(state.sessionPaging);
     nodes.sessionNext.disabled = !canGoNext(state.sessionPaging);
-    renderSessionList(nodes.sessionList, state.sessions, state.selectedSessionId, (sessionId) => {
-      void selectSession(sessionId);
+    renderSessionList(nodes.sessionList, state.sessions, state.selectedSessionKey, (sessionKey) => {
+      void selectSession(sessionKey);
     });
   };
 
@@ -191,13 +200,13 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
         state.searchHits.length === 0 ? searchSummary(state.search) : "",
       );
       nodes.middleEmpty.hidden = state.searchHits.length > 0;
-      renderSearchList(nodes.middleList, state.searchHits, state.selectedEventId, (hit) => {
+      renderSearchList(nodes.middleList, state.searchHits, state.selectedEventKey, (hit) => {
         void selectSearchHit(hit);
       });
       return;
     }
     nodes.middleList.setAttribute("role", "list");
-    if (!state.selectedSessionId) {
+    if (!state.selectedSessionKey) {
       setText(nodes.middleEmpty, "Select a session to load exchanges");
       nodes.middleEmpty.hidden = false;
       nodes.middleList.replaceChildren();
@@ -215,10 +224,10 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     renderExchangeList(
       nodes.middleList,
       state.exchanges,
-      state.selectedExchangeId,
-      state.selectedEventId,
-      (exchange, eventId) => {
-        void selectExchangeMessage(exchange, eventId);
+      state.selectedExchangeKey,
+      state.selectedEventKey,
+      (exchange, eventKey) => {
+        void selectExchangeMessage(exchange, eventKey);
       },
     );
     if (!searching) {
@@ -300,11 +309,11 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     sourceEpoch += 1;
     state.sessions = [];
     state.sessionPaging = resetPaging();
-    state.selectedSessionId = null;
+    state.selectedSessionKey = null;
     state.exchanges = [];
     state.exchangePaging = resetPaging();
-    state.selectedExchangeId = null;
-    state.selectedEventId = null;
+    state.selectedExchangeKey = null;
+    state.selectedEventKey = null;
     state.search = createSearchState();
     state.searchHits = [];
     nodes.searchInput.value = "";
@@ -336,17 +345,17 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   };
 
   const loadExchanges = async (): Promise<void> => {
-    if (!state.selectedSessionId) {
+    if (!state.selectedSessionKey) {
       state.exchanges = [];
       state.exchangePaging = resetPaging();
       return;
     }
-    const sessionId = state.selectedSessionId;
+    const sessionKey = state.selectedSessionKey;
     const token = ++exchangeLoad;
     const epoch = sourceEpoch;
     try {
       const page = await api.listExchanges(
-        sessionId,
+        sessionKey,
         state.exchangePaging.cursor,
         state.exchangePaging.limit,
       );
@@ -354,7 +363,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
         !alive ||
         token !== exchangeLoad ||
         epoch !== sourceEpoch ||
-        state.selectedSessionId !== sessionId
+        state.selectedSessionKey !== sessionKey
       ) {
         return;
       }
@@ -450,9 +459,9 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       return;
     }
     state.event = applied.event;
-    state.selectedEventId = applied.event.eventId;
-    state.selectedSessionId = applied.event.sessionId;
-    state.selectedExchangeId = applied.event.exchangeId;
+    state.selectedEventKey = applied.event.eventKey;
+    state.selectedSessionKey = applied.event.sessionKey;
+    state.selectedExchangeKey = applied.event.exchangeKey;
     state.eventLoading = false;
     state.eventError = null;
   };
@@ -510,22 +519,22 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     }
   };
 
-  const loadEvent = async (eventId: string): Promise<void> => {
-    state.selectedEventId = eventId;
+  const loadEvent = async (eventKey: string): Promise<void> => {
+    state.selectedEventKey = eventKey;
     state.eventLoading = true;
     state.eventError = null;
     paintEvent();
     paintMiddle();
     try {
-      const content = await api.getEventContent(eventId);
-      if (!alive || state.selectedEventId !== eventId) {
+      const content = await api.getEventContent(eventKey);
+      if (!alive || state.selectedEventKey !== eventKey) {
         return;
       }
       state.event = content;
       state.eventLoading = false;
       state.eventError = content ? null : "Event content is unavailable";
     } catch {
-      if (!alive || state.selectedEventId !== eventId) {
+      if (!alive || state.selectedEventKey !== eventKey) {
         return;
       }
       state.event = null;
@@ -535,12 +544,12 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     paintEvent();
   };
 
-  const selectSession = async (sessionId: string): Promise<void> => {
-    state.selectedSessionId = sessionId;
+  const selectSession = async (sessionKey: string): Promise<void> => {
+    state.selectedSessionKey = sessionKey;
     state.exchangePaging = resetPaging();
-    state.selectedExchangeId = null;
+    state.selectedExchangeKey = null;
     if (!isSearchActive(state.search.query)) {
-      state.selectedEventId = null;
+      state.selectedEventKey = null;
       state.event = null;
       state.eventError = null;
     }
@@ -550,18 +559,18 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
 
   const selectExchangeMessage = async (
     exchange: ExchangeSummary,
-    eventId: string,
+    eventKey: string,
   ): Promise<void> => {
-    state.selectedSessionId = exchange.sessionId;
-    state.selectedExchangeId = exchange.exchangeId;
-    await loadEvent(eventId);
+    state.selectedSessionKey = exchange.sessionKey;
+    state.selectedExchangeKey = exchange.exchangeKey;
+    await loadEvent(eventKey);
     paint();
   };
 
   const selectSearchHit = async (hit: SearchHit): Promise<void> => {
-    state.selectedSessionId = hit.sessionId;
-    state.selectedExchangeId = hit.exchangeId;
-    await loadEvent(hit.eventId);
+    state.selectedSessionKey = hit.sessionKey;
+    state.selectedExchangeKey = hit.exchangeKey;
+    await loadEvent(hit.eventKey);
     paint();
   };
 
@@ -584,6 +593,36 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       }
     }
     return plan;
+  };
+
+  const removeSource = async (path: string): Promise<void> => {
+    if (state.selectingLog) {
+      return;
+    }
+    state.selectingLog = true;
+    paintChrome();
+    try {
+      const status = await api.removeEventLog(path);
+      if (!alive) {
+        return;
+      }
+      state.settings = await api.getSettings();
+      if (!alive) {
+        return;
+      }
+      state.settingsDirty = false;
+      await applyStatus(status, "reset");
+      state.loadError = null;
+    } catch {
+      if (alive) {
+        state.loadError = loadErrorLabel("remove an event log");
+      }
+    } finally {
+      state.selectingLog = false;
+      if (alive) {
+        paint();
+      }
+    }
   };
 
   const bootstrap = async (): Promise<void> => {
@@ -696,7 +735,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
         await applyStatus(status, "reset");
       } catch {
         if (alive) {
-          state.loadError = loadErrorLabel("select an event log");
+          state.loadError = loadErrorLabel("add an event log");
         }
       } finally {
         state.selectingLog = false;
@@ -931,7 +970,7 @@ function buildDetailShell() {
   const title = el("h1", { className: "detail-title", text: "Parley Conversation Viewer" });
   const sourceLine = el("p", { className: "detail-source", id: "source-status" });
   const healthLine = el("p", { className: "detail-health" });
-  const selectLog = button("Select Log", "action", () => undefined, {
+  const selectLog = button("Add Log", "action", () => undefined, {
     "aria-describedby": "source-status",
   });
   const widgetVisible = el("input", {
@@ -1045,6 +1084,19 @@ function buildDetailShell() {
 
   const peerHealth = buildPeerHealthSection();
 
+  const sourceList = el("ul", {
+    className: "source-list",
+    attrs: { "aria-label": "Configured event logs" },
+  });
+  const sourceEmpty = el("p", { className: "panel-empty", text: "No event logs configured" });
+  const sourcesPanel = el("section", {
+    className: "panel panel-sources",
+    children: [
+      el("h2", { text: "Event log sources" }),
+      el("div", { className: "panel-body", children: [sourceEmpty, sourceList] }),
+    ],
+  });
+
   const diagnostics = el("p", { className: "diagnostics-text" });
   const diagnosticsPanel = el("section", {
     className: "panel",
@@ -1088,7 +1140,7 @@ function buildDetailShell() {
   });
   const footer = el("div", {
     className: "detail-footer",
-    children: [diagnosticsPanel, settingsPanel],
+    children: [sourcesPanel, diagnosticsPanel, settingsPanel],
   });
   const shell = el("div", {
     className: "detail-layout",
@@ -1121,6 +1173,8 @@ function buildDetailShell() {
     eventEmpty,
     eventBody,
     peerHealth,
+    sourceList,
+    sourceEmpty,
     diagnostics,
     monitor,
     corner,
@@ -1193,18 +1247,18 @@ function readSettingsForm(
 function renderSessionList(
   list: HTMLUListElement,
   sessions: SessionSummary[],
-  selectedId: string | null,
-  onSelect: (sessionId: string) => void,
+  selectedKey: string | null,
+  onSelect: (sessionKey: string) => void,
 ): void {
   const restoreFocus = list.contains(document.activeElement);
   list.replaceChildren();
   for (const session of sessions) {
-    const selected = session.sessionId === selectedId;
+    const selected = session.sessionKey === selectedKey;
     const item = el("li", {
       className: selected ? "record selected" : "record",
       attrs: {
         role: "option",
-        tabindex: selected || (selectedId == null && session === sessions[0]) ? "0" : "-1",
+        tabindex: selected || (selectedKey == null && session === sessions[0]) ? "0" : "-1",
         "aria-selected": selected ? "true" : "false",
       },
     });
@@ -1215,16 +1269,17 @@ function renderSessionList(
         className: "record-meta",
         text: `${formatRoute(session.latestSource, session.latestTarget)} \u00b7 ${session.exchangeCount} \u00b7 ${formatTimestamp(session.latestTimestampMs)}`,
       }),
+      el("p", { className: "record-source", text: session.sourcePath }),
       excerpt,
     );
     if (session.excerptExtracted) {
       item.append(el("p", { className: "record-flag", text: "Extracted task" }));
     }
-    item.addEventListener("click", () => onSelect(session.sessionId));
+    item.addEventListener("click", () => onSelect(session.sessionKey));
     item.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
-        onSelect(session.sessionId);
+        onSelect(session.sessionKey);
       }
     });
     list.append(item);
@@ -1238,30 +1293,31 @@ function renderSessionList(
 function renderExchangeList(
   list: HTMLUListElement,
   exchanges: ExchangeSummary[],
-  selectedExchangeId: string | null,
-  selectedEventId: string | null,
-  onSelect: (exchange: ExchangeSummary, eventId: string) => void,
+  selectedExchangeKey: string | null,
+  selectedEventKey: string | null,
+  onSelect: (exchange: ExchangeSummary, eventKey: string) => void,
 ): void {
   const restoreFocus = list.contains(document.activeElement);
   list.replaceChildren();
   for (const exchange of exchanges) {
     const presented = presentExchange(exchange);
-    const selected = exchange.exchangeId === selectedExchangeId;
+    const selected = exchange.exchangeKey === selectedExchangeKey;
     const item = el("li", {
       className: selected ? "record selected" : "record",
     });
     item.append(
       el("p", {
         className: "record-title",
-        text: formatTimestamp(exchange.timestampMs),
+        text: `${formatTimestamp(exchange.timestampMs)} \u00b7 ${exchange.exchangeId}`,
       }),
+      el("p", { className: "record-source", text: exchange.sourcePath }),
     );
     const request = presented.request;
     if (request) {
       const requestBtn = button(
         `${request.heading}${request.extractedLabel ? ` \u00b7 ${request.extractedLabel}` : ""} \u00b7 ${request.route}`,
-        selectedEventId === request.eventId ? "record-link selected" : "record-link",
-        () => onSelect(exchange, request.eventId),
+        selectedEventKey === request.eventKey ? "record-link selected" : "record-link",
+        () => onSelect(exchange, request.eventKey),
       );
       item.append(requestBtn, el("p", { className: "record-excerpt", text: request.excerpt }));
     }
@@ -1269,8 +1325,8 @@ function renderExchangeList(
     if (completion) {
       const completionBtn = button(
         `${completion.heading} \u00b7 ${completion.route}`,
-        selectedEventId === completion.eventId ? "record-link selected" : "record-link",
-        () => onSelect(exchange, completion.eventId),
+        selectedEventKey === completion.eventKey ? "record-link selected" : "record-link",
+        () => onSelect(exchange, completion.eventKey),
       );
       item.append(
         completionBtn,
@@ -1290,13 +1346,13 @@ function renderExchangeList(
 function renderSearchList(
   list: HTMLUListElement,
   hits: SearchHit[],
-  selectedEventId: string | null,
+  selectedEventKey: string | null,
   onSelect: (hit: SearchHit) => void,
 ): void {
   const restoreFocus = list.contains(document.activeElement);
   list.replaceChildren();
   for (const hit of hits) {
-    const selected = hit.eventId === selectedEventId;
+    const selected = hit.eventKey === selectedEventKey;
     const item = el("li", {
       className: selected ? "record selected" : "record",
       attrs: {
@@ -1314,6 +1370,7 @@ function renderSearchList(
         className: "record-meta",
         text: `${hit.sessionId} \u00b7 match offset ${Math.trunc(hit.matchOffset)}`,
       }),
+      el("p", { className: "record-source", text: hit.sourcePath }),
       el("p", { className: "record-excerpt", text: hit.excerpt }),
     );
     item.addEventListener("click", () => onSelect(hit));
@@ -1339,6 +1396,7 @@ function renderEventMeta(dl: HTMLDListElement, event: EventContent): void {
     ["Timestamp", formatTimestamp(event.timestampMs)],
     ["Status", event.status],
     ["Duration", formatDuration(event.durationMs)],
+    ["Event log", event.sourcePath],
     ["Session", event.sessionId],
     ["Exchange", event.exchangeId],
     ["Event", event.eventId],
@@ -1347,8 +1405,56 @@ function renderEventMeta(dl: HTMLDListElement, event: EventContent): void {
   if (event.error) {
     rows.push(["Parley execution error", event.error]);
   }
+  if (event.context) {
+    rows.push(
+      ["Context source", event.context.source ?? "unknown"],
+      ["Context mode", event.context.mode ?? "unknown"],
+      [
+        "Context offsets",
+        `${event.context.fromOffset ?? "unknown"} \u2192 ${event.context.toOffset ?? "unknown"}`,
+      ],
+      ["Context records", event.context.recordCount?.toString() ?? "unknown"],
+      ["Context characters", event.context.characterCount?.toString() ?? "unknown"],
+      [
+        "Context truncated",
+        event.context.truncated == null ? "unknown" : event.context.truncated ? "yes" : "no",
+      ],
+    );
+    if (event.context.recovery) {
+      rows.push(["Context recovery", event.context.recovery]);
+    }
+  }
   for (const [label, value] of rows) {
     dl.append(el("dt", { text: label }), el("dd", { text: value }));
+  }
+}
+
+function renderSourceList(
+  list: HTMLUListElement,
+  empty: HTMLParagraphElement,
+  sources: SourceStatus[],
+  busy: boolean,
+  onRemove: (path: string) => void,
+): void {
+  list.replaceChildren();
+  empty.hidden = sources.length > 0;
+  for (const source of sources) {
+    const remove = button("Remove", "source-remove", () => onRemove(source.path));
+    remove.disabled = busy;
+    const alias = source.aliasOf ? " \u00b7 duplicate alias ignored" : "";
+    const item = el("li", {
+      className: "source-record",
+      children: [
+        el("p", { className: "source-path", text: source.path }),
+        el("p", {
+          className: "record-meta",
+          text: `${formatSourceState(source.sourceState)} \u00b7 ${source.sessionCount} sessions \u00b7 ${source.exchangeCount} exchanges${alias}`,
+        }),
+        el("p", { className: "source-diagnostics", text: formatDiagnostics(source.diagnostics) }),
+        remove,
+      ],
+    });
+    list.append(item);
   }
 }
 

@@ -27,11 +27,11 @@ pub fn list_sessions(state: State<'_, AppState>, cursor: Option<u64>, limit: usi
 #[tauri::command]
 pub fn list_exchanges(
     state: State<'_, AppState>,
-    session_id: String,
+    session_key: String,
     cursor: Option<u64>,
     limit: usize,
 ) -> ExchangePage {
-    state.engine.exchange_page(&session_id, cursor, limit)
+    state.engine.exchange_page(&session_key, cursor, limit)
 }
 
 #[tauri::command]
@@ -45,8 +45,8 @@ pub fn search_events(
 }
 
 #[tauri::command]
-pub fn get_event_content(state: State<'_, AppState>, event_id: String) -> Option<EventContent> {
-    state.engine.event_content(&event_id)
+pub fn get_event_content(state: State<'_, AppState>, event_key: String) -> Option<EventContent> {
+    state.engine.event_content(&event_key)
 }
 
 #[tauri::command]
@@ -117,7 +117,7 @@ pub async fn select_event_log<R: Runtime>(
         let path = selection
             .into_path()
             .map_err(|error| format!("selected event log is not a filesystem path: {error}"))?;
-        state.set_source(Some(path), true)?;
+        state.add_source(path, true)?;
     }
     Ok(state.status())
 }
@@ -127,7 +127,28 @@ pub fn set_event_log(
     state: State<'_, AppState>,
     path: Option<String>,
 ) -> Result<ViewerStatus, String> {
-    state.set_source(path.map(PathBuf::from), true)?;
+    state.set_sources(path.map(PathBuf::from).into_iter().collect(), true)?;
+    Ok(state.status())
+}
+
+#[tauri::command]
+pub fn set_event_logs(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<ViewerStatus, String> {
+    state.set_sources(paths.into_iter().map(PathBuf::from).collect(), true)?;
+    Ok(state.status())
+}
+
+#[tauri::command]
+pub fn add_event_log(state: State<'_, AppState>, path: String) -> Result<ViewerStatus, String> {
+    state.add_source(PathBuf::from(path), true)?;
+    Ok(state.status())
+}
+
+#[tauri::command]
+pub fn remove_event_log(state: State<'_, AppState>, path: String) -> Result<ViewerStatus, String> {
+    state.remove_source(PathBuf::from(path), true)?;
     Ok(state.status())
 }
 

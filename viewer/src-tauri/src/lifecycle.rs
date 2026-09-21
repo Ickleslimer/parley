@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_POPUP,
 };
 
-use crate::launch::{resolve_initial_source, LaunchOptions, SourceOrigin};
+use crate::launch::{resolve_initial_sources, LaunchOptions, SourceOrigin};
 use crate::peer_health;
 use crate::runtime::{
     calculate_placement, AppState, MonitorInfo, UnderlayAction, UnderlayState, WorkArea,
@@ -80,18 +80,18 @@ pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let saved_source = state.settings().viewer.selected_log;
+    let saved_sources = state.settings().viewer.selected_logs;
     let environment_source = env::var_os("PARLEY_EVENT_LOG");
-    let initial_source =
-        match resolve_initial_source(&launch, environment_source, saved_source.as_deref()) {
-            Ok(source) => source,
-            Err(error) => {
-                state.set_runtime_error(error);
-                resolve_initial_source(&launch, None, saved_source.as_deref())?
-            }
-        };
-    let persist_source = initial_source.origin == SourceOrigin::CommandLine;
-    if let Err(error) = state.set_source(initial_source.path, persist_source) {
+    let initial_sources = match resolve_initial_sources(&launch, environment_source, &saved_sources)
+    {
+        Ok(sources) => sources,
+        Err(error) => {
+            state.set_runtime_error(error);
+            resolve_initial_sources(&launch, None, &saved_sources)?
+        }
+    };
+    let persist_sources = initial_sources.origin == SourceOrigin::CommandLine;
+    if let Err(error) = state.set_sources(initial_sources.paths, persist_sources) {
         state.set_runtime_error(error);
     }
 
@@ -151,8 +151,8 @@ pub fn handle_second_instance<R: Runtime>(app: &AppHandle<R>, args: Vec<String>)
         exit_app(app);
         return;
     }
-    if let Some(path) = options.event_log.clone() {
-        if let Err(error) = state.set_source(Some(path), true) {
+    if !options.event_logs.is_empty() {
+        if let Err(error) = state.set_sources(options.event_logs.clone(), true) {
             state.set_runtime_error(error);
         }
     }
@@ -304,7 +304,7 @@ pub fn select_log_from_tray<R: Runtime>(app: &AppHandle<R>) {
             let state = picker_app.state::<AppState>();
             match selection.into_path() {
                 Ok(path) => {
-                    if let Err(error) = state.set_source(Some(path), true) {
+                    if let Err(error) = state.add_source(path, true) {
                         state.set_runtime_error(error);
                     }
                 }
@@ -343,7 +343,7 @@ fn create_tray(app: &App) -> tauri::Result<()> {
     let settings = app.state::<AppState>().settings().viewer;
     let (unread_count, muted) = peer_health::tray_state();
     let open = MenuItem::with_id(app, MENU_OPEN, "Open Transcript", true, None::<&str>)?;
-    let select = MenuItem::with_id(app, MENU_SELECT, "Select Log...", true, None::<&str>)?;
+    let select = MenuItem::with_id(app, MENU_SELECT, "Add Event Log...", true, None::<&str>)?;
     let widget_visible = CheckMenuItem::with_id(
         app,
         MENU_WIDGET,

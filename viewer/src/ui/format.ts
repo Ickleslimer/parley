@@ -88,6 +88,7 @@ export function formatDiagnostics(diagnostics: Diagnostics): string {
     `unsupported ${Math.trunc(diagnostics.unsupportedRecords)}`,
     `duplicates ${Math.trunc(diagnostics.duplicateEvents)}`,
     `I/O ${Math.trunc(diagnostics.ioErrors)}`,
+    `aliases ${Math.trunc(diagnostics.aliasCollisions)}`,
   ];
   if (diagnostics.lastError) {
     parts.push(`last error: ${diagnostics.lastError}`);
@@ -97,9 +98,9 @@ export function formatDiagnostics(diagnostics: Diagnostics): string {
 
 export function formatSourceLine(status: ViewerStatus): string {
   const base = formatSourceState(status.sourceState);
-  const path = status.sourcePath ? ` \u00b7 ${status.sourcePath}` : "";
+  const sources = ` \u00b7 ${formatCount(status.sources.length, "source")}`;
   const counts = ` \u00b7 ${formatCount(status.sessionCount, "session")} \u00b7 ${formatCount(status.exchangeCount, "exchange")}`;
-  return `${base}${path}${counts}`;
+  return `${base}${sources}${counts}`;
 }
 
 export function formatRuntimeHealth(status: ViewerStatus): string {

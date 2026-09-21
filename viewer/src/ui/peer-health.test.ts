@@ -34,9 +34,13 @@ import {
 } from "./peer-health";
 
 const event = (overrides: Partial<EventContent> = {}): EventContent => ({
+  eventKey: "key-evt-1",
+  exchangeKey: "key-ex-1",
+  sessionKey: "key-ses-1",
   eventId: "evt-1",
   exchangeId: "ex-1",
   sessionId: "ses-1",
+  sourcePath: "C:\\logs\\events.jsonl",
   eventType: "response",
   speaker: "grok",
   recipient: "codex",
@@ -45,6 +49,7 @@ const event = (overrides: Partial<EventContent> = {}): EventContent => ({
   durationMs: 12,
   error: null,
   content: "exact preserved Grok stdout",
+  context: null,
   ...overrides,
 });
 
@@ -288,6 +293,7 @@ describe("peer health actions", () => {
       label: "Latest undelivered Grok stdout",
       incidentId: "inc-u",
       exactUndelivered: true,
+      diagnostic: null,
     };
     const withIncident = snapshot({
       recentIncidents: [
@@ -310,6 +316,7 @@ describe("peer health actions", () => {
       label: "Latest preceding Grok reply",
       incidentId: "inc-1",
       exactUndelivered: false,
+      diagnostic: null,
     };
     const quotaApplied = applyOpenHandoff(
       quota,

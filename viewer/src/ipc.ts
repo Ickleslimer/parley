@@ -17,9 +17,9 @@ export interface ViewerApi {
   getStatus(): Promise<ViewerStatus>;
   getWidgetSnapshot(): Promise<WidgetSnapshot>;
   listSessions(cursor: number | null, limit: number): Promise<SessionPage>;
-  listExchanges(sessionId: string, cursor: number | null, limit: number): Promise<ExchangePage>;
+  listExchanges(sessionKey: string, cursor: number | null, limit: number): Promise<ExchangePage>;
   search(query: string, cursor: number | null, limit: number): Promise<SearchPage>;
-  getEventContent(eventId: string): Promise<EventContent | null>;
+  getEventContent(eventKey: string): Promise<EventContent | null>;
   getPeerHealth(): Promise<PeerHealthSnapshot>;
   acknowledgePeerIncident(incidentId: string): Promise<PeerHealthSnapshot>;
   setPeerHealthMuted(muted: boolean): Promise<PeerHealthSnapshot>;
@@ -30,6 +30,9 @@ export interface ViewerApi {
   listMonitors(): Promise<MonitorInfo[]>;
   selectEventLog(): Promise<ViewerStatus>;
   setEventLog(path: string | null): Promise<ViewerStatus>;
+  setEventLogs(paths: string[]): Promise<ViewerStatus>;
+  addEventLog(path: string): Promise<ViewerStatus>;
+  removeEventLog(path: string): Promise<ViewerStatus>;
   setWidgetVisible(visible: boolean): Promise<ViewerStatus>;
   setLaunchAtLogin(enabled: boolean): Promise<ViewerSettings>;
   showDetail(): Promise<void>;
@@ -41,12 +44,12 @@ export const viewerApi: ViewerApi = {
   getWidgetSnapshot: () => invoke<WidgetSnapshot>("get_widget_snapshot"),
   listSessions: (cursor, limit) =>
     invoke<SessionPage>("list_sessions", { cursor, limit }),
-  listExchanges: (sessionId, cursor, limit) =>
-    invoke<ExchangePage>("list_exchanges", { sessionId, cursor, limit }),
+  listExchanges: (sessionKey, cursor, limit) =>
+    invoke<ExchangePage>("list_exchanges", { sessionKey, cursor, limit }),
   search: (query, cursor, limit) =>
     invoke<SearchPage>("search_events", { query, cursor, limit }),
-  getEventContent: (eventId) =>
-    invoke<EventContent | null>("get_event_content", { eventId }),
+  getEventContent: (eventKey) =>
+    invoke<EventContent | null>("get_event_content", { eventKey }),
   getPeerHealth: () => invoke<PeerHealthSnapshot>("get_peer_health"),
   acknowledgePeerIncident: (incidentId) =>
     invoke<PeerHealthSnapshot>("acknowledge_peer_incident", { incidentId }),
@@ -59,6 +62,9 @@ export const viewerApi: ViewerApi = {
   listMonitors: () => invoke<MonitorInfo[]>("list_monitors"),
   selectEventLog: () => invoke<ViewerStatus>("select_event_log"),
   setEventLog: (path) => invoke<ViewerStatus>("set_event_log", { path }),
+  setEventLogs: (paths) => invoke<ViewerStatus>("set_event_logs", { paths }),
+  addEventLog: (path) => invoke<ViewerStatus>("add_event_log", { path }),
+  removeEventLog: (path) => invoke<ViewerStatus>("remove_event_log", { path }),
   setWidgetVisible: (visible) =>
     invoke<ViewerStatus>("set_widget_visible", { visible }),
   setLaunchAtLogin: (enabled) =>

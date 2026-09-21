@@ -93,7 +93,10 @@ export function dataRefreshPlan(
   if (!previous) {
     return "refresh";
   }
-  if (previous.generation !== current.generation || previous.sourcePath !== current.sourcePath) {
+  if (
+    previous.generation !== current.generation ||
+    sourceTopology(previous) !== sourceTopology(current)
+  ) {
     return "reset";
   }
   if (
@@ -106,4 +109,10 @@ export function dataRefreshPlan(
     return "refresh";
   }
   return "none";
+}
+
+function sourceTopology(status: ViewerStatus): string {
+  return status.sources
+    .map((source) => `${source.path}\u0000${source.identity}\u0000${source.generation}`)
+    .join("\u0001");
 }

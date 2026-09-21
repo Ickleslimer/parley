@@ -22,6 +22,20 @@ pub(crate) struct FileIdentity {
     file_index: u64,
 }
 
+pub(crate) fn path_identity(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    normalize_windows_path(&resolved)
+}
+
+pub(crate) fn normalize_windows_path(path: &Path) -> String {
+    let lossy = path.to_string_lossy();
+    let stripped = lossy
+        .strip_prefix(r"\\?\")
+        .or_else(|| lossy.strip_prefix("//?/"))
+        .unwrap_or(lossy.as_ref());
+    stripped.replace('/', "\\").to_ascii_lowercase()
+}
+
 impl FileIdentity {
     pub(crate) fn from_file(file: &File) -> io::Result<Self> {
         let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };

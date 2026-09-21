@@ -11,6 +11,7 @@ import {
 import { EXTRACTED_TASK_LABEL, PARLEY_ERROR_LABEL, PENDING_LABEL } from "./labels";
 
 const preview = (overrides: Partial<MessagePreview> = {}): MessagePreview => ({
+  eventKey: "key-event-1",
   eventId: "event-1",
   eventType: "request",
   speaker: "codex",
@@ -101,6 +102,8 @@ describe("exact excerpt presentation", () => {
 
   it("presents completion, pending, and Parley error states from the snapshot", () => {
     const pending: WidgetSnapshot = {
+      sessionKey: "key-s-1",
+      exchangeKey: "key-ex-3",
       sessionId: "s-1",
       exchangeId: "ex-3",
       request: preview({ excerpt: "waiting" }),
@@ -114,6 +117,8 @@ describe("exact excerpt presentation", () => {
     expect(pendingView.completionHeading).toBe(PENDING_LABEL);
 
     const failed: WidgetSnapshot = {
+      sessionKey: "key-s-1",
+      exchangeKey: "key-ex-2",
       sessionId: "s-1",
       exchangeId: "ex-2",
       request: preview({ excerpt: "second" }),

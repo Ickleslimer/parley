@@ -23,12 +23,12 @@ const diagnostics = (overrides: Partial<Diagnostics> = {}): Diagnostics => ({
   unsupportedRecords: 0,
   duplicateEvents: 0,
   ioErrors: 0,
+  aliasCollisions: 0,
   lastError: null,
   ...overrides,
 });
 
 const status = (overrides: Partial<ViewerStatus> = {}): ViewerStatus => ({
-  sourcePath: "C:\\\\logs\\\\events.jsonl",
   sourceState: "watching",
   generation: 1,
   bytesRead: 2048,
@@ -39,6 +39,20 @@ const status = (overrides: Partial<ViewerStatus> = {}): ViewerStatus => ({
   underlayState: "attached",
   widgetVisible: true,
   diagnostics: diagnostics(),
+  sources: [
+    {
+      path: "C:\\\\logs\\\\events.jsonl",
+      identity: "c:\\\\logs\\\\events.jsonl",
+      sourceState: "watching",
+      generation: 1,
+      bytesRead: 2048,
+      sessionCount: 2,
+      exchangeCount: 5,
+      lastEventTimestampMs: 1,
+      diagnostics: diagnostics(),
+      aliasOf: null,
+    },
+  ],
   ...overrides,
 });
 
@@ -70,13 +84,13 @@ describe("formatting", () => {
     expect(formatDuration(null)).toBe("No duration");
     expect(formatDuration(9)).toBe("9 ms");
     expect(formatDiagnostics(diagnostics({ malformedLines: 2, lastError: "disk" }))).toBe(
-      "malformed 2 \u00b7 oversized 0 \u00b7 unsupported 0 \u00b7 duplicates 0 \u00b7 I/O 0 \u00b7 last error: disk",
+      "malformed 2 \u00b7 oversized 0 \u00b7 unsupported 0 \u00b7 duplicates 0 \u00b7 I/O 0 \u00b7 aliases 0 \u00b7 last error: disk",
     );
   });
 
-  it("keeps source path and runtime health as escaped plain text", () => {
+  it("formats aggregate source counts and runtime health", () => {
     const watching = status();
-    expect(formatSourceLine(watching)).toContain("C:\\\\logs\\\\events.jsonl");
+    expect(formatSourceLine(watching)).toContain("1 source");
     expect(formatSourceLine(watching)).toContain("2 sessions");
     expect(formatRuntimeHealth(watching)).toBe(
       "Tray available \u00b7 Underlay attached \u00b7 Widget visible",

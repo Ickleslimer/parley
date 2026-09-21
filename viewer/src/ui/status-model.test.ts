@@ -6,6 +6,7 @@ import { EXTRACTED_TASK_LABEL, PARLEY_ERROR_LABEL, PENDING_LABEL } from "./label
 import { widgetModel } from "./status-model";
 
 const preview = (overrides: Partial<MessagePreview> = {}): MessagePreview => ({
+  eventKey: "key-req-1",
   eventId: "req-1",
   eventType: "request",
   speaker: "codex",
@@ -19,7 +20,6 @@ const preview = (overrides: Partial<MessagePreview> = {}): MessagePreview => ({
 });
 
 const status = (overrides: Partial<ViewerStatus> = {}): ViewerStatus => ({
-  sourcePath: "C:\\\\events.jsonl",
   sourceState: "watching",
   generation: 1,
   bytesRead: 100,
@@ -35,14 +35,39 @@ const status = (overrides: Partial<ViewerStatus> = {}): ViewerStatus => ({
     unsupportedRecords: 0,
     duplicateEvents: 0,
     ioErrors: 0,
+    aliasCollisions: 0,
     lastError: null,
   },
+  sources: [
+    {
+      path: "C:\\\\events.jsonl",
+      identity: "c:\\\\events.jsonl",
+      sourceState: "watching",
+      generation: 1,
+      bytesRead: 100,
+      sessionCount: 1,
+      exchangeCount: 1,
+      lastEventTimestampMs: 0,
+      diagnostics: {
+        malformedLines: 0,
+        oversizedLines: 0,
+        unsupportedRecords: 0,
+        duplicateEvents: 0,
+        ioErrors: 0,
+        aliasCollisions: 0,
+        lastError: null,
+      },
+      aliasOf: null,
+    },
+  ],
   ...overrides,
 });
 
 describe("widget model", () => {
   it("composes exact excerpts, extracted-task labeling, and pending text", () => {
     const snapshot: WidgetSnapshot = {
+      sessionKey: "key-s-1",
+      exchangeKey: "key-ex-1",
       sessionId: "s-1",
       exchangeId: "ex-1",
       request: preview(),
@@ -60,6 +85,8 @@ describe("widget model", () => {
 
   it("surfaces Parley errors, idle source labels, and tray degradation", () => {
     const snapshot: WidgetSnapshot = {
+      sessionKey: "key-s-1",
+      exchangeKey: "key-ex-2",
       sessionId: "s-1",
       exchangeId: "ex-2",
       request: preview({ excerpt: "second", excerptExtracted: false }),
@@ -84,8 +111,16 @@ describe("widget model", () => {
     expect(model.banner).toContain("underlay");
 
     const idle = widgetModel({
-      status: status({ sourceState: "missing", sourcePath: "C:\\\\gone.jsonl" }),
-      snapshot: { sessionId: null, exchangeId: null, request: null, completion: null, pendingLabel: null },
+      status: status({ sourceState: "missing" }),
+      snapshot: {
+        sessionKey: null,
+        exchangeKey: null,
+        sessionId: null,
+        exchangeId: null,
+        request: null,
+        completion: null,
+        pendingLabel: null,
+      },
       loadError: null,
     });
     expect(idle.idleLabel).toBe("Event log is missing");

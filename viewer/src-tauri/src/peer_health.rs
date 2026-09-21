@@ -11,7 +11,7 @@ use parley_health::schema::{
 };
 use serde::Serialize;
 
-use crate::event_engine::{EventContent, EventEngine, EventType};
+use crate::event_engine::{EventContent, EventEngine, EventType, IdMatch};
 
 const CONTROL_WAIT: Duration = Duration::from_millis(1_000);
 const CONTROL_POLL: Duration = Duration::from_millis(25);
@@ -105,6 +105,7 @@ pub struct HandoffSelection {
     pub label: String,
     pub incident_id: Option<String>,
     pub exact_undelivered: bool,
+    pub diagnostic: Option<String>,
 }
 
 impl From<QueryDocument> for PeerHealthSnapshot {
@@ -316,40 +317,140 @@ fn select_handoff(document: &QueryDocument, engine: &EventEngine) -> HandoffSele
             label: NO_HANDOFF_LABEL.to_string(),
             incident_id: None,
             exact_undelivered: false,
+            diagnostic: None,
         };
     };
     match incident.class {
-        ClosedClass::McpStdoutUndelivered => {
-            let event = incident
-                .event_id
-                .as_deref()
-                .and_then(|event_id| engine.event_content(event_id))
-                .filter(|event| event.event_type == EventType::Response)
-                .or_else(|| {
-                    incident
-                        .exchange_id
-                        .as_deref()
-                        .and_then(|exchange_id| engine.response_for_exchange(exchange_id))
-                });
-            HandoffSelection {
-                exact_undelivered: event.is_some(),
-                event,
+        ClosedClass::McpStdoutUndelivered => match match_undelivered_response(incident, engine) {
+            Err(diagnostic) => ambiguous_handoff(incident.incident_id.clone(), diagnostic),
+            Ok(Some(event)) => HandoffSelection {
+                exact_undelivered: true,
+                event: Some(event),
                 label: EXACT_RESPONSE_LABEL.to_string(),
                 incident_id: Some(incident.incident_id.clone()),
-            }
-        }
-        ClosedClass::QuotaExhausted => {
-            let event = engine
-                .latest_grok_response_before(incident.as_of_ms, incident.session_id.as_deref())
-                .or_else(|| engine.latest_grok_response_before(incident.as_of_ms, None));
-            HandoffSelection {
-                event,
-                label: QUOTA_CONTEXT_LABEL.to_string(),
-                incident_id: Some(incident.incident_id.clone()),
+                diagnostic: None,
+            },
+            Ok(None) => HandoffSelection {
                 exact_undelivered: false,
+                event: None,
+                label: EXACT_RESPONSE_LABEL.to_string(),
+                incident_id: Some(incident.incident_id.clone()),
+                diagnostic: None,
+            },
+        },
+        ClosedClass::QuotaExhausted => {
+            match engine.match_latest_grok_response_before(
+                incident.as_of_ms,
+                incident.session_id.as_deref(),
+            ) {
+                IdMatch::Ambiguous { diagnostic, .. } => {
+                    ambiguous_handoff(incident.incident_id.clone(), diagnostic)
+                }
+                IdMatch::Unique(event) => HandoffSelection {
+                    event: Some(event),
+                    label: QUOTA_CONTEXT_LABEL.to_string(),
+                    incident_id: Some(incident.incident_id.clone()),
+                    exact_undelivered: false,
+                    diagnostic: None,
+                },
+                IdMatch::None => HandoffSelection {
+                    event: None,
+                    label: QUOTA_CONTEXT_LABEL.to_string(),
+                    incident_id: Some(incident.incident_id.clone()),
+                    exact_undelivered: false,
+                    diagnostic: None,
+                },
             }
         }
         _ => unreachable!("handoff incidents are filtered to supported classes"),
+    }
+}
+
+fn match_undelivered_response(
+    incident: &IncidentView,
+    engine: &EventEngine,
+) -> Result<Option<EventContent>, String> {
+    let event_id = incident
+        .event_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let exchange_id = incident
+        .exchange_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let session_id = incident
+        .session_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
+
+    let event = match event_id {
+        Some(raw_id) => match engine.match_event_id(raw_id) {
+            IdMatch::Unique(event) if event.event_type == EventType::Response => Some(event),
+            IdMatch::Unique(_) => {
+                return Err(format!(
+                    "handoff event id '{raw_id}' did not identify a response; no selection made"
+                ))
+            }
+            IdMatch::Ambiguous { diagnostic, .. } => return Err(diagnostic),
+            IdMatch::None => {
+                return Err(format!(
+                    "handoff event id '{raw_id}' was not found; no selection made"
+                ))
+            }
+        },
+        None => None,
+    };
+    let exchange = match exchange_id {
+        Some(raw_id) => match engine.match_exchange_response(raw_id) {
+            IdMatch::Unique(event) => Some(event),
+            IdMatch::Ambiguous { diagnostic, .. } => return Err(diagnostic),
+            IdMatch::None => {
+                return Err(format!(
+                    "handoff exchange id '{raw_id}' was not found; no selection made"
+                ))
+            }
+        },
+        None => None,
+    };
+    if let (Some(by_event), Some(by_exchange)) = (&event, &exchange) {
+        if by_event.event_key != by_exchange.event_key {
+            return Err(
+                "handoff event and exchange identifiers resolved to different responses; no selection made"
+                    .to_string(),
+            );
+        }
+    }
+    let candidate = event.or(exchange);
+    if let Some(raw_id) = session_id {
+        let session_key = match engine.match_session_id(raw_id) {
+            IdMatch::Unique(session_key) => session_key,
+            IdMatch::Ambiguous { diagnostic, .. } => return Err(diagnostic),
+            IdMatch::None => {
+                return Err(format!(
+                    "handoff session id '{raw_id}' was not found; no selection made"
+                ))
+            }
+        };
+        if candidate
+            .as_ref()
+            .is_some_and(|event| event.session_key != session_key)
+        {
+            return Err(
+                "handoff session identifier did not match the response; no selection made"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(candidate)
+}
+
+fn ambiguous_handoff(incident_id: String, diagnostic: String) -> HandoffSelection {
+    HandoffSelection {
+        event: None,
+        label: diagnostic.clone(),
+        incident_id: Some(incident_id),
+        exact_undelivered: false,
+        diagnostic: Some(diagnostic),
     }
 }
 
@@ -477,5 +578,80 @@ mod tests {
         assert!(quota.label.contains("not proven undelivered"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn handoff_selection_fails_closed_on_cross_source_ambiguity_and_id_mismatch() {
+        let suffix = CONTROL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let first = std::env::temp_dir().join(format!(
+            "parley-viewer-handoff-a-{}-{suffix}.jsonl",
+            std::process::id()
+        ));
+        let second = std::env::temp_dir().join(format!(
+            "parley-viewer-handoff-b-{}-{suffix}.jsonl",
+            std::process::id()
+        ));
+        let first_body = [
+            response_line("event-a", "exchange-a", "shared-session", "reply-a", 10),
+            response_line(
+                "duplicate-event",
+                "duplicate-exchange-a",
+                "session-a",
+                "duplicate-a",
+                11,
+            ),
+        ]
+        .join("\n");
+        let second_body = [
+            response_line("event-b", "exchange-b", "shared-session", "reply-b", 12),
+            response_line(
+                "duplicate-event",
+                "duplicate-exchange-b",
+                "session-b",
+                "duplicate-b",
+                13,
+            ),
+        ]
+        .join("\n");
+        std::fs::write(&first, format!("{first_body}\n")).unwrap();
+        std::fs::write(&second, format!("{second_body}\n")).unwrap();
+        let engine = EventEngine::new();
+        engine
+            .set_sources(vec![first.clone(), second.clone()])
+            .unwrap();
+        engine.poll();
+
+        let mut duplicate = incident(ClosedClass::McpStdoutUndelivered, 20);
+        duplicate.event_id = Some("duplicate-event".to_string());
+        duplicate.exchange_id = None;
+        duplicate.session_id = None;
+        let selection = select_handoff(&document_with(duplicate), &engine);
+        assert!(selection.event.is_none());
+        assert!(selection.diagnostic.unwrap().contains("ambiguous event id"));
+
+        let mut mismatch = incident(ClosedClass::McpStdoutUndelivered, 21);
+        mismatch.event_id = Some("event-a".to_string());
+        mismatch.exchange_id = Some("exchange-b".to_string());
+        mismatch.session_id = None;
+        let selection = select_handoff(&document_with(mismatch), &engine);
+        assert!(selection.event.is_none());
+        assert!(selection
+            .diagnostic
+            .unwrap()
+            .contains("resolved to different responses"));
+
+        let mut session_collision = incident(ClosedClass::McpStdoutUndelivered, 22);
+        session_collision.event_id = Some("event-a".to_string());
+        session_collision.exchange_id = Some("exchange-a".to_string());
+        session_collision.session_id = Some("shared-session".to_string());
+        let selection = select_handoff(&document_with(session_collision), &engine);
+        assert!(selection.event.is_none());
+        assert!(selection
+            .diagnostic
+            .unwrap()
+            .contains("ambiguous session id"));
+
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 }

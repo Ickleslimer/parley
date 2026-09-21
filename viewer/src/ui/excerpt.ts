@@ -17,6 +17,7 @@ import { completionStatusLabel, isParleyError } from "./labels";
 export type MessageRole = "request" | "completion";
 
 export interface PresentedMessage {
+  eventKey: string;
   eventId: string;
   eventType: MessagePreview["eventType"];
   heading: string;
@@ -55,6 +56,7 @@ export function presentMessage(
         ? "Request"
         : "Completion";
   return {
+    eventKey: preview.eventKey,
     eventId: preview.eventId,
     eventType: preview.eventType,
     heading,
