@@ -616,12 +616,9 @@ impl Inner {
 
     fn match_session_id(&self, session_id: &str) -> IdMatch<String> {
         collect_match(
-            self.unique_sources().filter_map(|source| {
-                source
-                    .store
-                    .contains_session(session_id)
-                    .then(|| source.keys().session_key(session_id))
-            }),
+            self.unique_sources()
+                .filter(|source| source.store.contains_session(session_id))
+                .map(|source| source.keys().session_key(session_id)),
             session_id,
             "session",
         )
@@ -766,11 +763,11 @@ fn aggregate_state(states: &[SourceState]) -> SourceState {
     if states.is_empty() {
         return SourceState::None;
     }
-    if states.iter().any(|state| *state == SourceState::Degraded) {
+    if states.contains(&SourceState::Degraded) {
         return SourceState::Degraded;
     }
-    let watching = states.iter().any(|state| *state == SourceState::Watching);
-    let missing = states.iter().any(|state| *state == SourceState::Missing);
+    let watching = states.contains(&SourceState::Watching);
+    let missing = states.contains(&SourceState::Missing);
     if watching && missing {
         SourceState::Degraded
     } else if watching {
