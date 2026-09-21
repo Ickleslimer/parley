@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::harness::Invocation;
-use crate::jobs::{GrantKind as PlanGrantKind, LaneOwner, LanePlan, LaneRole};
+use crate::jobs::{GrantKind as PlanGrantKind, LaneGrant, LaneOwner, LanePlan, LaneRole};
 use crate::json::Json;
 use crate::lane_grants::{
     ChildRole, GrantDraft, GrantKind, GrantSet, PathGrant as StoredPathGrant,
@@ -33,6 +33,8 @@ pub(crate) struct GuardedSubagentLaunch {
     model: String,
     reasoning_effort: String,
     base_commit: String,
+    parent_cwd: PathBuf,
+    parent_writable_paths: Vec<StoredPathGrant>,
     protected_roots: Vec<PathBuf>,
     children: Vec<ChildSpec>,
 }
@@ -58,6 +60,12 @@ impl GuardedSubagentLaunch {
         let guarded = policy.guarded_subagents().ok_or_else(|| {
             "Grok child lanes require PARLEY_GROK_SUBAGENT_MODE=guarded".to_string()
         })?;
+        let parent = plan
+            .lanes
+            .iter()
+            .find(|lane| lane.owner == LaneOwner::GrokParent)
+            .ok_or_else(|| "guarded Grok launch has no parent lane".to_string())?;
+        let parent_writable_paths = stored_path_grants(parent)?;
         let writer_count = children
             .iter()
             .filter(|lane| lane.role == LaneRole::Writer)
@@ -88,22 +96,7 @@ impl GuardedSubagentLaunch {
                 LaneRole::Writer => ChildRole::Writer,
                 LaneRole::Reviewer => ChildRole::Reviewer,
             };
-            let writable_paths = lane
-                .writable_paths
-                .iter()
-                .map(|grant| {
-                    let path = grant.path.to_str().ok_or_else(|| {
-                        format!("lane {} contains a non-Unicode path grant", lane.lane_id)
-                    })?;
-                    Ok(StoredPathGrant {
-                        kind: match grant.kind {
-                            PlanGrantKind::File => GrantKind::File,
-                            PlanGrantKind::Tree => GrantKind::Tree,
-                        },
-                        path: path.to_string(),
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
+            let writable_paths = stored_path_grants(lane)?;
             specs.push(ChildSpec {
                 grant_id: format!("{job_id}-c{slot}"),
                 lane_id: lane.lane_id.clone(),
@@ -128,6 +121,8 @@ impl GuardedSubagentLaunch {
             model: guarded.model.clone(),
             reasoning_effort: guarded.reasoning_effort.clone(),
             base_commit: plan.base_commit.to_ascii_lowercase(),
+            parent_cwd: parent.cwd.clone(),
+            parent_writable_paths,
             protected_roots,
             children: specs,
         }))
@@ -166,17 +161,16 @@ impl GuardedSubagentLaunch {
             "--disallowed-tools".to_string(),
             PARENT_DENIES.to_string(),
         ];
+        append_permission_allows(
+            &mut immutable_arguments,
+            &self.parent_cwd,
+            &self.parent_writable_paths,
+        )?;
         for child in &self.children {
             if child.role != ChildRole::Writer {
                 continue;
             }
-            for grant in &child.writable_paths {
-                let pattern = permission_pattern(&child.cwd, grant)?;
-                for prefix in ["Edit", "Write"] {
-                    immutable_arguments.push("--allow".to_string());
-                    immutable_arguments.push(format!("{prefix}({pattern})"));
-                }
-            }
+            append_permission_allows(&mut immutable_arguments, &child.cwd, &child.writable_paths)?;
         }
         for root in &self.protected_roots {
             let pattern = permission_tree_pattern(root)?;
@@ -245,6 +239,39 @@ impl GuardedSubagentLaunch {
         }
         GrantSet::create(&self.state_dir, &drafts)
     }
+}
+
+fn stored_path_grants(lane: &LaneGrant) -> Result<Vec<StoredPathGrant>, String> {
+    lane.writable_paths
+        .iter()
+        .map(|grant| {
+            let path = grant.path.to_str().ok_or_else(|| {
+                format!("lane {} contains a non-Unicode path grant", lane.lane_id)
+            })?;
+            Ok(StoredPathGrant {
+                kind: match grant.kind {
+                    PlanGrantKind::File => GrantKind::File,
+                    PlanGrantKind::Tree => GrantKind::Tree,
+                },
+                path: path.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn append_permission_allows(
+    arguments: &mut Vec<String>,
+    cwd: &Path,
+    writable_paths: &[StoredPathGrant],
+) -> Result<(), String> {
+    for grant in writable_paths {
+        let pattern = permission_pattern(cwd, grant)?;
+        for prefix in ["Edit", "Write"] {
+            arguments.push("--allow".to_string());
+            arguments.push(format!("{prefix}({pattern})"));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn append_parent_contract(prompt: &mut String, plan: &LanePlan) {
@@ -444,6 +471,11 @@ mod tests {
             model: "grok-4.7".to_string(),
             reasoning_effort: "xhigh".to_string(),
             base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            parent_cwd: PathBuf::from(r"C:\repo\parent"),
+            parent_writable_paths: vec![StoredPathGrant {
+                kind: GrantKind::File,
+                path: "README.md".to_string(),
+            }],
             protected_roots: vec![PathBuf::from(r"C:\repo\integration")],
             children: Vec::new(),
         }
@@ -524,6 +556,14 @@ mod tests {
         });
         let mut invocation = Invocation::new("grok", vec!["--no-auto-update".to_string()]);
         launch.configure_invocation(&mut invocation).unwrap();
+        assert!(invocation
+            .args
+            .iter()
+            .any(|argument| argument == "Edit(C:/repo/parent/README.md)"));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|argument| argument == "Write(C:/repo/parent/README.md)"));
         assert!(invocation
             .args
             .iter()
