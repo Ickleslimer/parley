@@ -10,6 +10,7 @@ mod fuse;
 mod harness;
 mod health_report;
 mod installer;
+mod jobs;
 mod json;
 mod mcp;
 mod model;
