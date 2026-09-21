@@ -127,7 +127,7 @@ pub(crate) struct RuntimePolicy {
     grok_max_turns: Option<u64>,
     grok_denies: Vec<String>,
     grok_allows: Vec<String>,
-    grok_health_query_exe: Option<PathBuf>,
+    grok_health_query_command: Option<String>,
     grok_require_handoff_footer: bool,
     context_locked_source: Option<String>,
     context_locked_mode: Option<ContextMode>,
@@ -171,7 +171,7 @@ impl Default for RuntimePolicy {
             grok_max_turns: None,
             grok_denies: Vec::new(),
             grok_allows: Vec::new(),
-            grok_health_query_exe: None,
+            grok_health_query_command: None,
             grok_require_handoff_footer: false,
             context_locked_source: None,
             context_locked_mode: None,
@@ -259,6 +259,7 @@ impl RuntimePolicy {
             );
         }
         let mut grok_allows = Vec::new();
+        let mut grok_health_query_command = None;
         if let Some(query) = &grok_health_query_exe {
             if grok_locked_permission_mode.is_none() {
                 return Err(
@@ -266,7 +267,9 @@ impl RuntimePolicy {
                         .to_string(),
                 );
             }
-            grok_allows = add_health_tool_rules(query, &mut grok_denies);
+            let (allows, command) = add_health_tool_rules(query, &mut grok_denies)?;
+            grok_allows = allows;
+            grok_health_query_command = Some(command);
         }
 
         Ok(Self {
@@ -280,7 +283,7 @@ impl RuntimePolicy {
             grok_max_turns,
             grok_denies,
             grok_allows,
-            grok_health_query_exe,
+            grok_health_query_command,
             grok_require_handoff_footer,
             context_locked_source,
             context_locked_mode,
@@ -539,13 +542,14 @@ impl RuntimePolicy {
         if harness != "grok" || !self.grok_require_handoff_footer {
             return;
         }
-        let Some(query) = &self.grok_health_query_exe else {
+        let Some(query) = &self.grok_health_query_command else {
             return;
         };
         prompt.push_str("\n\nTWO CHAIRS LOCKED RESPONSE CONTRACT\n");
         prompt.push_str("The current user-authorized request explicitly permits executing only the exact peer-health query below.\n");
         prompt.push_str("Keep the normal final response self-contained. Immediately before finishing, invoke exactly this read-only command with no arguments, wrappers, redirects, or chaining:\n");
-        prompt.push_str(&format!("& \"{}\"\n", query.display()));
+        prompt.push_str(query);
+        prompt.push('\n');
         prompt.push_str("End the response with this exact field block, copying only current evidence from the query JSON:\n");
         prompt.push_str("TWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: <usage_sample|quota_exhausted|unavailable>\nincident_id: <id|none>\nas_of_ms: <integer|unknown>\n");
         prompt.push_str("Include event_id and exchange_id only when present. End with: continuity: not_authorized\n");
@@ -624,12 +628,12 @@ fn hardened_grok_denies() -> Vec<String> {
         .collect()
 }
 
-fn add_health_tool_rules(query: &Path, denies: &mut Vec<String>) -> Vec<String> {
-    let query_text = query.to_string_lossy();
-    let allows = vec![
-        format!("Bash(& \"{query_text}\")"),
-        format!("Bash(*{query_text}*)"),
-    ];
+fn add_health_tool_rules(
+    query: &Path,
+    denies: &mut Vec<String>,
+) -> Result<(Vec<String>, String), String> {
+    let command = powershell_direct_command(query)?;
+    let allows = vec![format!("Bash({command})")];
     if let Some(parent) = query.parent() {
         for writer in ["parley-health-supervisor.exe", "parley-health-hook.exe"] {
             denies.push(format!("Bash(*{}*)", parent.join(writer).to_string_lossy()));
@@ -637,7 +641,34 @@ fn add_health_tool_rules(query: &Path, denies: &mut Vec<String>) -> Vec<String> 
     }
     denies.push("Bash(*parley-health-supervisor.exe*)".to_string());
     denies.push("Bash(*parley-health-hook.exe*)".to_string());
-    allows
+    Ok((allows, command))
+}
+
+fn powershell_direct_command(path: &Path) -> Result<String, String> {
+    let original = path.to_string_lossy();
+    let text = if let Some(rest) = original.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = original.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        original.into_owned()
+    };
+    if text.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        return Err(
+            "PARLEY_GROK_HEALTH_QUERY_EXE contains an unsafe control character".to_string(),
+        );
+    }
+
+    let mut command = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '\\' | '/' | ':' | '.' | '_' | '-') {
+            command.push(ch);
+        } else {
+            command.push('`');
+            command.push(ch);
+        }
+    }
+    Ok(command)
 }
 
 fn is_uuid(value: &str) -> bool {
@@ -1022,18 +1053,15 @@ mod tests {
     fn health_query_rules_allow_only_query_and_deny_writer_images() {
         let query = PathBuf::from(r"C:\Program Files\Parley\health\parley-health-query.exe");
         let mut denies = hardened_grok_denies();
-        let allows = add_health_tool_rules(&query, &mut denies);
+        let (allows, command) = add_health_tool_rules(&query, &mut denies).unwrap();
 
         assert_eq!(
-            allows,
-            vec![
-                format!("Bash(& \"{}\")", query.to_string_lossy()),
-                format!("Bash(*{}*)", query.to_string_lossy()),
-            ]
+            command,
+            r"C:\Program` Files\Parley\health\parley-health-query.exe"
         );
+        assert_eq!(allows, vec![format!("Bash({command})")]);
         assert!(!allows[0].contains('*'));
-        assert!(allows[1].contains(&query.to_string_lossy().to_string()));
-        assert!(!allows[1].contains("*parley-health-query.exe*"));
+        assert!(!allows[0].contains("& \""));
         for writer in ["parley-health-supervisor.exe", "parley-health-hook.exe"] {
             assert!(denies.iter().any(|rule| rule.contains(writer)));
             assert!(denies.iter().any(|rule| {
@@ -1055,14 +1083,16 @@ mod tests {
     #[test]
     fn locked_handoff_contract_names_exact_query_and_never_applies_to_other_harnesses() {
         let query = PathBuf::from(r"C:\Parley Health\parley-health-query.exe");
+        let command = powershell_direct_command(&query).unwrap();
         let policy = RuntimePolicy {
-            grok_health_query_exe: Some(query.clone()),
+            grok_health_query_command: Some(command.clone()),
             grok_require_handoff_footer: true,
             ..RuntimePolicy::default()
         };
         let mut prompt = "task".to_string();
         policy.apply_handoff_contract("grok", &mut prompt);
-        assert!(prompt.contains(&format!("& \"{}\"", query.display())));
+        assert!(prompt.contains(&command));
+        assert!(!prompt.contains("& \""));
         assert!(prompt.contains("current user-authorized request explicitly permits"));
         assert!(prompt.contains("continuity: not_authorized"));
         assert!(prompt.contains("Stale or unavailable evidence never means the peer is down"));

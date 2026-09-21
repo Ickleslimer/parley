@@ -88,3 +88,16 @@ fn command_analysis_distinguishes_exact_names_from_prefix_lookalikes() {
     assert_eq!(sibling.health_binary, Some(HealthBinary::Query));
     assert!(!sibling.is_exact_query());
 }
+
+#[test]
+fn command_analysis_unescapes_powershell_direct_paths() {
+    let query = analyze_command(
+        r"C:\Program` Files\Parley` Conversation` Viewer\health\parley-health-query.exe",
+    );
+    assert_eq!(query.health_binary, Some(HealthBinary::Query));
+    assert_eq!(
+        query.executable_token.as_deref(),
+        Some(r"C:\Program Files\Parley Conversation Viewer\health\parley-health-query.exe")
+    );
+    assert!(query.is_exact_query());
+}

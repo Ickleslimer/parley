@@ -102,6 +102,28 @@ fn pretool_use_is_deny_only_and_silent_for_exact_in_scope_query() {
 }
 
 #[test]
+fn pretool_use_accepts_escaped_space_direct_query() {
+    let home = common::TempHome::new("pretool escaped space");
+    let root = home.paths.root.to_string_lossy().to_string();
+    let query_dir = home
+        .paths
+        .root
+        .join("Parley Conversation Viewer")
+        .join("health");
+    std::fs::create_dir_all(&query_dir).unwrap();
+    let query_path = query_dir.join("parley-health-query.exe");
+    std::fs::write(&query_path, b"query").unwrap();
+    let query = query_path.to_string_lossy().to_string();
+    let command = query.replace(' ', "` ");
+    let scope = common::scope_for(&root, &query);
+
+    assert_eq!(
+        decide_pretool_use(&pretool(&command, &root, &root), &scope),
+        HookDecision::Silent
+    );
+}
+
+#[test]
 fn out_of_scope_health_invocation_denies_unrelated_tools_noop() {
     let query = r"C:\Parley\parley-health-query.exe";
     let scope = common::scope_for(r"C:\repo", query);

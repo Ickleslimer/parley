@@ -148,8 +148,17 @@ pub fn tokenize(command: &str) -> Vec<String> {
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
+    let mut escaped = false;
     for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
         match ch {
+            '`' if !in_single => {
+                escaped = true;
+            }
             '\'' if !in_double => {
                 in_single = !in_single;
             }
@@ -163,6 +172,9 @@ pub fn tokenize(command: &str) -> Vec<String> {
             }
             _ => current.push(ch),
         }
+    }
+    if escaped {
+        current.push('`');
     }
     if !current.is_empty() {
         tokens.push(current);
@@ -194,6 +206,10 @@ fn scan_operators(command: &str) -> (bool, bool) {
     let mut i = 0;
     while i < chars.len() {
         let ch = chars[i];
+        if ch == '`' && !in_single {
+            i += if i + 1 < chars.len() { 2 } else { 1 };
+            continue;
+        }
         if ch == '\'' && !in_double {
             in_single = !in_single;
             i += 1;
