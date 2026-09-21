@@ -37,6 +37,19 @@ child results rather than inventing completion. The process tree exited cleanly
 and all three Grok worktrees remained unchanged. A focused catalog regression
 now requires `spawn_subagent` and rejects `Agent(...)` in the allowlist.
 
+A second guarded run started from commit
+`40f90b818e6eb2244c5cdb72555d332e464a5870` with job
+`7ab8dc90-727a-4ba5-8ecf-750b2e9c534f` and Grok session
+`0f3f941c-9168-4278-800e-354cdd88d359`. This evidence update occurred after
+that job reported `running`, while its contained parent process was live.
+
+That run also exited without child processes or lane writes. Its native
+`tool_definitions.json` proved that `spawn_subagent` was absent even though the
+literal internal name had been placed in `--tools`. Grok 1.0.40 expects the CLI
+alias `task` in the allowlist and then exposes the internal tool as
+`spawn_subagent`; no session on this machine exposes an internal `task` tool.
+The captured history contained no spawn call, and all Grok lanes stayed clean.
+
 ## Fail-closed startup evidence
 
 Two earlier development attempts never launched Grok:
