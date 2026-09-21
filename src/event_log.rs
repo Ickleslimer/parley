@@ -43,9 +43,16 @@ pub(crate) struct ExchangeReceipt {
 }
 
 impl ExchangeLog {
-    pub(crate) fn start(req: &AskRequest, prompt: &str) -> Result<Self, String> {
+    pub(crate) fn allocate_exchange_id() -> String {
+        new_id("exchange")
+    }
+
+    pub(crate) fn start_with_exchange_id(
+        req: &AskRequest,
+        prompt: &str,
+        exchange_id: String,
+    ) -> Result<Self, String> {
         let path = env::var_os("PARLEY_EVENT_LOG").map(PathBuf::from);
-        let exchange_id = new_id("exchange");
         let mut log = Self {
             path,
             exchange_id: exchange_id.clone(),

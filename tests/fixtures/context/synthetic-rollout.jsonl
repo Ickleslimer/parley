@@ -1,0 +1,18 @@
+{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"fixture-session-aaa","cwd":"C:\\synth"}}
+{"timestamp":"2026-01-01T00:00:01.000Z","type":"turn_context","payload":{"turn_id":"turn-1","cwd":"C:\\synth"}}
+{"timestamp":"2026-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg-u1","content":[{"type":"input_text","text":"SYNTH_USER_ALPHA"}]}}
+{"timestamp":"2026-01-01T00:00:03.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"text":"SYNTH_HIDDEN_REASONING"}]}}
+{"timestamp":"2026-01-01T00:00:04.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c1"}}
+{"timestamp":"2026-01-01T00:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"SYNTH_TOOL_ECHO"}}
+{"timestamp":"2026-01-01T00:00:06.000Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg-a1","phase":"commentary","content":[{"type":"output_text","text":"SYNTH_COMMENTARY_CHARLIE"}]}}
+{"timestamp":"2026-01-01T00:00:07.000Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg-a2","phase":"final_answer","content":[{"type":"output_text","text":"SYNTH_FINAL_DELTA"}]}}
+{"timestamp":"2026-01-01T00:00:08.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"SYNTH_DEV_HIDDEN"}]}}
+{"timestamp":"2026-01-01T00:00:09.000Z","type":"response_item","payload":{"type":"message","role":"system","content":[{"type":"input_text","text":"SYNTH_SYS_HIDDEN"}]}}
+{"timestamp":"2026-01-01T00:00:10.000Z","type":"compacted","payload":{"message":"SYNTH_COMPACTED"}}
+{"timestamp":"2026-01-01T00:00:11.000Z","type":"event_msg","payload":{"type":"user_message","message":"SYNTH_EVENT_HIDDEN"}}
+{"timestamp":"2026-01-01T00:00:12.000Z","type":"event_msg","payload":{"type":"environment_context","text":"SYNTH_ENV_ACCOUNT"}}
+{"timestamp":"2026-01-01T00:00:13.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<synthetic-permission-block>"}]}}
+{"timestamp":"2026-01-01T00:00:14.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for synthetic"}]}}
+{"timestamp":"2026-01-01T00:00:15.000Z","type":"turn_context","payload":{"turn_id":"turn-2"}}
+{"timestamp":"2026-01-01T00:00:16.000Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg-u2","content":[{"type":"input_text","text":"line1"},{"type":"input_text","text":"line2"}]}}
+{"timestamp":"2026-01-01T00:00:17.000Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg-a3","content":[{"type":"output_text","text":"café 😀"}]}}

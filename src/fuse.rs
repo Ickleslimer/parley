@@ -202,7 +202,7 @@ pub(crate) fn run_judge(
         resume_id: None,
         yolo,
         context: None,
-        max_context_chars: max_context,
+        max_context_chars: Some(max_context),
     };
     run_one(&req)
 }
@@ -250,7 +250,7 @@ fn build_requests(
                 resume_id: None,
                 yolo,
                 context: context.clone(),
-                max_context_chars: max_context,
+                max_context_chars: Some(max_context),
             };
             (label, req)
         })
@@ -322,7 +322,7 @@ fn dry_run(prompt: &str, panel: &[String], config: DryRunConfig<'_>) -> Result<(
         resume_id: None,
         yolo: config.yolo,
         context: None,
-        max_context_chars: config.max_context,
+        max_context_chars: Some(config.max_context),
     };
     println!(
         "# judge {judge} — dry run\n{}",
@@ -337,10 +337,16 @@ fn parse_context_spec(spec: &str) -> ContextRef {
         Some((harness, session)) => ContextRef {
             harness: harness.to_string(),
             session: session.to_string(),
+            mode: crate::context::ContextMode::Snapshot,
+            mode_explicit: false,
+            recovery: None,
         },
         None => ContextRef {
             harness: spec.to_string(),
             session: String::new(),
+            mode: crate::context::ContextMode::Snapshot,
+            mode_explicit: false,
+            recovery: None,
         },
     }
 }
@@ -381,11 +387,14 @@ mod tests {
         let ctx = Some(ContextRef {
             harness: "claude".into(),
             session: String::new(),
+            mode: crate::context::ContextMode::Snapshot,
+            mode_explicit: false,
+            recovery: None,
         });
         let panel = vec!["g".to_string(), "co".to_string()];
         let reqs = build_requests("design X", &panel, &ctx, &cwd(), 8_000, true);
         assert_eq!(reqs[0].1.harness, "gemini");
-        assert_eq!(reqs[0].1.max_context_chars, 8_000);
+        assert_eq!(reqs[0].1.max_context_chars, Some(8_000));
         assert!(reqs[0].1.context.is_some());
     }
 

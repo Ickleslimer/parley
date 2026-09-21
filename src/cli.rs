@@ -65,6 +65,8 @@ pub(crate) struct AskOptions {
     pub yolo: bool,
     /// `harness[:session]` of a transcript to inject as context.
     pub context_from: Option<String>,
+    pub context_mode: Option<String>,
+    pub context_recovery: Option<String>,
     pub max_context_chars: Option<usize>,
     pub dry_run: bool,
 }
@@ -429,6 +431,11 @@ Ask (agent-to-agent):
                                   Seed the call with your latest claude session here
   par ask -h cl --context-from co:<id> -p \"...\"
                                   Use a specific source session id as context
+  par ask -h gr --context-from co:<id> --context-mode auto --session-id <uuid> -p \"...\"
+                                  Seed a new Grok session with durable context state
+  par ask -h gr --context-from co:<id> --context-mode auto --resume-id <uuid> -p \"...\"
+                                  Resume with the exact delta after the committed cursor
+  --context-recovery replay|skip Recover an uncertain auto-resume explicitly
   par ask -h g -p \"...\" --max-context 8000 --dry-run
                                   Cap injected context; show the command, run nothing
   par ask -h gr -p \"...\" --no-yolo --permission-mode auto --reasoning-effort xhigh --session-id <uuid>
@@ -740,6 +747,12 @@ where
             "--context-from" | "--context" => {
                 options.context_from = Some(require_value(&mut args, "--context-from")?)
             }
+            "--context-mode" => {
+                options.context_mode = Some(require_value(&mut args, "--context-mode")?)
+            }
+            "--context-recovery" => {
+                options.context_recovery = Some(require_value(&mut args, "--context-recovery")?)
+            }
             "--max-context" => {
                 let raw = require_value(&mut args, "--max-context")?;
                 options.max_context_chars = Some(
@@ -761,6 +774,12 @@ where
             }
             _ if arg.starts_with("--context-from=") => {
                 options.context_from = Some(value_after_equals(&arg, "--context-from="))
+            }
+            _ if arg.starts_with("--context-mode=") => {
+                options.context_mode = Some(value_after_equals(&arg, "--context-mode="))
+            }
+            _ if arg.starts_with("--context-recovery=") => {
+                options.context_recovery = Some(value_after_equals(&arg, "--context-recovery="))
             }
             _ if arg.starts_with("--cwd=") => {
                 options.cwd = Some(value_after_equals(&arg, "--cwd="))
@@ -1154,6 +1173,38 @@ mod tests {
             Some("01a06582-d66e-7811-b0c9-0b0266e17903")
         );
         assert!(!options.yolo);
+    }
+
+    #[test]
+    fn parses_stateful_context_mode_and_recovery() {
+        let action = parse_args(
+            [
+                "ask",
+                "-h",
+                "grok",
+                "-p",
+                "review",
+                "--context-from",
+                "codex:source-session",
+                "--context-mode=auto",
+                "--context-recovery",
+                "replay",
+                "--resume-id",
+                "01a06582-d66e-7811-b0c9-0b0266e17903",
+            ]
+            .map(String::from),
+            defaults(),
+        )
+        .unwrap();
+        let CliAction::Ask(options) = action else {
+            panic!("expected ask action");
+        };
+        assert_eq!(
+            options.context_from.as_deref(),
+            Some("codex:source-session")
+        );
+        assert_eq!(options.context_mode.as_deref(), Some("auto"));
+        assert_eq!(options.context_recovery.as_deref(), Some("replay"));
     }
 
     #[test]

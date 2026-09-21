@@ -230,20 +230,9 @@ pub(crate) fn capture_invocation_timeout(
         command.current_dir(cwd);
     }
 
-    // No bounds set: the simple blocking path is enough and avoids the extra
-    // threads entirely.
-    if timeouts.overall.is_zero() && timeouts.idle.is_zero() {
-        let output = command
-            .output()
-            .map_err(|error| format!("failed to start {}: {error}", invocation.command))?;
-        return Ok(Captured {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            success: output.status.success(),
-            timed_out: false,
-        });
-    }
-
+    // Always spawn explicitly. This makes every returned `Err` definitive
+    // evidence that no child existed; wait/reap ambiguity is represented as a
+    // non-successful `Captured` result so stateful callers fail closed.
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {}: {error}", invocation.command))?;

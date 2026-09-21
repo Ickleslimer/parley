@@ -106,7 +106,7 @@ pub(crate) fn run_cli(options: ConverseOptions) -> Result<(), String> {
             resume_id: None,
             yolo: options.yolo,
             context: None,
-            max_context_chars: max_context,
+            max_context_chars: Some(max_context),
         };
 
         if options.dry_run {

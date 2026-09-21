@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::context::{ContextMode, ContextRecovery};
+
 const HARDENED_GROK_DENIES: &[&str] = &[
     "WebFetch",
     "WebSearch",
@@ -127,6 +129,9 @@ pub(crate) struct RuntimePolicy {
     grok_allows: Vec<String>,
     grok_health_query_exe: Option<PathBuf>,
     grok_require_handoff_footer: bool,
+    context_locked_source: Option<String>,
+    context_locked_mode: Option<ContextMode>,
+    context_require_explicit_session: bool,
 }
 
 pub(crate) struct PolicyRequest<'a> {
@@ -139,6 +144,18 @@ pub(crate) struct PolicyRequest<'a> {
     pub session_id: Option<&'a str>,
     pub resume_id: Option<&'a str>,
     pub passthrough: &'a [String],
+}
+
+pub(crate) struct ContextPolicyRequest<'a> {
+    pub target_harness: &'a str,
+    pub source_harness: &'a mut String,
+    pub source_session: &'a str,
+    pub mode: &'a mut ContextMode,
+    pub mode_explicit: bool,
+    pub recovery: Option<ContextRecovery>,
+    pub max_context_chars: Option<usize>,
+    pub session_id: Option<&'a str>,
+    pub resume_id: Option<&'a str>,
 }
 
 impl Default for RuntimePolicy {
@@ -156,6 +173,9 @@ impl Default for RuntimePolicy {
             grok_allows: Vec::new(),
             grok_health_query_exe: None,
             grok_require_handoff_footer: false,
+            context_locked_source: None,
+            context_locked_mode: None,
+            context_require_explicit_session: false,
         }
     }
 }
@@ -225,6 +245,13 @@ impl RuntimePolicy {
         };
         let grok_require_handoff_footer =
             env_bool("PARLEY_GROK_REQUIRE_HANDOFF_FOOTER")?.unwrap_or(false);
+        let context_locked_source =
+            env_nonempty("PARLEY_CONTEXT_LOCKED_SOURCE").map(|value| value.to_ascii_lowercase());
+        let context_locked_mode = env_nonempty("PARLEY_CONTEXT_LOCKED_MODE")
+            .map(|value| ContextMode::parse(&value))
+            .transpose()?;
+        let context_require_explicit_session =
+            env_bool("PARLEY_CONTEXT_REQUIRE_EXPLICIT_SESSION")?.unwrap_or(false);
         if grok_require_handoff_footer && grok_health_query_exe.is_none() {
             return Err(
                 "PARLEY_GROK_REQUIRE_HANDOFF_FOOTER requires PARLEY_GROK_HEALTH_QUERY_EXE"
@@ -255,6 +282,9 @@ impl RuntimePolicy {
             grok_allows,
             grok_health_query_exe,
             grok_require_handoff_footer,
+            context_locked_source,
+            context_locked_mode,
+            context_require_explicit_session,
         })
     }
 
@@ -395,6 +425,102 @@ impl RuntimePolicy {
             }
         }
         Ok(resolved)
+    }
+
+    pub(crate) fn apply_context(&self, request: ContextPolicyRequest<'_>) -> Result<(), String> {
+        let ContextPolicyRequest {
+            target_harness,
+            source_harness,
+            source_session,
+            mode,
+            mode_explicit,
+            recovery,
+            max_context_chars,
+            session_id,
+            resume_id,
+        } = request;
+        if let Some(locked) = &self.context_locked_source {
+            if !source_harness.is_empty() && source_harness != locked {
+                return Err(format!(
+                    "context source is locked to {locked}; requested {source_harness}"
+                ));
+            }
+            *source_harness = locked.clone();
+        }
+        if let Some(locked) = self.context_locked_mode {
+            if mode_explicit && *mode != locked {
+                return Err(format!(
+                    "context mode is locked to {}; requested {}",
+                    locked.as_str(),
+                    mode.as_str()
+                ));
+            }
+            if !mode_explicit {
+                *mode = locked;
+            }
+        }
+
+        if *mode == ContextMode::Snapshot {
+            if recovery.is_some() {
+                return Err("context recovery is only valid for uncertain auto resumes".to_string());
+            }
+            return Ok(());
+        }
+        if target_harness != "grok" {
+            return Err("stateful context modes are only supported for Grok".to_string());
+        }
+        if source_harness != "codex" {
+            return Err("stateful context modes require source harness codex".to_string());
+        }
+        if source_session.is_empty()
+            || source_session.eq_ignore_ascii_case("latest")
+            || source_session.eq_ignore_ascii_case("last")
+        {
+            return Err(
+                "stateful context requires an explicit Codex source session id".to_string(),
+            );
+        }
+        if max_context_chars.is_some() {
+            return Err("--max-context applies only to snapshot context mode".to_string());
+        }
+        if session_id.is_none() && resume_id.is_none() {
+            return Err(
+                "stateful context requires an explicit target session_id or resume_id".to_string(),
+            );
+        }
+        if self.context_require_explicit_session && (session_id.is_none() && resume_id.is_none()) {
+            return Err(
+                "context requires an explicit target session under PARLEY_CONTEXT_REQUIRE_EXPLICIT_SESSION"
+                    .to_string(),
+            );
+        }
+        match *mode {
+            ContextMode::Auto => {
+                if recovery.is_some() && resume_id.is_none() {
+                    return Err(
+                        "context recovery is only valid for an uncertain auto resume".to_string(),
+                    );
+                }
+            }
+            ContextMode::Seed => {
+                if session_id.is_none() || resume_id.is_some() {
+                    return Err("seed context mode requires session_id, not resume_id".to_string());
+                }
+                if recovery.is_some() {
+                    return Err("context recovery is only valid for auto resume".to_string());
+                }
+            }
+            ContextMode::Delta => {
+                if resume_id.is_none() || session_id.is_some() {
+                    return Err("delta context mode requires resume_id, not session_id".to_string());
+                }
+                if recovery.is_some() {
+                    return Err("context recovery is only valid for auto resume".to_string());
+                }
+            }
+            ContextMode::Snapshot => unreachable!(),
+        }
+        Ok(())
     }
 
     pub(crate) fn grok_denies(&self) -> &[String] {
@@ -745,6 +871,147 @@ mod tests {
             })
             .unwrap_err()
             .contains("require session_id or resume_id"));
+    }
+
+    #[test]
+    fn locked_context_policy_injects_omissions_and_rejects_conflicts() {
+        let policy = RuntimePolicy {
+            context_locked_source: Some("codex".to_string()),
+            context_locked_mode: Some(ContextMode::Auto),
+            context_require_explicit_session: true,
+            ..RuntimePolicy::default()
+        };
+        let mut source = String::new();
+        let mut mode = ContextMode::Snapshot;
+        policy
+            .apply_context(ContextPolicyRequest {
+                target_harness: "grok",
+                source_harness: &mut source,
+                source_session: "codex-session",
+                mode: &mut mode,
+                mode_explicit: false,
+                recovery: None,
+                max_context_chars: None,
+                session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903"),
+                resume_id: None,
+            })
+            .unwrap();
+        assert_eq!(source, "codex");
+        assert_eq!(mode, ContextMode::Auto);
+
+        let mut source = "claude".to_string();
+        let mut mode = ContextMode::Auto;
+        assert!(policy
+            .apply_context(ContextPolicyRequest {
+                target_harness: "grok",
+                source_harness: &mut source,
+                source_session: "codex-session",
+                mode: &mut mode,
+                mode_explicit: true,
+                recovery: None,
+                max_context_chars: None,
+                session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903"),
+                resume_id: None,
+            })
+            .unwrap_err()
+            .contains("source is locked"));
+
+        let mut source = "codex".to_string();
+        let mut mode = ContextMode::Snapshot;
+        assert!(policy
+            .apply_context(ContextPolicyRequest {
+                target_harness: "grok",
+                source_harness: &mut source,
+                source_session: "codex-session",
+                mode: &mut mode,
+                mode_explicit: true,
+                recovery: None,
+                max_context_chars: None,
+                session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903"),
+                resume_id: None,
+            })
+            .unwrap_err()
+            .contains("mode is locked"));
+    }
+
+    #[test]
+    fn stateful_context_policy_enforces_the_session_matrix() {
+        let policy = RuntimePolicy::default();
+        let cases = [
+            (
+                ContextMode::Seed,
+                None,
+                Some("resume"),
+                None,
+                "requires session_id",
+            ),
+            (
+                ContextMode::Delta,
+                Some("new"),
+                None,
+                None,
+                "requires resume_id",
+            ),
+            (
+                ContextMode::Auto,
+                Some("new"),
+                None,
+                Some(ContextRecovery::Replay),
+                "uncertain auto resume",
+            ),
+        ];
+        for (requested_mode, session_id, resume_id, recovery, expected) in cases {
+            let mut source = "codex".to_string();
+            let mut mode = requested_mode;
+            let error = policy
+                .apply_context(ContextPolicyRequest {
+                    target_harness: "grok",
+                    source_harness: &mut source,
+                    source_session: "source-session",
+                    mode: &mut mode,
+                    mode_explicit: true,
+                    recovery,
+                    max_context_chars: None,
+                    session_id,
+                    resume_id,
+                })
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let mut source = "codex".to_string();
+        let mut mode = ContextMode::Auto;
+        let error = policy
+            .apply_context(ContextPolicyRequest {
+                target_harness: "claude",
+                source_harness: &mut source,
+                source_session: "source-session",
+                mode: &mut mode,
+                mode_explicit: true,
+                recovery: None,
+                max_context_chars: None,
+                session_id: Some("new"),
+                resume_id: None,
+            })
+            .unwrap_err();
+        assert!(error.contains("only supported for Grok"));
+
+        let mut source = "codex".to_string();
+        let mut mode = ContextMode::Auto;
+        let error = policy
+            .apply_context(ContextPolicyRequest {
+                target_harness: "grok",
+                source_harness: &mut source,
+                source_session: "source-session",
+                mode: &mut mode,
+                mode_explicit: true,
+                recovery: None,
+                max_context_chars: Some(1_000),
+                session_id: Some("new"),
+                resume_id: None,
+            })
+            .unwrap_err();
+        assert!(error.contains("only to snapshot"));
     }
 
     #[test]

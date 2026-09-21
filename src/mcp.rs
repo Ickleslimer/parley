@@ -557,9 +557,38 @@ fn tools_list_result() -> Json {
                         obj(vec![
                             ("harness", str_prop("Source agent (claude, codex, grok, opencode, pi).")),
                             ("session", str_prop("Session id, or 'latest' / omitted for the newest in cwd.")),
+                            (
+                                "mode",
+                                obj(vec![
+                                    ("type", Json::Str("string".to_string())),
+                                    (
+                                        "enum",
+                                        Json::Array(
+                                            ["snapshot", "auto", "seed", "delta"]
+                                                .into_iter()
+                                                .map(|value| Json::Str(value.to_string()))
+                                                .collect(),
+                                        ),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "recovery",
+                                obj(vec![
+                                    ("type", Json::Str("string".to_string())),
+                                    (
+                                        "enum",
+                                        Json::Array(
+                                            ["replay", "skip"]
+                                                .into_iter()
+                                                .map(|value| Json::Str(value.to_string()))
+                                                .collect(),
+                                        ),
+                                    ),
+                                ]),
+                            ),
                         ]),
                     ),
-                    ("required", Json::Array(vec![Json::Str("harness".to_string())])),
                 ]),
             ),
         ]),
@@ -671,16 +700,7 @@ fn call_tool(
                 .get("prompt")
                 .and_then(Json::as_str)
                 .ok_or((-32602, "missing prompt".to_string()))?;
-            let context = args.get("context_from").and_then(|c| {
-                c.get("harness").and_then(Json::as_str).map(|h| ContextRef {
-                    harness: h.to_string(),
-                    session: c
-                        .get("session")
-                        .and_then(Json::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                })
-            });
+            let context = parse_ask_context(args)?;
             let cwd = policy
                 .validate_spawn_cwd(&cwd)
                 .map_err(|error| (-32602, error))?;
@@ -688,6 +708,7 @@ fn call_tool(
                 .resolve_mcp_yolo(args.get("yolo").and_then(Json::as_bool))
                 .map_err(|error| (-32602, error))?;
             let max_turns = optional_positive_integer(args, "max_turns")?;
+            let max_context_chars = optional_positive_usize(args, "max_context_chars")?;
             let request = AskRequest {
                 harness: harness.to_string(),
                 prompt: prompt.to_string(),
@@ -716,11 +737,7 @@ fn call_tool(
                     .map(str::to_string),
                 yolo,
                 context,
-                max_context_chars: args
-                    .get("max_context_chars")
-                    .and_then(Json::as_number)
-                    .map(|n| n as usize)
-                    .unwrap_or(session::DEFAULT_CONTEXT_CHARS),
+                max_context_chars,
             };
             match ask::run_with_receipt(&request) {
                 Ok(outcome) => match outcome.captured.reply() {
@@ -777,6 +794,9 @@ fn call_tool(
                         .and_then(Json::as_str)
                         .unwrap_or("")
                         .to_string(),
+                    mode: crate::context::ContextMode::Snapshot,
+                    mode_explicit: false,
+                    recovery: None,
                 })
             });
             let max_context = args
@@ -841,6 +861,41 @@ fn is_logged_grok_response(receipt: &ExchangeReceipt) -> bool {
         && receipt.request.exchange_id == receipt.completion.exchange_id
 }
 
+fn parse_ask_context(args: &Json) -> Result<Option<ContextRef>, (i64, String)> {
+    let Some(context) = args.get("context_from") else {
+        return Ok(None);
+    };
+    if context.as_object().is_none() {
+        return Err((-32602, "context_from must be an object".to_string()));
+    }
+    let string_field = |name: &str| -> Result<Option<&str>, (i64, String)> {
+        match context.get(name) {
+            Some(value) => value
+                .as_str()
+                .map(Some)
+                .ok_or((-32602, format!("context_from.{name} must be a string"))),
+            None => Ok(None),
+        }
+    };
+    let mode_raw = string_field("mode")?;
+    let mode = mode_raw
+        .map(crate::context::ContextMode::parse)
+        .transpose()
+        .map_err(|error| (-32602, error))?
+        .unwrap_or_default();
+    let recovery = string_field("recovery")?
+        .map(crate::context::ContextRecovery::parse)
+        .transpose()
+        .map_err(|error| (-32602, error))?;
+    Ok(Some(ContextRef {
+        harness: string_field("harness")?.unwrap_or("").to_string(),
+        session: string_field("session")?.unwrap_or("").to_string(),
+        mode,
+        mode_explicit: mode_raw.is_some(),
+        recovery,
+    }))
+}
+
 fn optional_positive_integer(args: &Json, name: &str) -> Result<Option<String>, (i64, String)> {
     let Some(value) = args.get(name) else {
         return Ok(None);
@@ -852,6 +907,19 @@ fn optional_positive_integer(args: &Json, name: &str) -> Result<Option<String>, 
         return Err((-32602, format!("{name} must be a positive integer")));
     }
     Ok(Some((number as u64).to_string()))
+}
+
+fn optional_positive_usize(args: &Json, name: &str) -> Result<Option<usize>, (i64, String)> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let number = value
+        .as_number()
+        .ok_or((-32602, format!("{name} must be an integer")))?;
+    if number < 1.0 || number.fract() != 0.0 || number > usize::MAX as f64 {
+        return Err((-32602, format!("{name} must be a positive integer")));
+    }
+    Ok(Some(number as usize))
 }
 
 fn arg_cwd(args: &Json, default_cwd: &Path) -> PathBuf {
@@ -1135,6 +1203,61 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["low", "medium", "high", "xhigh"]
         );
+        let context = properties.get("context_from").unwrap();
+        let context_properties = context.get("properties").unwrap();
+        assert_eq!(
+            context_properties
+                .get("mode")
+                .and_then(|property| property.get("enum"))
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Json::as_str)
+                .collect::<Vec<_>>(),
+            vec!["snapshot", "auto", "seed", "delta"]
+        );
+        assert_eq!(
+            context_properties
+                .get("recovery")
+                .and_then(|property| property.get("enum"))
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Json::as_str)
+                .collect::<Vec<_>>(),
+            vec!["replay", "skip"]
+        );
+    }
+
+    #[test]
+    fn ask_context_parser_preserves_omissions_and_rejects_invalid_values() {
+        let omitted = Json::parse(r#"{"context_from":{"session":"source-1"}}"#).unwrap();
+        let context = parse_ask_context(&omitted).unwrap().unwrap();
+        assert!(context.harness.is_empty());
+        assert_eq!(context.session, "source-1");
+        assert_eq!(context.mode, crate::context::ContextMode::Snapshot);
+        assert!(!context.mode_explicit);
+
+        let explicit = Json::parse(
+            r#"{"context_from":{"harness":"codex","session":"source-1","mode":"auto","recovery":"skip"}}"#,
+        )
+        .unwrap();
+        let context = parse_ask_context(&explicit).unwrap().unwrap();
+        assert_eq!(context.mode, crate::context::ContextMode::Auto);
+        assert_eq!(
+            context.recovery,
+            Some(crate::context::ContextRecovery::Skip)
+        );
+        assert!(context.mode_explicit);
+
+        for bad in [
+            r#"{"context_from":{"mode":"rolling"}}"#,
+            r#"{"context_from":{"recovery":"guess"}}"#,
+            r#"{"context_from":"codex:source-1"}"#,
+        ] {
+            let args = Json::parse(bad).unwrap();
+            assert!(parse_ask_context(&args).is_err());
+        }
     }
 
     #[test]

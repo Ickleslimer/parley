@@ -1,6 +1,7 @@
 mod ask;
 mod cli;
 mod config;
+mod context;
 mod converse;
 mod convert;
 mod event_log;
