@@ -15,8 +15,7 @@ use crate::policy::RuntimePolicy;
 const PARENT_NAME: &str = "two-chairs-parent";
 const WRITER_NAME: &str = "two-chairs-writer";
 const REVIEWER_NAME: &str = "two-chairs-reviewer";
-const PARENT_TOOLS: &str = "read_file,list_dir,grep,search_replace,write,task,Agent(two-chairs-writer),Agent(two-chairs-reviewer),get_command_or_subagent_output,wait_commands_or_subagents";
-const PARENT_DENIES: &str = "run_terminal_cmd,run_terminal_command,web_search,web_fetch,search_tool,use_tool,workflow,send_subagent_message,scheduler_create,scheduler_delete,scheduler_list,monitor,kill_command_or_subagent,update_goal,todo_write,ask_user_question,enter_plan_mode,exit_plan_mode";
+const PARENT_DENIES: &str = "run_terminal_cmd,run_terminal_command,web_search,web_fetch,search_tool,use_tool,workflow,send_subagent_message,scheduler_create,scheduler_delete,scheduler_list,monitor,update_goal,todo_write,ask_user_question,enter_plan_mode,exit_plan_mode";
 
 #[derive(Clone, Debug)]
 struct ChildSpec {
@@ -173,8 +172,6 @@ impl GuardedSubagentLaunch {
             agent_definitions_json(),
             "--agent".to_string(),
             parent_profile.to_string(),
-            "--tools".to_string(),
-            PARENT_TOOLS.to_string(),
             "--disallowed-tools".to_string(),
             PARENT_DENIES.to_string(),
         ];
@@ -363,8 +360,8 @@ fn parent_agent_profile() -> String {
         "search_replace",
         "write",
         "task",
-        "Agent(two-chairs-writer)",
-        "Agent(two-chairs-reviewer)",
+        "Agent(two-chairs-writer, two-chairs-reviewer)",
+        "kill_command_or_subagent",
         "get_command_or_subagent_output",
         "wait_commands_or_subagents",
     ] {
@@ -568,8 +565,8 @@ mod tests {
         let profile = launch().parent_profile_contents();
         assert!(profile.starts_with("---\nname: two-chairs-parent\n"));
         assert!(profile.contains("  - \"task\"\n"));
-        assert!(profile.contains("  - \"Agent(two-chairs-writer)\"\n"));
-        assert!(profile.contains("  - \"Agent(two-chairs-reviewer)\"\n"));
+        assert!(profile.contains("  - \"Agent(two-chairs-writer, two-chairs-reviewer)\"\n"));
+        assert!(profile.contains("  - \"kill_command_or_subagent\"\n"));
         assert!(profile.contains("  - \"run_terminal_cmd\"\n"));
         assert!(profile.contains("injectDefaultTools: false\n"));
         assert!(profile.contains("mcpInheritance: none\n"));
@@ -599,18 +596,11 @@ mod tests {
             .args
             .windows(2)
             .any(|arguments| arguments == ["--agent", r"C:\Temp\parent.md"]));
+        assert!(!invocation.args.iter().any(|argument| argument == "--tools"));
         assert!(invocation
             .args
-            .iter()
-            .any(|argument| argument == PARENT_TOOLS));
-        assert!(PARENT_TOOLS
-            .split(',')
-            .any(|tool| tool == "Agent(two-chairs-writer)"));
-        assert!(PARENT_TOOLS
-            .split(',')
-            .any(|tool| tool == "Agent(two-chairs-reviewer)"));
-        assert!(PARENT_TOOLS.split(',').any(|tool| tool == "task"));
-        assert!(!PARENT_TOOLS.split(',').any(|tool| tool == "spawn_subagent"));
+            .windows(2)
+            .any(|arguments| arguments == ["--disallowed-tools", PARENT_DENIES]));
         assert_eq!(
             invocation.env.get("GROK_SUBAGENT_MODEL_INHERITANCE"),
             Some(&"1".to_string())
