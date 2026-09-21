@@ -1,7 +1,7 @@
 mod common;
 
 use parley_health::integration::{
-    configure_r3, hook_document, install_hooks, remove_hooks, HOOK_FILE_NAME,
+    allow_query_root, configure_r3, hook_document, install_hooks, remove_hooks, HOOK_FILE_NAME,
 };
 use parley_health::scope::ScopeFile;
 
@@ -84,4 +84,23 @@ fn configure_caches_r3_identity_and_installed_executable_identities() {
         .unwrap(),
         hook_document(&install.join("parley-health-hook.exe"))
     );
+}
+
+#[test]
+fn query_only_root_is_cached_without_expanding_r3_failure_scope() {
+    let home = common::TempHome::new("query-root");
+    let install = fake_install(&home);
+    let main = home.paths.root.join("r3");
+    let common_dir = main.join(".git");
+    let query_root = home.paths.root.join("parley-dev");
+    std::fs::create_dir_all(&common_dir).unwrap();
+    std::fs::create_dir_all(&query_root).unwrap();
+    let grok_home = home.paths.root.join("grok");
+
+    configure_r3(&home.paths, &common_dir, &main, &install, &grok_home).unwrap();
+    allow_query_root(&home.paths, &query_root).unwrap();
+    let scope = ScopeFile::load(&home.paths.scope()).unwrap();
+    let query_root = query_root.to_string_lossy();
+    assert!(scope.in_query_scope(Some(&query_root), Some(&query_root)));
+    assert!(!scope.in_scope(Some(&query_root), Some(&query_root)));
 }

@@ -33,6 +33,7 @@ pub fn configure_r3(
         git_common_dir: Some(git_common_dir.to_string_lossy().to_string()),
         main_root: Some(main_root.to_string_lossy().to_string()),
         worktree_roots: Vec::new(),
+        query_roots: Vec::new(),
         query_path: Some(query.to_string_lossy().to_string()),
         supervisor_path: Some(supervisor.to_string_lossy().to_string()),
         hook_path: Some(hook.to_string_lossy().to_string()),
@@ -40,6 +41,16 @@ pub fn configure_r3(
     scope.refresh_cached_roots();
     scope.save(&health_paths.scope())?;
     install_hooks(grok_home, &hook)
+}
+
+pub fn allow_query_root(health_paths: &HealthPaths, root: &Path) -> Result<(), HealthError> {
+    require_directory(root, "query-only root")?;
+    let mut scope = ScopeFile::load(&health_paths.scope())?;
+    scope.apply_update(ScopeUpdate {
+        query_roots: vec![root.to_string_lossy().to_string()],
+        ..ScopeUpdate::default()
+    });
+    scope.save(&health_paths.scope())
 }
 
 pub fn refresh_installation(

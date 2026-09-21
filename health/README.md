@@ -22,6 +22,7 @@ this directory as evidence.
 ```powershell
 parley-health-supervisor.exe
 parley-health-supervisor.exe --configure-r3 <git-common-dir> <main-root>
+parley-health-supervisor.exe --allow-query-root <root>
 parley-health-supervisor.exe --refresh-installation
 parley-health-supervisor.exe --remove-hooks
 parley-health-supervisor.exe --shutdown
@@ -29,6 +30,8 @@ parley-health-supervisor.exe --shutdown
 
 `--shutdown` signals the exact single-instance supervisor through a named
 current-user event. It does not enumerate or terminate unrelated processes.
+`--allow-query-root` adds only a root from which the exact installed read-only
+query may run; it does not admit `StopFailure` evidence from that repository.
 
 ## Evidence boundaries
 

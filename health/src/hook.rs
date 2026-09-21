@@ -115,7 +115,7 @@ pub fn decide_pretool_use(value: &Value, scope: &ScopeFile) -> HookDecision {
     let tool_name = string_field(value, &["tool_name", "toolName"]).unwrap_or_default();
     let cwd = string_field(value, &["cwd"]);
     let workspace = string_field(value, &["workspace_root", "workspaceRoot"]);
-    let in_scope = scope.in_scope(cwd.as_deref(), workspace.as_deref());
+    let in_query_scope = scope.in_query_scope(cwd.as_deref(), workspace.as_deref());
     let tool_input = value
         .get("tool_input")
         .or_else(|| value.get("toolInput"))
@@ -133,13 +133,13 @@ pub fn decide_pretool_use(value: &Value, scope: &ScopeFile) -> HookDecision {
     if !analysis.is_health_invocation() {
         return HookDecision::Silent;
     }
-    if !in_scope {
-        return HookDecision::Deny {
-            reason: "parley-health: deny out-of-scope",
-        };
-    }
     match analysis.health_binary {
         Some(HealthBinary::Query) => {
+            if !in_query_scope {
+                return HookDecision::Deny {
+                    reason: "parley-health: deny out-of-scope",
+                };
+            }
             if analysis.wrapper
                 || analysis.chaining
                 || analysis.redirect

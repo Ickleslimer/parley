@@ -38,11 +38,15 @@ fn run() -> Result<(), HealthError> {
         ),
         "--remove-hooks" if args.len() == 1 => integration::remove_hooks(&integration::grok_home())
             .map(|_| ()),
+        "--allow-query-root" if args.len() == 2 => integration::allow_query_root(
+            &HealthPaths::from_env(),
+            &PathBuf::from(&args[1]),
+        ),
         "--shutdown" if args.len() == 1 => parley_health::instance::signal_shutdown(
             parley_health::instance::SUPERVISOR_SHUTDOWN_EVENT,
         ),
         _ => Err(HealthError::msg(
-            "usage: parley-health-supervisor.exe [--configure-r3 <git-common-dir> <main-root> | --refresh-installation | --remove-hooks | --shutdown]",
+            "usage: parley-health-supervisor.exe [--configure-r3 <git-common-dir> <main-root> | --allow-query-root <root> | --refresh-installation | --remove-hooks | --shutdown]",
         )),
     }
 }

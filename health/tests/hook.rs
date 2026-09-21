@@ -124,6 +124,49 @@ fn out_of_scope_health_invocation_denies_unrelated_tools_noop() {
 }
 
 #[test]
+fn query_only_root_allows_exact_query_without_admitting_failure_scope() {
+    let home = common::TempHome::new("query-only-root");
+    let r3 = home.paths.root.join("r3");
+    let dev = home.paths.root.join("parley-dev");
+    std::fs::create_dir_all(&r3).unwrap();
+    std::fs::create_dir_all(&dev).unwrap();
+    let query = common::fake_query_exe(&home);
+    let mut scope = common::scope_for(&r3.to_string_lossy(), &query.to_string_lossy());
+    scope.query_roots = vec![parley_health::scope::normalize_windows_path(
+        &dev.to_string_lossy(),
+    )];
+
+    assert!(!scope.in_scope(Some(&dev.to_string_lossy()), Some(&dev.to_string_lossy())));
+    assert!(scope.in_query_scope(Some(&dev.to_string_lossy()), Some(&dev.to_string_lossy())));
+    assert_eq!(
+        decide_pretool_use(
+            &pretool(
+                &query.to_string_lossy(),
+                &dev.to_string_lossy(),
+                &dev.to_string_lossy()
+            ),
+            &scope
+        ),
+        HookDecision::Silent
+    );
+    assert!(matches!(
+        decide_pretool_use(
+            &pretool(
+                &home
+                    .paths
+                    .root
+                    .join("parley-health-supervisor.exe")
+                    .to_string_lossy(),
+                &dev.to_string_lossy(),
+                &dev.to_string_lossy()
+            ),
+            &scope
+        ),
+        HookDecision::Deny { .. }
+    ));
+}
+
+#[test]
 fn never_serializes_allow() {
     let query = r"C:\Parley\parley-health-query.exe";
     let scope = common::scope_for(r"C:\repo", query);

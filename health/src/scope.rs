@@ -19,6 +19,8 @@ pub struct ScopeFile {
     #[serde(default)]
     pub worktree_roots: Vec<String>,
     #[serde(default)]
+    pub query_roots: Vec<String>,
+    #[serde(default)]
     pub executables: HealthExecutables,
 }
 
@@ -58,6 +60,7 @@ pub struct ScopeUpdate {
     pub git_common_dir: Option<String>,
     pub main_root: Option<String>,
     pub worktree_roots: Vec<String>,
+    pub query_roots: Vec<String>,
     pub query_path: Option<String>,
     pub supervisor_path: Option<String>,
     pub hook_path: Option<String>,
@@ -71,6 +74,7 @@ impl ScopeFile {
             git_common_dir_identity: None,
             main_root: String::new(),
             worktree_roots: Vec::new(),
+            query_roots: Vec::new(),
             executables: HealthExecutables::default(),
         }
     }
@@ -125,6 +129,22 @@ impl ScopeFile {
         }
     }
 
+    pub fn in_query_scope(&self, cwd: Option<&str>, workspace_root: Option<&str>) -> bool {
+        let contains = |candidate: &str| {
+            self.contains_path(candidate)
+                || self
+                    .query_roots
+                    .iter()
+                    .any(|root| canonical_contains_existing(root, candidate))
+        };
+        match (cwd, workspace_root) {
+            (Some(cwd), Some(workspace)) => contains(cwd) && contains(workspace),
+            (Some(cwd), None) => contains(cwd),
+            (None, Some(workspace)) => contains(workspace),
+            (None, None) => false,
+        }
+    }
+
     pub fn executable(&self, binary: HealthBinary) -> Option<&ExecutableIdentity> {
         match binary {
             HealthBinary::Query => self.executables.query.as_ref(),
@@ -148,6 +168,9 @@ impl ScopeFile {
         for root in update.worktree_roots {
             push_unique(&mut self.worktree_roots, normalize_windows_path(&root));
         }
+        for root in update.query_roots {
+            push_unique(&mut self.query_roots, normalize_windows_path(&root));
+        }
         if let Some(path) = update.query_path {
             self.executables.query = Some(identity_for_path(&path));
         }
@@ -169,6 +192,7 @@ impl ScopeFile {
     }
 
     pub fn refresh_cached_roots(&mut self) {
+        self.query_roots.retain(|root| Path::new(root).is_dir());
         let Some(common) = self.git_common_dir.clone() else {
             self.worktree_roots.retain(|root| Path::new(root).is_dir());
             self.refresh_identities();
