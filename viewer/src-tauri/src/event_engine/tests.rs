@@ -976,6 +976,67 @@ fn aggregate_order_is_timestamp_then_configured_source_then_key() {
 }
 
 #[test]
+#[ignore = "requires explicit local read-only acceptance logs"]
+fn acceptance_reads_real_multi_logs_without_gui() {
+    let raw = std::env::var("PARLEY_VIEWER_ACCEPTANCE_LOGS_JSON")
+        .expect("PARLEY_VIEWER_ACCEPTANCE_LOGS_JSON must be a JSON path array");
+    let configured: Vec<PathBuf> = serde_json::from_str::<Vec<String>>(&raw)
+        .expect("acceptance log paths must be valid JSON")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    assert!(configured.len() >= 2);
+    assert!(configured
+        .iter()
+        .all(|path| path.is_absolute() && path.is_file()));
+
+    let expected_exchange = std::env::var("PARLEY_VIEWER_ACCEPTANCE_EXCHANGE")
+        .expect("PARLEY_VIEWER_ACCEPTANCE_EXCHANGE must name the globally newest exchange");
+    let expected_source = std::env::var("PARLEY_VIEWER_ACCEPTANCE_SOURCE")
+        .expect("PARLEY_VIEWER_ACCEPTANCE_SOURCE must name its configured log");
+    let engine = EventEngine::new();
+    engine.set_sources(configured.clone()).unwrap();
+    engine.poll();
+
+    let status = engine.status();
+    assert_eq!(status.sources.len(), configured.len());
+    assert!(status.sources.iter().all(|source| {
+        source.source_state == SourceState::Watching
+            && source.alias_of.is_none()
+            && source.bytes_read > 0
+    }));
+    let snapshot = engine.widget_snapshot();
+    assert_eq!(
+        snapshot.exchange_id.as_deref(),
+        Some(expected_exchange.as_str())
+    );
+    let completion = engine
+        .response_for_exchange(snapshot.exchange_key.as_deref().expect("exchange key"))
+        .expect("globally newest exchange completion");
+    let actual_source = fs::canonicalize(&completion.source_path).unwrap();
+    let expected_source = fs::canonicalize(&expected_source).unwrap();
+    assert!(actual_source
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected_source.to_string_lossy()));
+    assert_eq!(
+        status.last_event_timestamp_ms,
+        snapshot
+            .completion
+            .as_ref()
+            .or(snapshot.request.as_ref())
+            .map(|message| message.timestamp_ms)
+    );
+    eprintln!(
+        "sources={} sessions={} exchanges={} newest_exchange={} newest_source={}",
+        status.sources.len(),
+        status.session_count,
+        status.exchange_count,
+        expected_exchange,
+        completion.source_path
+    );
+}
+
+#[test]
 fn extracts_matching_context_marker_and_keeps_context_off_the_widget() {
     let log = TempLog::new("framed");
     let framed = format!(
