@@ -124,6 +124,31 @@ Focused regressions now require path-chain validation to skip only synthetic
 prefix/root components and permission rendering to strip only the extended
 Windows prefix while continuing to reject actual rule metacharacters.
 
+## Consequential diff review
+
+Grok 4.7/XHigh reviewed the consequential integrated result through the
+locked development profile. The first full-patch review ended with a provider
+HTTP 500 (`c743d23f-5b9e-4622-8676-a9c22ad51104`), and the next bounded tree
+review timed out without a complete reply
+(`55f0254d-3bc4-4ad6-82b9-fe4b2edb81a2`). Neither failure was retried
+automatically.
+
+A narrower security-delta review then completed under job
+`f14b2287-d259-46b0-aee8-03c5cf52ad23`, session
+`b1ac494f-c413-4ff2-8f9c-58c2100f0197`. It requested defense-in-depth child
+readiness validation at launch, whole-line terminal-result matching, clearer
+normal-path permission evidence, and an R3 charter clarification about lane
+checkpoint and integration timing. Commit
+`a0407b9e474454cedc7059239e1d846785746d08` closed those findings; commit
+`ab8e452aff59b3f4021536b4d67561e40f6ab82b` made the Windows extended-prefix
+assertion unambiguous with an ordinary escaped string. Root format, all tests,
+strict clippy, and release build passed after each commit.
+
+The same Grok session reviewed the final one-line delta and reported no
+remaining P0-P3 finding: **Milestone 5 accepted**. It independently retained
+the fail-closed native-child decision for Grok CLI 1.0.40 and accepted the
+guarded Codex plus Grok-parent topology with `--no-subagents`.
+
 ## Acceptance gates
 
 The candidate is accepted only when independent evidence confirms:
