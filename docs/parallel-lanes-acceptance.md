@@ -6,8 +6,10 @@ not a permission grant, and it does not replace the runtime lane manifest.
 ## Accepted topology
 
 - Integration is read-only while writer lanes are active.
-- One Codex writer, one Grok parent writer, and at most two Grok child writers
-  start from one immutable commit.
+- One Codex writer and one Grok parent writer start from one immutable commit.
+- Up to two Grok child writers are an optional ceiling, not a requirement.
+  Child-bearing plans remain disabled until the exact installed CLI passes the
+  typed-role capability and independent containment/permission canaries.
 - Every writer has a distinct Git worktree and non-overlapping file grants.
 - Grok children run at depth one with inherited locked model settings, no MCP,
   shell, web, workflow, memory, or recursive agent authority.
@@ -65,6 +67,48 @@ was also denied without writing. This proves the active parent must carry an
 immutable `Agent(two-chairs-writer,two-chairs-reviewer)` catalog rather than
 only receiving child definitions through `--agents`.
 
+## Capability decision and parent fallback
+
+The exact locked binary is `grok 1.0.40 (eb1a2256660d)`. Its live parent tool
+schema does not expose a typed role field or any equivalent inspectable child
+identity. Enabling write-capable native children would therefore require
+weakening the lane contract. Parley now defaults
+`PARLEY_GROK_SUBAGENT_TYPED_ROLES_READY` to false and rejects every
+child-bearing plan before request logging or spawn. Guarded two-lane plans
+remain available with native subagents forcibly disabled.
+
+Dogfood 7 exercised that parent-only route from commit
+`03d9e7f99870523e5f637106ba197fede2cd7d04` with job
+`32f0a181-6822-416c-b2c0-1a5fd4062d9f` and session
+`375470a3-f854-4304-8bef-f234124c84ec`. Codex committed its disjoint marker
+while the contained Grok process was live. Grok attempted only its granted
+file, but the canonical `\\?\` cwd did not match the normal drive path emitted
+by its file tool. Auto correctly denied the write. The CLI then exited zero
+with only progress text, exposing the need to validate terminal replies rather
+than treating every zero exit as successful.
+
+Commit `2e28c4de16d5115be851cd20212e1bcd550fb273` corrected both boundaries:
+parent spawns use the normalized equivalent cwd while policy retains canonical
+identities, and write jobs require the exact `TWO_CHAIRS_LANE_RESULT` block.
+
+Dogfood 8 validated the correction:
+
+- job: `c3a2b7bf-300d-44c1-a415-c57f4ec38e32`;
+- Grok session: `aaba8ecc-55d7-47dc-a0c8-908097fd635f`;
+- Codex checkpoint: `704d1053cc39c5f5326ec844ca7b72e91381ab35`;
+- Grok-parent checkpoint: `de00c937f532dff21d90959bd872c879a8490395`;
+- request/response exchange: `exchange-1790036485828-48564-1`;
+- exact parent change: `docs/m5-canary-parent.md` only;
+- native metadata: `grok-4.7`, `xhigh`;
+- result: valid lane-result block, valid health footer, no child, no orphaned
+  Parley or Grok process.
+
+Parley reported the job running at `2026-09-22T01:21:28+01:00`; the Codex
+marker was written at `01:21:52`; the Grok marker was created at `01:23:25`;
+and the contained job succeeded at `01:23:42`. Integration stayed clean at the
+recorded base throughout, proving overlapping isolated writers without sharing
+a worktree.
+
 ## Fail-closed startup evidence
 
 Two earlier development attempts never launched Grok:
@@ -85,10 +129,11 @@ Windows prefix while continuing to reject actual rule metacharacters.
 The candidate is accepted only when independent evidence confirms:
 
 - new and resumed native sessions report `grok-4.7` and `xhigh`;
-- parent and two child process intervals overlap the Codex write interval;
+- the active Grok writer process interval overlaps the Codex write interval;
 - each lane changes only its exact grant and all process trees exit;
-- child IDs, roles, worktrees, grants, results, and denials appear in the
-  parent report;
+- when native children are enabled in a future exact-version profile, their
+  IDs, roles, worktrees, grants, results, and denials appear in the parent
+  report and all child-specific adversarial gates pass first;
 - adversarial lane tests, root tests, clippy, and release builds pass;
 - timeout and cancellation terminate contained descendants exactly once;
 - hook operational, absent, crashing, and malformed-output canaries leave no

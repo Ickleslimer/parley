@@ -29,6 +29,7 @@ Parley is **first-class both ways** — a CLI you drive, and an MCP server your 
 | --- | --- | --- |
 | **Fuse** a panel into one answer | `par fuse "design a rate limiter"` | `fuse` tool |
 | **Ask** another agent, with context | `par ask -h g -p "…" --context-from cl` | `ask_agent` tool |
+| **Run** a contained background Grok job | — | `start_agent_job` · `get_agent_job` · `list_agent_jobs` · `cancel_agent_job` |
 | **Resume** any agent's session here | `par resume` | `list_sessions` · `get_last_session` · `resume_command` |
 | **Converse** — two agents, multi-turn | `par converse --a cl --b g -p "…"` | *(compose via `ask_agent`)* |
 | **Route** a prompt to any agent | `par -p "…" -h <agent>` | — |
@@ -436,14 +437,18 @@ par converse --a cl --b g -p "..." --a-model <m> --b-model <m> --dry-run
 
 Each turn spawns a full agent process, so cost and latency scale with `--turns`. The loop is two-party; `--until` is the way to end before the turn budget.
 
-## MCP — fuse, ask, and resume from inside your agent
+## MCP — fuse, ask, jobs, and resume from inside your agent
 
-`par mcp` runs a small [MCP](https://modelcontextprotocol.io) server over stdio (newline-delimited JSON-RPC 2.0), so any MCP-capable agent can **convene a panel and fuse it**, ask other agents questions, and resume sessions — all from inside the agent you're already in. This is how you say *"fuse this across Codex and Gemini"*, *"ask Gemini to review this with my Claude context"*, or *"pick up my last conversation from Claude"* without leaving your agent.
+`par mcp` runs a small [MCP](https://modelcontextprotocol.io) server over stdio (newline-delimited JSON-RPC 2.0), so any MCP-capable agent can **convene a panel and fuse it**, ask other agents questions, supervise opt-in background Grok jobs, and resume sessions — all from inside the agent you're already in. This is how you say *"fuse this across Codex and Gemini"*, *"ask Gemini to review this with my Claude context"*, or *"pick up my last conversation from Claude"* without leaving your agent.
 
 **Tools:**
 
 - **`fuse {prompt, panel?, judge?, judge_model?, cwd?, context_from?: {harness, session?}}`** — the collective-intelligence tool. Sends `prompt` to every agent in `panel` (default `claude,codex,gemini`) **in parallel**, then a judge agent (`judge`, default `claude`) synthesizes one answer — consensus as high-confidence, contradictions resolved, gaps filled, blind spots flagged — and returns it as text. `context_from` seeds every panelist with a prior session. Needs ≥2 panelists; ones whose CLI isn't installed are skipped with a note. (Same engine as the `par fuse` command.)
 - `ask_agent {harness, prompt, model?, reasoning_effort?, provider?, permission_mode?, max_turns?, session_id?, resume_id?, yolo?, cwd?, context_from?: {harness, session?, mode?, recovery?}}` — run another agent headless and return its reply, optionally seeded with a transcript or attached to a native session. Grok reasoning accepts `low`, `medium`, `high`, or `xhigh`. Context mode accepts `snapshot`, `auto`, `seed`, or `delta`; recovery accepts `replay` or `skip`. The runtime policy can lock model, reasoning, permissions, context source/mode, cap turns, require sessions, reject yolo, and constrain cwd.
+- `start_agent_job {job_id, job_mode, harness, prompt, ..., lane_plan?}` — start one idempotent contained Grok job. It returns only after preflight, request logging, durable running state, and successful spawn, or returns the exact terminal preflight result. Locked write plans declare distinct canonical worktrees and non-glob file/tree grants.
+- `get_agent_job {job_id}` — return one job's state, identifiers, diagnostics, and exact terminal reply or error.
+- `list_agent_jobs {limit?}` — return bounded newest-first metadata without reply bodies.
+- `cancel_agent_job {job_id}` — cancel one exact active job and its contained process tree without retrying it.
 - `list_sessions {cwd?, harness?}` — resumable sessions for a directory, newest first.
 - `get_last_session {cwd?, harness?}` — the most recent session plus a ready-to-run resume command.
 - `resume_command {harness, id, cwd?, yolo?}` — build the native resume command for a session id (text; never spawns an interactive agent).
@@ -656,6 +661,8 @@ A Homebrew tap can follow once artifact names are stable.
 **Opt-in peer health** — locked deployments may set `PARLEY_HEALTH_INBOX`, `PARLEY_GROK_HEALTH_QUERY_EXE`, and `PARLEY_GROK_REQUIRE_HANDOFF_FOOTER=true` to durably record sanitized transport outcomes and require a read-only Two Chairs handoff footer. Generic Parley behavior is unchanged when these variables are absent. The independent Windows package and its privacy/evidence boundaries are documented in [`health/README.md`](health/README.md).
 
 **Locked shared context** — `PARLEY_CONTEXT_LOCKED_SOURCE`, `PARLEY_CONTEXT_LOCKED_MODE`, and `PARLEY_CONTEXT_REQUIRE_EXPLICIT_SESSION` constrain stateful context independently of generic snapshot calls. `PARLEY_CODEX_HOME` selects the Codex rollout store, `PARLEY_CONTEXT_STATE_DIR` selects the sanitized cursor journal, and the seed/delta/hard character caps are controlled by `PARLEY_CONTEXT_SEED_MAX_CHARS`, `PARLEY_CONTEXT_DELTA_MAX_CHARS`, and `PARLEY_CONTEXT_HARD_MAX_CHARS`. Stateful requests and long Grok prompts use create-new, flushed prompt files with closed stdin; the exact child is reaped before deletion. Dry runs resolve and fingerprint context without writing journals, logs, or prompt files.
+
+**Opt-in asynchronous jobs and lanes** — `PARLEY_ASYNC_JOBS_ENABLED=true` requires an absolute `PARLEY_JOB_STATE_DIR`; locked profiles also require explicit UUIDs and `PARLEY_JOB_MAX_CONCURRENT=1`. Windows jobs use kill-on-close Job Objects and exact session/worktree leases. Guarded lane plans require `PARLEY_GROK_SUBAGENT_MODE=guarded`, a validated lane hook, and exact non-overlapping grants. Native child lanes additionally require `PARLEY_GROK_SUBAGENT_TYPED_ROLES_READY=true`; it defaults false, so an unvalidated CLI can use the guarded Grok-parent lane but cannot spawn writer children. Every locked synchronous call and every parent-only job keeps `--no-subagents`.
 
 **Event log** — when `PARLEY_EVENT_LOG` is set, every captured ask appends and flushes one schema-v1 JSON object for the request and one for the response/error. The fields are `schema_version`, `event_type`, `event_id`, `exchange_id`, `timestamp_ms`, `source`, `target`, `cwd`, `session_id`, `session_action`, `content`, `status`, `duration_ms`, and `error`. Prompt and reply content is verbatim and is not redacted, so protect the file accordingly. No separate environment dump, credential field, raw tool payload, or command-argument list is added. A request-log failure prevents launch; a completion-log failure returns a non-retriable error containing the captured result.
 

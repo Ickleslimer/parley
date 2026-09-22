@@ -18,6 +18,13 @@ A write `lane_plan` contains:
 - zero to two `grok_child` lanes;
 - a canonical worktree, role, and non-glob `file` or `tree` grants per lane.
 
+Child-bearing plans have an additional fail-closed capability gate. They are
+rejected unless `PARLEY_GROK_SUBAGENT_TYPED_ROLES_READY=true` and guarded mode
+is active. The flag defaults to false and may be enabled only after the exact
+installed Grok CLI exposes typed child roles and passes the independent tool,
+hook-failure, containment, and inheritance canaries. Two-lane plans containing
+only Codex and the Grok parent remain valid while this gate is closed.
+
 The same job UUID plus the same canonical request fingerprint is idempotent.
 The same UUID plus a different fingerprint is rejected. Start returns only
 after request logging, context and health preflight, durable `running` state,
@@ -63,6 +70,24 @@ Guarded mode injects only `two-chairs-writer` and `two-chairs-reviewer`.
 Children use pre-created worktrees with `isolation:none`, inherit the parent
 model and effort, receive no MCP servers, and cannot use shell, web, MCP, Task,
 or caller-supplied tool definitions. Depth is one and the child limit is two.
+
+Guarded configuration alone does not authorize a native child. With no child
+lane declared, Parley keeps `--no-subagents`, injects exact parent-lane
+`Edit(...)` and `Write(...)` rules, denies the integration and Codex worktree
+roots, and creates no child profile or grant state. On Windows, only the spawn
+cwd presentation strips the canonical `\\?\` prefix; canonical identities
+remain authoritative for policy and lease checks. Parent file tools receive
+both normalized absolute and worktree-relative rules.
+
+Every write job must finish with the exact block below. A missing, mismatched,
+or partial block is a non-retriable failed job even if Grok exits zero; captured
+stdout remains available in the terminal job result.
+
+```text
+TWO_CHAIRS_LANE_RESULT
+job_id: <caller UUID>
+status: completed
+```
 
 `parley-lane-hook.exe` reads create-new grants beneath the configured lane
 state root and validates role, cwd identity, path grants, model inheritance,
