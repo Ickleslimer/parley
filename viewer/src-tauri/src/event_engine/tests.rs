@@ -1039,9 +1039,7 @@ fn acceptance_reads_real_multi_logs_without_gui() {
 #[test]
 fn extracts_matching_context_marker_and_keeps_context_off_the_widget() {
     let log = TempLog::new("framed");
-    let framed = format!(
-        "=== PARLEY_UNTRUSTED_CONTEXT_V1 exchange=ex-frame ===\nsource: codex\nmode: seed\nfrom_offset: 4\nto_offset: 8\nrecord_count: 2\ncharacter_count: 16\ntruncated: true\nrecovery: skip\n=== BEGIN_UNTRUSTED_TRANSCRIPT ===\ntask: historical\n=== END_UNTRUSTED_TRANSCRIPT ===\n=== PARLEY_CURRENT_REQUEST_V1 exchange=ex-frame ===\npolicy:\n  task: Current framed task\n"
-    );
+    let framed = "=== PARLEY_UNTRUSTED_CONTEXT_V1 exchange=ex-frame ===\nsource: codex\nmode: seed\nfrom_offset: 4\nto_offset: 8\nrecord_count: 2\ncharacter_count: 16\ntruncated: true\nrecovery: skip\n=== BEGIN_UNTRUSTED_TRANSCRIPT ===\ntask: historical\n=== END_UNTRUSTED_TRANSCRIPT ===\n=== PARLEY_CURRENT_REQUEST_V1 exchange=ex-frame ===\npolicy:\n  task: Current framed task\n".to_string();
     write_lines(
         &log,
         &[event_line(
