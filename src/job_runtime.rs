@@ -674,6 +674,13 @@ impl AskSpawnObserver for JobObserver {
             .unwrap_or(defaults)
     }
 
+    fn temporary_file_max_age(&self, timeouts: Timeouts) -> Duration {
+        self.handoff
+            .as_ref()
+            .map(HandoffSession::temporary_file_max_age)
+            .unwrap_or_else(|| timeouts.overall.saturating_add(Duration::from_secs(300)))
+    }
+
     fn process_created(&self, _receipt: &AskSpawnReceipt) -> Result<(), String> {
         match &self.handoff {
             Some(handoff) => handoff.process_created(_receipt.process_id),
@@ -944,6 +951,16 @@ impl HandoffSession {
             overall: Duration::from_secs(self.config.execution_ceiling_secs),
             idle: Duration::ZERO,
         }
+    }
+
+    fn temporary_file_max_age(&self) -> Duration {
+        Duration::from_secs(
+            self.config
+                .execution_ceiling_secs
+                .saturating_add(self.config.acknowledgement_ceiling_secs)
+                .saturating_add(self.config.wait_slice_secs)
+                .saturating_add(300),
+        )
     }
 
     fn process_created(&self, process_id: u32) -> Result<(), String> {
@@ -2594,6 +2611,15 @@ mod tests {
             &Mutex::new(()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn acknowledgement_jobs_protect_temporary_files_for_full_wall_lifetime() {
+        let session = test_handoff_session("temporary-file-lifetime");
+        assert_eq!(
+            session.temporary_file_max_age(),
+            Duration::from_secs(43_800)
+        );
     }
 
     fn text_stream_record(text: &str) -> String {

@@ -94,6 +94,10 @@ pub(crate) trait AskSpawnObserver: Send + Sync {
         defaults
     }
 
+    fn temporary_file_max_age(&self, timeouts: Timeouts) -> Duration {
+        timeouts.overall.saturating_add(Duration::from_secs(300))
+    }
+
     fn process_created(&self, _receipt: &AskSpawnReceipt) -> Result<(), String> {
         Ok(())
     }
@@ -579,11 +583,11 @@ pub(crate) fn run_prepared_with_receipt_controlled(
         ));
     }
     let timeouts = observer.timeouts(Timeouts::from_env());
+    let temporary_file_max_age = observer.temporary_file_max_age(timeouts);
     let mut invocation_files = InvocationFiles::default();
     if let Some(guarded_launch) = guarded_launch {
         let profile_path = if guarded_launch.has_children() {
-            let max_age = timeouts.overall.saturating_add(Duration::from_secs(300));
-            if let Err(error) = cleanup_stale_agent_profile_files(max_age) {
+            if let Err(error) = cleanup_stale_agent_profile_files(temporary_file_max_age) {
                 return Err(preflight_failure(
                     req,
                     &resolved.text,
@@ -654,8 +658,7 @@ pub(crate) fn run_prepared_with_receipt_controlled(
         }
     }
     if should_use_prompt_file(req, &invocation, resolved.stateful.is_some()) {
-        let max_age = timeouts.overall.saturating_add(Duration::from_secs(300));
-        if let Err(error) = cleanup_stale_prompt_files(max_age) {
+        if let Err(error) = cleanup_stale_prompt_files(temporary_file_max_age) {
             let suffix = invocation_files
                 .cleanup()
                 .err()

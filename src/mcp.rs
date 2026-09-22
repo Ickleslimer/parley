@@ -84,7 +84,9 @@ pub(crate) fn run(_options: McpOptions) -> Result<(), String> {
                 continue;
             }
             let response = match Json::parse(trimmed) {
-                Ok(request) => handle_request_with_receipt(&request, &cwd, &policy, &jobs),
+                Ok(request) => {
+                    handle_request_with_receipt(&request, &cwd, &policy, &jobs, &reporter)
+                }
                 Err(_) => Some(HandledResponse {
                     json: error_response(&Json::Null, -32700, "parse error"),
                     delivery: None,
@@ -377,8 +379,14 @@ fn handle_request_with_policy(
     default_cwd: &Path,
     policy: &RuntimePolicy,
 ) -> Option<Json> {
-    handle_request_with_receipt(request, default_cwd, policy, &JobRuntime::disabled())
-        .map(|response| response.json)
+    handle_request_with_receipt(
+        request,
+        default_cwd,
+        policy,
+        &JobRuntime::disabled(),
+        &HealthReporter::disabled(),
+    )
+    .map(|response| response.json)
 }
 
 fn handle_request_with_receipt(
@@ -386,6 +394,7 @@ fn handle_request_with_receipt(
     default_cwd: &Path,
     policy: &RuntimePolicy,
     jobs: &JobRuntime,
+    reporter: &HealthReporter,
 ) -> Option<HandledResponse> {
     let method = request.get("method").and_then(Json::as_str).unwrap_or("");
     // Notifications carry no id and expect no reply.
@@ -395,7 +404,7 @@ fn handle_request_with_receipt(
     let result = match method {
         "initialize" => Ok(initialize_result()),
         "tools/list" => Ok(tools_list_result()),
-        "tools/call" => call_tool(request, default_cwd, policy, jobs, &mut delivery),
+        "tools/call" => call_tool(request, default_cwd, policy, jobs, reporter, &mut delivery),
         "ping" => Ok(obj(vec![])),
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -892,6 +901,7 @@ fn call_tool(
     default_cwd: &Path,
     policy: &RuntimePolicy,
     jobs: &JobRuntime,
+    reporter: &HealthReporter,
     delivery: &mut Option<ExchangeReceipt>,
 ) -> Result<Json, (i64, String)> {
     let params = request
@@ -1026,9 +1036,11 @@ fn call_tool(
             let job_id = required_arg_string(args, "job_id")?;
             let handoff_id = required_arg_string(args, "handoff_id")?;
             match jobs.acknowledge(&job_id, &handoff_id) {
-                Ok(lookup) => Ok(text_content(
-                    &job_runtime::lookup_json(&lookup, true).to_pretty_string(),
-                    false,
+                Ok(lookup) => Ok(acknowledged_handoff_content(
+                    &lookup,
+                    reporter,
+                    &job_id,
+                    &handoff_id,
                 )),
                 Err(error) => Ok(text_content(&error, true)),
             }
@@ -1148,6 +1160,48 @@ fn call_tool(
             }
         }
         other => Err((-32602, format!("unknown tool: {other}"))),
+    }
+}
+
+fn acknowledged_handoff_content(
+    lookup: &job_runtime::JobLookup,
+    reporter: &HealthReporter,
+    job_id: &str,
+    requested_handoff_id: &str,
+) -> Json {
+    let Some(handoff) = lookup.handoff.as_ref() else {
+        return text_content(
+            &format!(
+                "handoff receipt is durable, but its evidence could not be reloaded; do not retry automatically: job {job_id} handoff {requested_handoff_id}"
+            ),
+            true,
+        );
+    };
+    let Some(receipt_at_ms) = handoff.receipt_at_ms else {
+        return text_content(
+            &format!(
+                "handoff receipt is durable, but its timestamp could not be reloaded; do not retry automatically: job {job_id} handoff {requested_handoff_id}"
+            ),
+            true,
+        );
+    };
+    match reporter.handoff_received(
+        job_id,
+        &handoff.handoff_id,
+        handoff.alert_incident_id.as_deref(),
+        lookup.view.session_id.as_deref(),
+        receipt_at_ms,
+    ) {
+        Ok(()) => text_content(
+            &job_runtime::lookup_json(lookup, true).to_pretty_string(),
+            false,
+        ),
+        Err(error) => text_content(
+            &format!(
+                "handoff receipt is durable, but health receipt reporting failed; do not retry automatically: {error}; job {job_id} handoff {requested_handoff_id} remains acknowledged"
+            ),
+            true,
+        ),
     }
 }
 
@@ -1367,6 +1421,7 @@ fn obj(pairs: Vec<(&str, Json)>) -> Json {
 mod tests {
     use super::*;
     use crate::event_log::EventReceipt;
+    use crate::jobs::{JobState, JobView};
     use std::io::ErrorKind;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1445,6 +1500,34 @@ mod tests {
         }
     }
 
+    fn acknowledged_lookup() -> job_runtime::JobLookup {
+        job_runtime::JobLookup {
+            view: JobView {
+                job_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                state: JobState::Running,
+                exchange_id: Some("exchange-1".to_string()),
+                session_id: Some("33333333-3333-4333-8333-333333333333".to_string()),
+                request_event_id: Some("request-1".to_string()),
+                completion_event_id: None,
+                error: None,
+                reply: None,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            },
+            delivery: None,
+            handoff: Some(job_runtime::HandoffView {
+                handoff_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                state: "acknowledged".to_string(),
+                report: Some("exact report".to_string()),
+                report_fingerprint: Some("fingerprint".to_string()),
+                ready_at_ms: Some(10),
+                deadline_ms: Some(20),
+                receipt_at_ms: Some(15),
+                alert_incident_id: Some("handoff-11111111-1111-4111-8111-111111111111".to_string()),
+            }),
+        }
+    }
+
     #[test]
     fn stdout_write_and_flush_failures_report_exact_undelivered_response_once() {
         for (label, stage) in [
@@ -1484,6 +1567,32 @@ mod tests {
             );
             fs::remove_dir_all(inbox.parent().unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn acknowledged_receipt_survives_health_reporting_failure_without_retry_advice() {
+        let blocked = temp_root();
+        fs::write(&blocked, b"not a directory").unwrap();
+        let reporter = HealthReporter::at(blocked.clone());
+        let lookup = acknowledged_lookup();
+        let content = acknowledged_handoff_content(
+            &lookup,
+            &reporter,
+            "22222222-2222-4222-8222-222222222222",
+            "11111111-1111-4111-8111-111111111111",
+        );
+        assert_eq!(content.get("isError").and_then(Json::as_bool), Some(true));
+        let text = content
+            .get("content")
+            .and_then(Json::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Json::as_str)
+            .unwrap();
+        assert!(text.contains("handoff receipt is durable"));
+        assert!(text.contains("do not retry automatically"));
+        assert!(text.contains("remains acknowledged"));
+        fs::remove_file(blocked).unwrap();
     }
 
     #[test]
