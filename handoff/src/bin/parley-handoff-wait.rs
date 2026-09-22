@@ -1,4 +1,3 @@
 fn main() {
-    eprintln!("parley-handoff-wait is not activated");
-    std::process::exit(1);
+    std::process::exit(parley_handoff::service::run_wait());
 }
