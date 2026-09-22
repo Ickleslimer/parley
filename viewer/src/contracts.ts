@@ -185,6 +185,7 @@ export const CLOSED_CLASSES = [
   "turn_error",
   "watchdog_killed",
   "mcp_stdout_undelivered",
+  "handoff_unacknowledged",
 ] as const;
 export type ClosedClass = (typeof CLOSED_CLASSES)[number];
 
@@ -273,6 +274,82 @@ export interface HandoffSelection {
   incidentId: string | null;
   exactUndelivered: boolean;
   diagnostic: string | null;
+}
+
+export type PeerActivityUnavailableReason =
+  | "missing"
+  | "malformed"
+  | "locked"
+  | "unavailable";
+
+export type HandoffReportAvailability =
+  | "absent"
+  | "available"
+  | "missing"
+  | "malformed"
+  | "locked"
+  | "unavailable";
+
+export interface PeerActivityDiagnostics {
+  rootMissing: boolean;
+  rootLocked: boolean;
+  rootMalformed: boolean;
+  jobsMissing: boolean;
+  jobsLocked: boolean;
+  jobsMalformed: boolean;
+  skippedEntries: number;
+  missingJobs: number;
+  malformedJobs: number;
+  lockedJobs: number;
+  unavailableJobs: number;
+  reportMismatches: number;
+  reportMissing: number;
+  reportLocked: number;
+  reportMalformed: number;
+}
+
+export interface PeerActivityEvent {
+  class: string;
+  timestampMs: number;
+  toolName: string | null;
+  status: string | null;
+}
+
+export interface PeerHandoffItem {
+  jobId: string;
+  handoffId: string | null;
+  sourceSessionId: string | null;
+  targetSessionId: string | null;
+  state: string | null;
+  phase: string | null;
+  processState: string | null;
+  createdAtMs: number | null;
+  updatedAtMs: number | null;
+  lastActivityMs: number | null;
+  readyAtMs: number | null;
+  deadlineMs: number | null;
+  receiptAtMs: number | null;
+  alertIncidentId: string | null;
+  recordDiagnostic: PeerActivityUnavailableReason | null;
+  excerptText: string | null;
+  excerptTruncated: boolean;
+  activities: PeerActivityEvent[];
+  reportAvailability: HandoffReportAvailability;
+  reportText: string | null;
+}
+
+export interface PeerActivitySnapshot {
+  generatedMs: number;
+  assessment: "not_inferred";
+  source: {
+    kind: "environment" | "local_app_data" | "unconfigured";
+  };
+  unavailable: PeerActivityUnavailableReason | null;
+  diagnostics: PeerActivityDiagnostics;
+  shownCount: number;
+  totalCount: number;
+  truncated: boolean;
+  handoffs: PeerHandoffItem[];
 }
 
 export const DEFAULT_PEER_HEALTH_DIAGNOSTICS: PeerHealthDiagnostics = {

@@ -4,6 +4,7 @@
 
 - The viewer is an independent Windows-only Tauri 2 application. It is not a member of Parley's root Cargo package or a root workspace.
 - Rust owns file access, parsing, history, source selection, settings, window lifecycle, tray behavior, underlay attachment, health-inbox writes, and all persistence.
+- Rust alone reads peer-health and handoff evidence. TypeScript receives bounded serialized snapshots and never opens either evidence store.
 - TypeScript receives bounded snapshots or paged records through explicit commands. It never reads files, opens sockets, starts processes, or renders HTML from event content.
 - The production CSP permits only packaged assets and Tauri IPC. There is no shell, HTTP, updater, global-shortcut, notification, or filesystem guest plugin.
 - Every event log is opened read-only with read/write/delete sharing and is never created, renamed, deleted, truncated, or locked against Parley writers.
@@ -45,6 +46,7 @@ Widget excerpts are bounded to 420 Unicode scalar values and never model-generat
 - Underlay failure keeps the widget hidden, reports degraded state, and enters bounded reattachment cycles. No always-on-top, click-through, or ordinary-window fallback is allowed.
 - Closing detail hides it to tray. Only the Exit action or tray Exit terminates the process.
 - Viewer settings (`%APPDATA%\com.ickleslimer.parley-viewer\settings.json`), `%LOCALAPPDATA%\Parley\health`, and `%LOCALAPPDATA%\Parley\context` all survive uninstall and upgrade.
+- `%LOCALAPPDATA%\Parley\jobs`, `%LOCALAPPDATA%\Parley\lanes`, and `%LOCALAPPDATA%\Parley\handoffs` also survive uninstall and upgrade as task evidence.
 - Once `autostartInitialized` is true, saved `launchAtLogin` stays authoritative: startup restores or clears the viewer Run entry to match it, including after uninstall removed the registration. First interactive detail launch still enables autostart when `autostartInitialized` is false.
 
 ## Frontend IPC
@@ -54,10 +56,17 @@ Widget excerpts are bounded to 420 Unicode scalar values and never model-generat
 - `getStatus` and `getWidgetSnapshot` drive bounded live refresh across all sources.
 - `listSessions`, `listExchanges`, `search`, and `getEventContent` use opaque keys for paging, search, and exact retrieval.
 - `getSettings`, `saveSettings`, and `listMonitors` drive source ordering and geometry settings.
+- `getPeerActivity` returns the newest bounded handoff records, sanitized activity metadata, visible-output excerpts, and exact reports only after their stored fingerprints verify.
 - `selectEventLog`, `setEventLogs`, `addEventLog`, and `removeEventLog` manage sources through Rust only.
 - `setWidgetVisible`, `setLaunchAtLogin`, `showDetail`, and `exit` expose only required lifecycle actions.
 - Content is rendered with DOM text nodes or `textContent` only. Event content must never enter `innerHTML`.
 
+## Peer Activity and Acknowledged Handoffs
+
+The interactive detail window polls the handoff-schema-v1 store read-only. It shows exact lifecycle tokens, process phase metadata, timestamps, bounded visible-output excerpts, sanitized activity classes, and fingerprint-verified reports. It never exposes capability hashes, process identifiers, hidden reasoning text, raw tool payloads, command arguments, prompts, or environment values. Missing, locked, malformed, and unavailable evidence remains explicit; neither the Rust command nor the TypeScript presenter emits a peer-failure verdict.
+
+The desktop-underlay widget continues to consume only completed event-log exchanges. Pending handoffs and peer activity never enter its snapshot or rendering path. Viewing a report, expanding it, or acknowledging a health incident cannot record the Codex receipt required by Parley; only the locked MCP `ack_agent_handoff` command can do that, and receipt means delivery rather than acceptance.
+
 ## Installer and Evidence
 
-The current-user NSIS package bundles the viewer and health binaries. It owns only its exact viewer and supervisor autostart entries plus the two exact Grok hook entries. Uninstall removes those integrations but preserves per-user viewer settings in `%APPDATA%\com.ickleslimer.parley-viewer` (placement, monitor, dimensions, selected sources, and launch preference) together with `%LOCALAPPDATA%\Parley\health` and `%LOCALAPPDATA%\Parley\context` as evidence. Generic binaries contain no machine-specific event-log path; local sources are seeded after installation through repeated `--event-log` arguments.
+The current-user NSIS package bundles the viewer, health, lane, and handoff binaries. It owns only its exact viewer and supervisor autostart entries plus the exact managed Grok health, lane, and handoff hook entries. Uninstall removes those integrations but preserves per-user viewer settings in `%APPDATA%\com.ickleslimer.parley-viewer` (placement, monitor, dimensions, selected sources, and launch preference) together with `%LOCALAPPDATA%\Parley\health`, `%LOCALAPPDATA%\Parley\context`, `%LOCALAPPDATA%\Parley\jobs`, `%LOCALAPPDATA%\Parley\lanes`, and `%LOCALAPPDATA%\Parley\handoffs` as evidence. Generic binaries contain no machine-specific event-log or handoff path; local sources are seeded after installation through repeated `--event-log` arguments.

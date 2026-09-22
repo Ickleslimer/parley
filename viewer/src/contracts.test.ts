@@ -28,6 +28,7 @@ describe("peer health contract tokens", () => {
       "turn_error",
       "watchdog_killed",
       "mcp_stdout_undelivered",
+      "handoff_unacknowledged",
     ]);
     expect(PEER_HEALTH_UNAVAILABLE_REASONS).toEqual([
       "missing",

@@ -174,6 +174,8 @@ export function closedClassLabel(closedClass: ClosedClass): string {
       return "watchdog_killed \u00b7 Watchdog killed";
     case "mcp_stdout_undelivered":
       return "mcp_stdout_undelivered \u00b7 MCP stdout undelivered";
+    case "handoff_unacknowledged":
+      return "handoff_unacknowledged \u00b7 Handoff awaiting Codex receipt";
   }
 }
 

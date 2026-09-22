@@ -69,7 +69,7 @@ const incident = (overrides: Partial<PeerIncident> = {}): PeerIncident => ({
 });
 
 const snapshot = (overrides: Partial<PeerHealthSnapshot> = {}): PeerHealthSnapshot => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   generatedMs: 1_704_067_260_000,
   asOfMs: 1_704_067_200_000,
   muted: false,
@@ -212,6 +212,7 @@ describe("peer health labels", () => {
     expect(handoffSemanticsLabel("watchdog_killed")).toBeNull();
     expect(handoffSemanticsLabel("capacity_throttle")).toBeNull();
     expect(handoffSemanticsLabel("usage_sample")).toBeNull();
+    expect(handoffSemanticsLabel("handoff_unacknowledged")).toBeNull();
     expect(handoffSemanticsLabel("quota_exhausted", true)).toBe(EXACT_PRESERVED_RESPONSE_LABEL);
   });
 

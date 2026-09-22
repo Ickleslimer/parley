@@ -5,6 +5,7 @@ import type {
   ExchangePage,
   HandoffSelection,
   MonitorInfo,
+  PeerActivitySnapshot,
   PeerHealthSnapshot,
   SearchPage,
   SessionPage,
@@ -25,6 +26,7 @@ export interface ViewerApi {
   setPeerHealthMuted(muted: boolean): Promise<PeerHealthSnapshot>;
   testPeerHealthChime(): Promise<void>;
   openLatestHandoff(): Promise<HandoffSelection>;
+  getPeerActivity(): Promise<PeerActivitySnapshot>;
   getSettings(): Promise<ViewerSettings>;
   saveSettings(settings: ViewerSettings): Promise<ViewerSettings>;
   listMonitors(): Promise<MonitorInfo[]>;
@@ -57,6 +59,7 @@ export const viewerApi: ViewerApi = {
     invoke<PeerHealthSnapshot>("set_peer_health_muted", { muted }),
   testPeerHealthChime: () => invoke<void>("test_peer_health_chime"),
   openLatestHandoff: () => invoke<HandoffSelection>("open_latest_handoff"),
+  getPeerActivity: () => invoke<PeerActivitySnapshot>("get_peer_activity"),
   getSettings: () => invoke<ViewerSettings>("get_settings"),
   saveSettings: (settings) => invoke<ViewerSettings>("save_settings", { settings }),
   listMonitors: () => invoke<MonitorInfo[]>("list_monitors"),

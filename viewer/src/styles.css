@@ -779,6 +779,130 @@ select {
   gap: 6px;
 }
 
+.panel-peer-activity {
+  max-height: 52vh;
+  overflow: auto;
+  gap: 6px;
+}
+
+.panel-peer-activity [hidden] {
+  display: none !important;
+}
+
+.peer-activity-caption,
+.peer-activity-meta,
+.peer-activity-diagnostics,
+.peer-activity-event-meta,
+.peer-activity-kicker {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.peer-activity-caption {
+  line-height: 1.4;
+}
+
+.peer-activity-availability {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.peer-activity-error,
+.peer-activity-warning {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.peer-activity-diagnostics {
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.peer-activity-list,
+.peer-activity-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.peer-activity-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.peer-activity-item {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-left: 2px solid rgb(126 224 255 / 55%);
+  border-radius: 8px;
+  background: var(--bg-panel-2);
+}
+
+.peer-activity-item h3 {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.peer-activity-kicker,
+.peer-activity-event-class {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.peer-activity-events {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.peer-activity-events li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.peer-activity-excerpt,
+.peer-activity-report-body {
+  max-height: 14rem;
+  overflow: auto;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-family: ui-monospace, "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  background: #0e121a;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px;
+}
+
+.peer-activity-report summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.peer-activity-report[open] summary {
+  margin-bottom: 6px;
+}
+
 .panel-peer-health [hidden] {
   display: none !important;
 }
@@ -916,7 +1040,8 @@ select {
   .settings-form,
   .peer-health-summary,
   .peer-health-evidence,
-  .peer-health-incidents {
+  .peer-health-incidents,
+  .peer-activity-list {
     grid-template-columns: 1fr;
   }
 
@@ -930,6 +1055,11 @@ select {
   }
 
   .panel-peer-health {
+    min-height: 0;
+    max-height: none;
+  }
+
+  .panel-peer-activity {
     min-height: 0;
     max-height: none;
   }
