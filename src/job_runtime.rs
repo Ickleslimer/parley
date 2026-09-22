@@ -818,6 +818,7 @@ impl HandoffSession {
         let _guard = process_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_session_id = source_session_id.unwrap_or("unavailable").to_string();
         prepare_handoff_root(root)?;
         let directory = root.join("jobs").join(job_id);
         crate::context::refuse_reparse_chain(&directory).map_err(|error| error.to_string())?;
@@ -840,7 +841,7 @@ impl HandoffSession {
             job_id: job_id.to_string(),
             handoff_id: handoff_id.clone(),
             state: "pending".to_string(),
-            source_session_id: source_session_id.map(str::to_string),
+            source_session_id: Some(source_session_id.clone()),
             target_session_id: target_session_id.map(str::to_string),
             capability_hash: digest_text(&capability),
             process_id: None,
@@ -865,7 +866,7 @@ impl HandoffSession {
             job_id: job_id.to_string(),
             handoff_id,
             capability,
-            source_session_id: source_session_id.map(str::to_string),
+            source_session_id: Some(source_session_id),
             target_session_id: target_session_id.map(str::to_string),
             config: config.clone(),
             stream: Arc::new(Mutex::new(HandoffStream {
@@ -2619,6 +2620,26 @@ mod tests {
         assert_eq!(
             session.temporary_file_max_age(),
             Duration::from_secs(43_800)
+        );
+    }
+
+    #[test]
+    fn acknowledgement_jobs_without_context_bind_an_explicit_unavailable_source() {
+        let root = temp("unavailable-source-session");
+        let policy = test_handoff_policy(&root);
+        let session = HandoffSession::initialize(
+            &root,
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            None,
+            Some("grok-session"),
+            &policy,
+            &Mutex::new(()),
+        )
+        .unwrap();
+        assert_eq!(session.source_session_id.as_deref(), Some("unavailable"));
+        assert_eq!(
+            session.read().unwrap().source_session_id.as_deref(),
+            Some("unavailable")
         );
     }
 
