@@ -55,6 +55,9 @@ impl GuardedSubagentLaunch {
             .filter(|lane| lane.owner == LaneOwner::GrokChild)
             .collect::<Vec<_>>();
         children.sort_by(|left, right| left.lane_id.cmp(&right.lane_id));
+        if !children.is_empty() {
+            policy.require_grok_child_lanes_ready()?;
+        }
         let guarded = policy.guarded_subagents().ok_or_else(|| {
             "Grok child lanes require PARLEY_GROK_SUBAGENT_MODE=guarded".to_string()
         })?;
@@ -746,6 +749,43 @@ mod tests {
         assert!(!invocation
             .env
             .contains_key("GROK_SUBAGENT_MODEL_INHERITANCE"));
+    }
+
+    #[test]
+    fn extended_windows_paths_normalize_parent_allows_and_protected_denies() {
+        let mut launch = launch();
+        launch.parent_cwd = PathBuf::from(r"\\?\D:\repo\parent");
+        launch.parent_spawn_cwd = normalize_windows_extended_path(r"\\?\D:\repo\parent");
+        launch.protected_roots = vec![
+            PathBuf::from(r"\\?\D:\repo\integration"),
+            PathBuf::from(r"\\?\D:\repo\codex"),
+        ];
+        let mut invocation = Invocation::new(
+            "grok",
+            vec!["--no-auto-update".to_string(), "--no-subagents".to_string()],
+        );
+
+        launch.configure_invocation(&mut invocation, None).unwrap();
+
+        for expected in [
+            "Edit(D:/repo/parent/README.md)",
+            "Write(D:/repo/parent/README.md)",
+            "Edit(README.md)",
+            "Write(README.md)",
+            "Edit(D:/repo/integration/**)",
+            "Write(D:/repo/integration/**)",
+            "Edit(D:/repo/codex/**)",
+            "Write(D:/repo/codex/**)",
+        ] {
+            assert!(
+                invocation.args.iter().any(|argument| argument == expected),
+                "missing normalized permission rule {expected}"
+            );
+        }
+        assert!(!invocation
+            .args
+            .iter()
+            .any(|argument| argument.contains(r"\\?\")));
     }
 
     #[test]

@@ -531,8 +531,13 @@ impl AskSpawnObserver for JobObserver {
 
 fn validate_lane_result(reply: &str, job_id: &str) -> Result<(), String> {
     let normalized = reply.replace("\r\n", "\n");
-    let expected = format!("TWO_CHAIRS_LANE_RESULT\njob_id: {job_id}\nstatus: completed");
-    if normalized.contains(&expected) {
+    let expected_job = format!("job_id: {job_id}");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    if lines.windows(3).any(|window| {
+        window[0] == "TWO_CHAIRS_LANE_RESULT"
+            && window[1] == expected_job
+            && window[2] == "status: completed"
+    }) {
         Ok(())
     } else {
         Err(format!(
@@ -1095,6 +1100,11 @@ mod tests {
         assert!(validate_lane_result("I will write the file now.", job_id).is_err());
         assert!(validate_lane_result(
             "TWO_CHAIRS_LANE_RESULT\njob_id: other\nstatus: completed",
+            job_id
+        )
+        .is_err());
+        assert!(validate_lane_result(
+            &format!("TWO_CHAIRS_LANE_RESULT\njob_id: {job_id}\nstatus: completed_with_errors"),
             job_id
         )
         .is_err());

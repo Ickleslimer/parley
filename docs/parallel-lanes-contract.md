@@ -74,10 +74,11 @@ or caller-supplied tool definitions. Depth is one and the child limit is two.
 Guarded configuration alone does not authorize a native child. With no child
 lane declared, Parley keeps `--no-subagents`, injects exact parent-lane
 `Edit(...)` and `Write(...)` rules, denies the integration and Codex worktree
-roots, and creates no child profile or grant state. On Windows, only the spawn
-cwd presentation strips the canonical `\\?\` prefix; canonical identities
-remain authoritative for policy and lease checks. Parent file tools receive
-both normalized absolute and worktree-relative rules.
+roots, and creates no child profile or grant state. On Windows, the tool-facing
+spawn cwd and every allow/deny permission pattern strip the canonical `\\?\`
+prefix; the stored canonical identities remain authoritative for policy and
+lease checks. Parent file tools receive both normalized absolute and
+worktree-relative rules.
 
 Every write job must finish with the exact block below. A missing, mismatched,
 or partial block is a non-retriable failed job even if Grok exits zero; captured
