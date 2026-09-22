@@ -61,6 +61,10 @@
       "../../health/target/release/parley-health-supervisor.exe": "health/parley-health-supervisor.exe",
       "../../health/target/release/parley-health-query.exe": "health/parley-health-query.exe",
       "../../health/target/release/parley-health-hook.exe": "health/parley-health-hook.exe",
+      "../../handoff/target/release/parley-peer-peek.exe": "handoff/parley-peer-peek.exe",
+      "../../handoff/target/release/parley-handoff-wait.exe": "handoff/parley-handoff-wait.exe",
+      "../../handoff/target/release/parley-peer-alert.exe": "handoff/parley-peer-alert.exe",
+      "../../handoff/target/release/parley-handoff-hook.exe": "handoff/parley-handoff-hook.exe",
       "../../lanes/target/release/parley-lane-hook.exe": "lanes/parley-lane-hook.exe",
       "../../health/assets/two-chairs.wav": "health/two-chairs.wav"
     },

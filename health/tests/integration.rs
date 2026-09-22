@@ -9,8 +9,10 @@ fn fake_install(home: &common::TempHome) -> std::path::PathBuf {
     let install_root = home.paths.root.join("install");
     let install = install_root.join("health");
     let lanes = install_root.join("lanes");
+    let handoff = install_root.join("handoff");
     std::fs::create_dir_all(&install).unwrap();
     std::fs::create_dir_all(&lanes).unwrap();
+    std::fs::create_dir_all(&handoff).unwrap();
     for binary in [
         "parley-health-query.exe",
         "parley-health-supervisor.exe",
@@ -19,6 +21,11 @@ fn fake_install(home: &common::TempHome) -> std::path::PathBuf {
         std::fs::write(install.join(binary), binary.as_bytes()).unwrap();
     }
     std::fs::write(lanes.join("parley-lane-hook.exe"), b"parley-lane-hook.exe").unwrap();
+    std::fs::write(
+        handoff.join("parley-handoff-hook.exe"),
+        b"parley-handoff-hook.exe",
+    )
+    .unwrap();
     install
 }
 
@@ -30,8 +37,16 @@ fn lane_hook(health_install: &std::path::Path) -> std::path::PathBuf {
         .join("parley-lane-hook.exe")
 }
 
+fn handoff_hook(health_install: &std::path::Path) -> std::path::PathBuf {
+    health_install
+        .parent()
+        .unwrap()
+        .join("handoff")
+        .join("parley-handoff-hook.exe")
+}
+
 #[test]
-fn installs_health_and_lane_hooks_and_preserves_unrelated_files() {
+fn installs_all_managed_hooks_and_preserves_unrelated_files() {
     let home = common::TempHome::new("hook-install");
     let install = fake_install(&home);
     let grok_home = home.paths.root.join("grok");
@@ -44,19 +59,21 @@ fn installs_health_and_lane_hooks_and_preserves_unrelated_files() {
         &grok_home,
         &install.join("parley-health-hook.exe"),
         &lane_hook(&install),
+        &handoff_hook(&install),
     )
     .unwrap();
     let installed: serde_json::Value =
         serde_json::from_slice(&std::fs::read(hooks.join(HOOK_FILE_NAME)).unwrap()).unwrap();
-    assert_eq!(installed["hooks"].as_object().unwrap().len(), 2);
+    assert_eq!(installed["hooks"].as_object().unwrap().len(), 3);
     assert_eq!(
         installed["hooks"]["PreToolUse"].as_array().unwrap().len(),
-        2
+        3
     );
     assert_eq!(
         installed["hooks"]["StopFailure"].as_array().unwrap().len(),
         1
     );
+    assert_eq!(installed["hooks"]["Stop"].as_array().unwrap().len(), 1);
     assert!(unrelated.exists());
 
     assert!(remove_hooks(&grok_home).unwrap());
@@ -77,6 +94,7 @@ fn refuses_to_replace_an_unrelated_reserved_hook_file_and_leaves_it_on_remove() 
         &grok_home,
         &install.join("parley-health-hook.exe"),
         &lane_hook(&install),
+        &handoff_hook(&install),
     )
     .is_err());
     assert!(!remove_hooks(&grok_home).unwrap());
@@ -93,6 +111,7 @@ fn remove_hooks_removes_only_managed_entries_from_a_modified_document() {
         &grok_home,
         &install.join("parley-health-hook.exe"),
         &lane_hook(&install),
+        &handoff_hook(&install),
     )
     .unwrap();
 
@@ -115,6 +134,7 @@ fn remove_hooks_removes_only_managed_entries_from_a_modified_document() {
     let remaining = std::fs::read_to_string(&hook_path).unwrap();
     assert!(!remaining.contains("parley-health-hook.exe"));
     assert!(!remaining.contains("parley-lane-hook.exe"));
+    assert!(!remaining.contains("parley-handoff-hook.exe"));
     assert!(remaining.contains("unrelated-hook.exe"));
     assert!(remaining.contains("session-start.exe"));
 }
@@ -143,6 +163,7 @@ fn configure_caches_r3_identity_and_installed_executable_identities() {
         hook_document(
             &install.join("parley-health-hook.exe"),
             &lane_hook(&install),
+            &handoff_hook(&install),
         )
     );
 }
@@ -157,6 +178,7 @@ fn upgrade_replaces_managed_entries_without_removing_unrelated_hooks() {
         &grok_home,
         &install.join("parley-health-hook.exe"),
         &lane_hook(&install),
+        &handoff_hook(&install),
     )
     .unwrap();
 
@@ -175,11 +197,13 @@ fn upgrade_replaces_managed_entries_without_removing_unrelated_hooks() {
         &grok_home,
         &install.join("parley-health-hook.exe"),
         &lane_hook(&install),
+        &handoff_hook(&install),
     )
     .unwrap();
     let installed = std::fs::read_to_string(&hook_path).unwrap();
     assert_eq!(installed.matches("parley-health-hook.exe").count(), 2);
     assert_eq!(installed.matches("parley-lane-hook.exe").count(), 1);
+    assert_eq!(installed.matches("parley-handoff-hook.exe").count(), 2);
     assert!(installed.contains("unrelated-hook.exe"));
 }
 
@@ -197,6 +221,23 @@ fn configure_refuses_installation_without_the_lane_hook() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("lane hook"));
+    assert!(!grok_home.join("hooks").join(HOOK_FILE_NAME).exists());
+}
+
+#[test]
+fn configure_refuses_installation_without_the_handoff_hook() {
+    let home = common::TempHome::new("configure-missing-handoff");
+    let install = fake_install(&home);
+    std::fs::remove_file(handoff_hook(&install)).unwrap();
+    let main = home.paths.root.join("r3");
+    let common_dir = main.join(".git");
+    std::fs::create_dir_all(&common_dir).unwrap();
+    let grok_home = home.paths.root.join("grok");
+
+    let error = configure_r3(&home.paths, &common_dir, &main, &install, &grok_home)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("handoff hook"));
     assert!(!grok_home.join("hooks").join(HOOK_FILE_NAME).exists());
 }
 

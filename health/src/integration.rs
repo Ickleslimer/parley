@@ -12,6 +12,7 @@ use crate::scope::{ScopeFile, ScopeUpdate};
 pub const HOOK_FILE_NAME: &str = "two-chairs-peer-health.json";
 const HEALTH_HOOK_NAME: &str = "parley-health-hook.exe";
 const LANE_HOOK_NAME: &str = "parley-lane-hook.exe";
+const HANDOFF_HOOK_NAME: &str = "parley-handoff-hook.exe";
 
 pub fn configure_r3(
     health_paths: &HealthPaths,
@@ -26,10 +27,12 @@ pub fn configure_r3(
     let supervisor = install_dir.join("parley-health-supervisor.exe");
     let hook = install_dir.join(HEALTH_HOOK_NAME);
     let lane_hook = lane_hook_path(install_dir)?;
+    let handoff_hook = handoff_hook_path(install_dir)?;
     require_file(&query, "health query")?;
     require_file(&supervisor, "health supervisor")?;
     require_file(&hook, "health hook")?;
     require_file(&lane_hook, "lane hook")?;
+    require_file(&handoff_hook, "handoff hook")?;
 
     health_paths.ensure()?;
     let mut scope = ScopeFile::load_or_empty(&health_paths.scope());
@@ -44,7 +47,7 @@ pub fn configure_r3(
     });
     scope.refresh_cached_roots();
     scope.save(&health_paths.scope())?;
-    install_hooks(grok_home, &hook, &lane_hook)
+    install_hooks(grok_home, &hook, &lane_hook, &handoff_hook)
 }
 
 pub fn allow_query_root(health_paths: &HealthPaths, root: &Path) -> Result<(), HealthError> {
@@ -83,9 +86,11 @@ pub fn install_hooks(
     grok_home: &Path,
     health_hook_exe: &Path,
     lane_hook_exe: &Path,
+    handoff_hook_exe: &Path,
 ) -> Result<(), HealthError> {
     require_file(health_hook_exe, "health hook")?;
     require_file(lane_hook_exe, "lane hook")?;
+    require_file(handoff_hook_exe, "handoff hook")?;
     let hooks_dir = grok_home.join("hooks");
     fs::create_dir_all(&hooks_dir).map_err(|error| {
         HealthError::msg(format!(
@@ -107,7 +112,12 @@ pub fn install_hooks(
         json!({"hooks": {}})
     };
     remove_managed_entries(&mut document);
-    append_managed_entries(&mut document, health_hook_exe, lane_hook_exe)?;
+    append_managed_entries(
+        &mut document,
+        health_hook_exe,
+        lane_hook_exe,
+        handoff_hook_exe,
+    )?;
     let bytes = serde_json::to_vec_pretty(&document)?;
     fsutil::atomic_write(&path, &bytes)
 }
@@ -141,10 +151,19 @@ pub fn grok_home() -> PathBuf {
     PathBuf::from(r"C:\Users\Default\.grok")
 }
 
-pub fn hook_document(health_hook_exe: &Path, lane_hook_exe: &Path) -> Value {
+pub fn hook_document(
+    health_hook_exe: &Path,
+    lane_hook_exe: &Path,
+    handoff_hook_exe: &Path,
+) -> Value {
     let mut document = json!({"hooks": {}});
-    append_managed_entries(&mut document, health_hook_exe, lane_hook_exe)
-        .expect("fresh hook document has a hooks object");
+    append_managed_entries(
+        &mut document,
+        health_hook_exe,
+        lane_hook_exe,
+        handoff_hook_exe,
+    )
+    .expect("fresh hook document has a hooks object");
     document
 }
 
@@ -187,7 +206,7 @@ fn command_targets_named_hook(command: &str, name: &str) -> bool {
 }
 
 fn command_targets_managed_hook(command: &str) -> bool {
-    [HEALTH_HOOK_NAME, LANE_HOOK_NAME]
+    [HEALTH_HOOK_NAME, LANE_HOOK_NAME, HANDOFF_HOOK_NAME]
         .iter()
         .any(|name| command_targets_named_hook(command, name))
 }
@@ -196,6 +215,7 @@ fn append_managed_entries(
     value: &mut Value,
     health_hook_exe: &Path,
     lane_hook_exe: &Path,
+    handoff_hook_exe: &Path,
 ) -> Result<(), HealthError> {
     let hooks = value
         .get_mut("hooks")
@@ -203,6 +223,7 @@ fn append_managed_entries(
         .ok_or_else(|| HealthError::msg("Grok hook document has no hooks object"))?;
     let health_command = format!("\"{}\"", health_hook_exe.to_string_lossy());
     let lane_command = format!("\"{}\"", lane_hook_exe.to_string_lossy());
+    let handoff_command = format!("\"{}\"", handoff_hook_exe.to_string_lossy());
     let pretool = hooks
         .entry("PreToolUse")
         .or_insert_with(|| Value::Array(Vec::new()))
@@ -215,6 +236,10 @@ fn append_managed_entries(
     pretool.push(json!({
         "hooks": [{"type": "command", "command": lane_command, "timeout": 5}]
     }));
+    pretool.push(json!({
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": handoff_command, "timeout": 5}]
+    }));
     let stop_failure = hooks
         .entry("StopFailure")
         .or_insert_with(|| Value::Array(Vec::new()))
@@ -222,6 +247,14 @@ fn append_managed_entries(
         .ok_or_else(|| HealthError::msg("Grok StopFailure hooks are not an array"))?;
     stop_failure.push(json!({
         "hooks": [{"type": "command", "command": health_command, "timeout": 5}]
+    }));
+    let stop = hooks
+        .entry("Stop")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| HealthError::msg("Grok Stop hooks are not an array"))?;
+    stop.push(json!({
+        "hooks": [{"type": "command", "command": handoff_command, "timeout": 5}]
     }));
     Ok(())
 }
@@ -233,13 +266,20 @@ fn lane_hook_path(health_install_dir: &Path) -> Result<PathBuf, HealthError> {
     Ok(install_root.join("lanes").join(LANE_HOOK_NAME))
 }
 
+fn handoff_hook_path(health_install_dir: &Path) -> Result<PathBuf, HealthError> {
+    let install_root = health_install_dir.parent().ok_or_else(|| {
+        HealthError::msg("health installation directory has no parent installation root")
+    })?;
+    Ok(install_root.join("handoff").join(HANDOFF_HOOK_NAME))
+}
+
 fn remove_managed_entries(value: &mut Value) -> bool {
     let Some(hooks) = value.get_mut("hooks").and_then(Value::as_object_mut) else {
         return false;
     };
     let mut removed = false;
     let mut empty_events = Vec::new();
-    for event in ["PreToolUse", "StopFailure"] {
+    for event in ["PreToolUse", "StopFailure", "Stop"] {
         let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
             continue;
         };
