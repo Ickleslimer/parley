@@ -825,6 +825,30 @@ fn tools_list_result() -> Json {
         obj(vec![("job_id", str_prop("Caller-generated job UUID."))]),
         vec!["job_id"],
     );
+    let peek_job_tool = tool(
+        "peek_agent_job",
+        "Read bounded sanitized peer activity and an exact visible-output excerpt without inferring whether the peer is stalled.",
+        obj(vec![
+            ("job_id", str_prop("Caller-generated job UUID.")),
+            (
+                "since_ms",
+                obj(vec![
+                    ("type", Json::Str("integer".to_string())),
+                    ("minimum", Json::Number(0.0)),
+                ]),
+            ),
+        ]),
+        vec!["job_id"],
+    );
+    let ack_handoff_tool = tool(
+        "ack_agent_handoff",
+        "Record Codex receipt of one exact durable handoff. Receipt is not approval, acceptance, recovery, or continuity authorization.",
+        obj(vec![
+            ("job_id", str_prop("Caller-generated job UUID.")),
+            ("handoff_id", str_prop("Collision-resistant durable handoff UUID.")),
+        ]),
+        vec!["job_id", "handoff_id"],
+    );
     let list_job_tool = tool(
         "list_agent_jobs",
         "List newest-first bounded asynchronous job metadata without replies.",
@@ -854,6 +878,8 @@ fn tools_list_result() -> Json {
             ask_tool,
             start_job_tool,
             get_job_tool,
+            peek_job_tool,
+            ack_handoff_tool,
             list_job_tool,
             cancel_job_tool,
             fuse_tool,
@@ -935,13 +961,15 @@ fn call_tool(
             let job_id = required_arg_string(args, "job_id")?;
             let mode = JobMode::parse(&required_arg_string(args, "job_mode")?)
                 .map_err(|error| (-32602, error))?;
-            let handoff_mode = args
+            let requested_handoff_mode = args
                 .get("handoff_mode")
                 .and_then(Json::as_str)
                 .map(HandoffMode::parse)
                 .transpose()
-                .map_err(|error| (-32602, error))?
-                .unwrap_or_default();
+                .map_err(|error| (-32602, error))?;
+            let handoff_mode = policy
+                .resolve_handoff_mode(mode, requested_handoff_mode)
+                .map_err(|error| (-32602, error))?;
             let request = parse_ask_request(args, default_cwd, policy)?;
             let lane_plan = args
                 .get("lane_plan")
@@ -956,11 +984,11 @@ fn call_tool(
                 lane_plan,
             }) {
                 Ok(lookup) => {
-                    if let Some(receipt) = lookup.delivery {
+                    if let Some(receipt) = lookup.delivery.clone() {
                         *delivery = Some(receipt);
                     }
                     Ok(text_content(
-                        &job_runtime::view_json(&lookup.view, true).to_pretty_string(),
+                        &job_runtime::lookup_json(&lookup, true).to_pretty_string(),
                         false,
                     ))
                 }
@@ -971,15 +999,37 @@ fn call_tool(
             let job_id = required_arg_string(args, "job_id")?;
             match jobs.get(&job_id) {
                 Ok(Some(lookup)) => {
-                    if let Some(receipt) = lookup.delivery {
+                    if let Some(receipt) = lookup.delivery.clone() {
                         *delivery = Some(receipt);
                     }
                     Ok(text_content(
-                        &job_runtime::view_json(&lookup.view, true).to_pretty_string(),
+                        &job_runtime::lookup_json(&lookup, true).to_pretty_string(),
                         false,
                     ))
                 }
                 Ok(None) => Ok(text_content(&format!("job {job_id} was not found"), true)),
+                Err(error) => Ok(text_content(&error, true)),
+            }
+        }
+        "peek_agent_job" => {
+            let job_id = required_arg_string(args, "job_id")?;
+            let since_ms = optional_nonnegative_u128(args, "since_ms")?;
+            match jobs.peek(&job_id, since_ms) {
+                Ok(activity) => Ok(text_content(&activity.to_pretty_string(), false)),
+                Err(error) => Ok(text_content(&error, true)),
+            }
+        }
+        "ack_agent_handoff" => {
+            policy
+                .require_codex_handoff_caller()
+                .map_err(|error| (-32602, error))?;
+            let job_id = required_arg_string(args, "job_id")?;
+            let handoff_id = required_arg_string(args, "handoff_id")?;
+            match jobs.acknowledge(&job_id, &handoff_id) {
+                Ok(lookup) => Ok(text_content(
+                    &job_runtime::lookup_json(&lookup, true).to_pretty_string(),
+                    false,
+                )),
                 Err(error) => Ok(text_content(&error, true)),
             }
         }
@@ -1003,7 +1053,7 @@ fn call_tool(
             let job_id = required_arg_string(args, "job_id")?;
             match jobs.cancel(&job_id) {
                 Ok(lookup) => Ok(text_content(
-                    &job_runtime::view_json(&lookup.view, true).to_pretty_string(),
+                    &job_runtime::lookup_json(&lookup, true).to_pretty_string(),
                     false,
                 )),
                 Err(error) => Ok(text_content(&error, true)),
@@ -1224,6 +1274,19 @@ fn optional_positive_usize(args: &Json, name: &str) -> Result<Option<usize>, (i6
         return Err((-32602, format!("{name} must be a positive integer")));
     }
     Ok(Some(number as usize))
+}
+
+fn optional_nonnegative_u128(args: &Json, name: &str) -> Result<Option<u128>, (i64, String)> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let number = value
+        .as_number()
+        .ok_or((-32602, format!("{name} must be an integer")))?;
+    if number < 0.0 || number.fract() != 0.0 || !number.is_finite() {
+        return Err((-32602, format!("{name} must be a non-negative integer")));
+    }
+    Ok(Some(number as u128))
 }
 
 fn arg_cwd(args: &Json, default_cwd: &Path) -> PathBuf {
@@ -1462,7 +1525,7 @@ mod tests {
             .and_then(|r| r.get("tools"))
             .and_then(Json::as_array)
             .unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
         let names: Vec<_> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Json::as_str))
@@ -1473,6 +1536,8 @@ mod tests {
         assert!(names.contains(&"ask_agent"));
         assert!(names.contains(&"start_agent_job"));
         assert!(names.contains(&"get_agent_job"));
+        assert!(names.contains(&"peek_agent_job"));
+        assert!(names.contains(&"ack_agent_handoff"));
         assert!(names.contains(&"list_agent_jobs"));
         assert!(names.contains(&"cancel_agent_job"));
         assert!(names.contains(&"fuse"));

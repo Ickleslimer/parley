@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::context::{refuse_reparse_chain, ContextMode, ContextRecovery};
+use crate::jobs::{HandoffMode, JobMode};
 
 const HARDENED_GROK_DENIES: &[&str] = &[
     "WebFetch",
@@ -136,6 +137,24 @@ pub(crate) struct RuntimePolicy {
     context_locked_source: Option<String>,
     context_locked_mode: Option<ContextMode>,
     context_require_explicit_session: bool,
+    handoff: Option<HandoffPolicy>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HandoffPolicy {
+    pub(crate) state_dir: PathBuf,
+    pub(crate) peer_peek_exe: PathBuf,
+    pub(crate) wait_exe: PathBuf,
+    pub(crate) alert_exe: PathBuf,
+    pub(crate) hook_exe: PathBuf,
+    pub(crate) peer_peek_command: String,
+    pub(crate) wait_command: String,
+    pub(crate) alert_command: String,
+    pub(crate) wait_slice_secs: u64,
+    pub(crate) execution_ceiling_secs: u64,
+    pub(crate) acknowledgement_ceiling_secs: u64,
+    pub(crate) excerpt_chars: usize,
+    pub(crate) max_turns: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +220,7 @@ impl Default for RuntimePolicy {
             context_locked_source: None,
             context_locked_mode: None,
             context_require_explicit_session: false,
+            handoff: None,
         }
     }
 }
@@ -392,6 +412,64 @@ impl RuntimePolicy {
             grok_allows = allows;
             grok_health_query_command = Some(command);
         }
+        let handoff = match env_nonempty("PARLEY_HANDOFF_LOCKED_MODE")
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("off") => None,
+            Some("required") => {
+                if grok_locked_permission_mode.is_none()
+                    || grok_locked_model.as_deref() != Some("grok-4.7")
+                    || grok_locked_reasoning_effort.as_deref() != Some("xhigh")
+                    || grok_locked_version.is_none()
+                {
+                    return Err("required handoffs require locked Grok 4.7/XHigh, CLI version, and permission mode".to_string());
+                }
+                let state_dir = required_absolute_dir_value("PARLEY_HANDOFF_STATE_DIR")?;
+                let peer_peek_exe = required_executable("PARLEY_HANDOFF_PEER_PEEK_EXE")?;
+                let wait_exe = required_executable("PARLEY_HANDOFF_WAIT_EXE")?;
+                let alert_exe = required_executable("PARLEY_HANDOFF_ALERT_EXE")?;
+                let hook_exe = required_executable("PARLEY_HANDOFF_HOOK_EXE")?;
+                let wait_slice_secs = required_exact_u64("PARLEY_HANDOFF_WAIT_SLICE_SEC", 300)?;
+                let execution_ceiling_secs =
+                    required_exact_u64("PARLEY_HANDOFF_EXECUTION_CEILING_SEC", 21_600)?;
+                let acknowledgement_ceiling_secs =
+                    required_exact_u64("PARLEY_HANDOFF_ACK_CEILING_SEC", 21_600)?;
+                let excerpt_chars =
+                    required_exact_u64("PARLEY_HANDOFF_EXCERPT_CHARS", 4_096)? as usize;
+                let max_turns = required_exact_u64("PARLEY_HANDOFF_MAX_TURNS", 128)?;
+                let peer_peek_command = powershell_direct_command(&peer_peek_exe)?;
+                let wait_command = powershell_direct_command(&wait_exe)?;
+                let alert_command = powershell_direct_command(&alert_exe)?;
+                grok_allows.extend([
+                    format!("Bash({peer_peek_command})"),
+                    format!("Bash({wait_command})"),
+                    format!("Bash({alert_command})"),
+                ]);
+                add_handoff_hook_tool_rules(&hook_exe, &mut grok_denies);
+                Some(HandoffPolicy {
+                    state_dir,
+                    peer_peek_exe,
+                    wait_exe,
+                    alert_exe,
+                    hook_exe,
+                    peer_peek_command,
+                    wait_command,
+                    alert_command,
+                    wait_slice_secs,
+                    execution_ceiling_secs,
+                    acknowledgement_ceiling_secs,
+                    excerpt_chars,
+                    max_turns,
+                })
+            }
+            Some(value) => {
+                return Err(format!(
+                    "PARLEY_HANDOFF_LOCKED_MODE must be off or required, got {value}"
+                ))
+            }
+        };
 
         Ok(Self {
             allowed_cwd_root,
@@ -412,6 +490,7 @@ impl RuntimePolicy {
             context_locked_source,
             context_locked_mode,
             context_require_explicit_session,
+            handoff,
         })
     }
 
@@ -707,6 +786,49 @@ impl RuntimePolicy {
         prompt.push_str("Stale or unavailable evidence never means the peer is down. Do not retry the query or authorize continuation.\n");
     }
 
+    pub(crate) fn resolve_handoff_mode(
+        &self,
+        job_mode: JobMode,
+        requested: Option<HandoffMode>,
+    ) -> Result<HandoffMode, String> {
+        let locked = self.handoff.is_some();
+        let expected = if locked && matches!(job_mode, JobMode::Write | JobMode::Review) {
+            HandoffMode::Required
+        } else {
+            HandoffMode::None
+        };
+        if let Some(requested) = requested {
+            if locked && requested != expected {
+                return Err(format!(
+                    "handoff_mode is locked to {} for job_mode={}",
+                    expected.as_str(),
+                    job_mode.as_str()
+                ));
+            }
+            if requested == HandoffMode::Required && !locked {
+                return Err(
+                    "handoff_mode=required requires a locked handoff runtime profile".to_string(),
+                );
+            }
+            return Ok(requested);
+        }
+        Ok(expected)
+    }
+
+    pub(crate) fn handoff(&self) -> Option<&HandoffPolicy> {
+        self.handoff.as_ref()
+    }
+
+    pub(crate) fn require_codex_handoff_caller(&self) -> Result<(), String> {
+        if self.handoff.is_none() {
+            return Err("acknowledged handoffs are not enabled for this profile".to_string());
+        }
+        match env::var("PARLEY_CALLER") {
+            Ok(caller) if caller.eq_ignore_ascii_case("codex") => Ok(()),
+            _ => Err("handoff receipt requires the locked Codex caller".to_string()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         allowed_cwd_root: &Path,
@@ -847,6 +969,48 @@ fn add_health_tool_rules(
 fn add_lane_hook_tool_rules(hook: &Path, denies: &mut Vec<String>) {
     denies.push(format!("Bash(*{}*)", hook.to_string_lossy()));
     denies.push("Bash(*parley-lane-hook.exe*)".to_string());
+}
+
+fn add_handoff_hook_tool_rules(hook: &Path, denies: &mut Vec<String>) {
+    denies.push(format!("Bash(*{}*)", hook.to_string_lossy()));
+    denies.push("Bash(*parley-handoff-hook.exe*)".to_string());
+}
+
+fn required_absolute_dir_value(name: &str) -> Result<PathBuf, String> {
+    let value = env::var_os(name).ok_or_else(|| format!("{name} is required"))?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!("{name} must be absolute"));
+    }
+    if let Some(existing) = path.ancestors().find(|candidate| candidate.exists()) {
+        refuse_reparse_chain(existing).map_err(|error| error.to_string())?;
+    }
+    Ok(path)
+}
+
+fn required_executable(name: &str) -> Result<PathBuf, String> {
+    let value = env::var_os(name).ok_or_else(|| format!("{name} is required"))?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() || !path.is_file() {
+        return Err(format!(
+            "{name} is not an existing absolute file: {}",
+            path.display()
+        ));
+    }
+    refuse_reparse_chain(&path).map_err(|error| error.to_string())?;
+    fs::canonicalize(&path)
+        .map_err(|error| format!("canonicalize {name} {}: {error}", path.display()))
+}
+
+fn required_exact_u64(name: &str, expected: u64) -> Result<u64, String> {
+    let value = env_nonempty(name).ok_or_else(|| format!("{name} is required"))?;
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be an integer, got {value}"))?;
+    if parsed != expected {
+        return Err(format!("{name} must be {expected}, got {parsed}"));
+    }
+    Ok(parsed)
 }
 
 fn powershell_direct_command(path: &Path) -> Result<String, String> {
@@ -1415,6 +1579,54 @@ mod tests {
         let mut other = "task".to_string();
         policy.apply_handoff_contract("codex", &mut other);
         assert_eq!(other, "task");
+    }
+
+    #[test]
+    fn acknowledged_handoff_mode_is_locked_by_job_kind() {
+        let helper = PathBuf::from(r"C:\Program Files\Parley\helper.exe");
+        let policy = RuntimePolicy {
+            handoff: Some(HandoffPolicy {
+                state_dir: PathBuf::from(r"C:\Users\test\AppData\Local\Parley\handoffs"),
+                peer_peek_exe: helper.clone(),
+                wait_exe: helper.clone(),
+                alert_exe: helper.clone(),
+                hook_exe: helper,
+                peer_peek_command: "peer-peek".to_string(),
+                wait_command: "handoff-wait".to_string(),
+                alert_command: "peer-alert".to_string(),
+                wait_slice_secs: 300,
+                execution_ceiling_secs: 21_600,
+                acknowledgement_ceiling_secs: 21_600,
+                excerpt_chars: 4_096,
+                max_turns: 128,
+            }),
+            ..RuntimePolicy::default()
+        };
+        for mode in [JobMode::Write, JobMode::Review] {
+            assert_eq!(
+                policy.resolve_handoff_mode(mode, None).unwrap(),
+                HandoffMode::Required
+            );
+            assert_eq!(
+                policy
+                    .resolve_handoff_mode(mode, Some(HandoffMode::Required))
+                    .unwrap(),
+                HandoffMode::Required
+            );
+            assert!(policy
+                .resolve_handoff_mode(mode, Some(HandoffMode::None))
+                .is_err());
+        }
+        assert_eq!(
+            policy.resolve_handoff_mode(JobMode::Probe, None).unwrap(),
+            HandoffMode::None
+        );
+        assert!(policy
+            .resolve_handoff_mode(JobMode::Probe, Some(HandoffMode::Required))
+            .is_err());
+        assert!(RuntimePolicy::default()
+            .resolve_handoff_mode(JobMode::Write, Some(HandoffMode::Required))
+            .is_err());
     }
 
     #[test]

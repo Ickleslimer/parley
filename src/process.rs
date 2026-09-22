@@ -38,6 +38,36 @@ struct NoopSpawnObserver;
 
 impl SpawnObserver for NoopSpawnObserver {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+pub(crate) trait OutputObserver: Send + Sync {
+    /// Observe one exact byte chunk. Returning `true` retains the chunk in the
+    /// captured stream; returning `false` discards it after this call.
+    fn observe(&self, _stream: OutputStream, _chunk: &[u8]) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    /// Pauses the overall execution clock while an independently verified
+    /// helper wait is active. Idle accounting remains independent.
+    fn pause_overall_clock(&self) -> bool {
+        false
+    }
+
+    /// Supplies a caller-owned terminal deadline such as acknowledgement
+    /// expiry. The process runner never infers one from silence.
+    fn timeout_reason(&self) -> Option<String> {
+        None
+    }
+}
+
+struct NoopOutputObserver;
+
+impl OutputObserver for NoopOutputObserver {}
+
 /// Some agent CLIs keep a single, migration-locked local state store and wedge
 /// when two instances run at once. Antigravity's `agy` is the known case: two
 /// concurrent `agy` processes deadlock on their shared conversations DB
@@ -268,6 +298,24 @@ pub(crate) fn capture_invocation_timeout_controlled(
     cancellation: &CancellationToken,
     observer: &dyn SpawnObserver,
 ) -> Result<Captured, String> {
+    capture_invocation_timeout_controlled_observed(
+        invocation,
+        cwd,
+        timeouts,
+        cancellation,
+        observer,
+        &NoopOutputObserver,
+    )
+}
+
+pub(crate) fn capture_invocation_timeout_controlled_observed(
+    invocation: Invocation,
+    cwd: Option<&str>,
+    timeouts: Timeouts,
+    cancellation: &CancellationToken,
+    observer: &dyn SpawnObserver,
+    output_observer: &dyn OutputObserver,
+) -> Result<Captured, String> {
     // Held for the whole child run for commands that can't run concurrently
     // (see `exclusive_guard`); a no-op for everything else.
     let _exclusive = exclusive_guard(&invocation.command);
@@ -285,20 +333,22 @@ pub(crate) fn capture_invocation_timeout_controlled(
         }
     };
 
-    let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let (beat_tx, beat_rx) = mpsc::channel::<()>();
+    let mut out_buf = Vec::<u8>::new();
+    let mut err_buf = Vec::<u8>::new();
+    let (event_tx, event_rx) = mpsc::channel::<ReaderEvent>();
 
     let out_reader = child
         .take_stdout()
-        .map(|pipe| spawn_reader(pipe, Arc::clone(&out_buf), beat_tx.clone()));
+        .map(|pipe| spawn_reader(pipe, OutputStream::Stdout, event_tx.clone()));
     let err_reader = child
         .take_stderr()
-        .map(|pipe| spawn_reader(pipe, Arc::clone(&err_buf), beat_tx.clone()));
+        .map(|pipe| spawn_reader(pipe, OutputStream::Stderr, event_tx.clone()));
     // Drop our own sender so the channel disconnects once both readers finish.
-    drop(beat_tx);
+    drop(event_tx);
 
     let started = Instant::now();
+    let mut active_checkpoint = started;
+    let mut active_elapsed = Duration::ZERO;
     let mut last_activity = started;
     let mut timed_out = false;
     let mut cancelled = false;
@@ -307,6 +357,11 @@ pub(crate) fn capture_invocation_timeout_controlled(
     let tick = pick_tick(timeouts);
     let mut lifecycle_error = None;
     let status = loop {
+        let now = Instant::now();
+        if !output_observer.pause_overall_clock() {
+            active_elapsed = active_elapsed.saturating_add(now.duration_since(active_checkpoint));
+        }
+        active_checkpoint = now;
         match child.try_wait() {
             Ok(Some(exit_code)) => {
                 if let Err(error) = child.terminate_remaining_tree() {
@@ -350,7 +405,24 @@ pub(crate) fn capture_invocation_timeout_controlled(
                 }
             }
         }
-        if !timeouts.overall.is_zero() && started.elapsed() >= timeouts.overall {
+        if let Some(reason) = output_observer.timeout_reason() {
+            let termination = child.terminate().err();
+            timed_out = true;
+            match child.wait() {
+                Ok(status) => {
+                    lifecycle_error = Some(match termination {
+                        Some(error) => format!("{reason}; termination also failed: {error}"),
+                        None => reason,
+                    });
+                    break Some(status);
+                }
+                Err(error) => {
+                    lifecycle_error = Some(lifecycle_failure(&reason, termination, Some(error)));
+                    break None;
+                }
+            }
+        }
+        if !timeouts.overall.is_zero() && active_elapsed >= timeouts.overall {
             let termination = child.terminate().err();
             timed_out = true;
             match child.wait() {
@@ -372,10 +444,24 @@ pub(crate) fn capture_invocation_timeout_controlled(
                 }
             }
         }
-        match beat_rx.recv_timeout(tick) {
-            Ok(()) => {
-                last_activity = Instant::now();
-                continue;
+        match event_rx.recv_timeout(tick) {
+            Ok(event) => {
+                match observe_reader_event(event, output_observer, &mut out_buf, &mut err_buf) {
+                    Ok(()) => {
+                        last_activity = Instant::now();
+                        continue;
+                    }
+                    Err(error) => {
+                        let termination = child.terminate().err();
+                        let reaping = child.wait().err();
+                        lifecycle_error = Some(lifecycle_failure(
+                            &format!("output observer failed: {error}"),
+                            termination,
+                            reaping,
+                        ));
+                        break None;
+                    }
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // A child can close its inherited streams before it exits. Keep
@@ -440,8 +526,16 @@ pub(crate) fn capture_invocation_timeout_controlled(
         let _ = handle.join();
     }
 
-    let stdout = String::from_utf8_lossy(&out_buf.lock().unwrap()).into_owned();
-    let mut stderr = String::from_utf8_lossy(&err_buf.lock().unwrap()).into_owned();
+    for event in event_rx.try_iter() {
+        if let Err(error) = observe_reader_event(event, output_observer, &mut out_buf, &mut err_buf)
+        {
+            lifecycle_error.get_or_insert_with(|| format!("output observer failed: {error}"));
+            break;
+        }
+    }
+
+    let stdout = String::from_utf8_lossy(&out_buf).into_owned();
+    let mut stderr = String::from_utf8_lossy(&err_buf).into_owned();
     if let Some(error) = &lifecycle_error {
         if !stderr.is_empty() && !stderr.ends_with('\n') {
             stderr.push('\n');
@@ -634,8 +728,8 @@ fn idle_expired(last_activity: Instant, idle: Duration) -> bool {
 
 fn spawn_reader<R: Read + Send + 'static>(
     mut pipe: R,
-    buf: Arc<Mutex<Vec<u8>>>,
-    beat: mpsc::Sender<()>,
+    stream: OutputStream,
+    events: mpsc::Sender<ReaderEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut chunk = [0u8; 4096];
@@ -643,13 +737,40 @@ fn spawn_reader<R: Read + Send + 'static>(
             match pipe.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    buf.lock().unwrap().extend_from_slice(&chunk[..n]);
                     // A dead receiver just means the watchdog already moved on.
-                    let _ = beat.send(());
+                    if events
+                        .send(ReaderEvent {
+                            stream,
+                            bytes: chunk[..n].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
         }
     })
+}
+
+struct ReaderEvent {
+    stream: OutputStream,
+    bytes: Vec<u8>,
+}
+
+fn observe_reader_event(
+    event: ReaderEvent,
+    observer: &dyn OutputObserver,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+) -> Result<(), String> {
+    if observer.observe(event.stream, &event.bytes)? {
+        match event.stream {
+            OutputStream::Stdout => stdout.extend_from_slice(&event.bytes),
+            OutputStream::Stderr => stderr.extend_from_slice(&event.bytes),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -717,6 +838,134 @@ mod tests {
         assert_eq!(out.stdout, "abc");
         assert!(out.success);
         assert!(!out.timed_out);
+    }
+
+    struct DroppingObserver {
+        seen: Mutex<Vec<u8>>,
+    }
+
+    impl OutputObserver for DroppingObserver {
+        fn observe(&self, _stream: OutputStream, chunk: &[u8]) -> Result<bool, String> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(chunk);
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn output_observer_can_consume_bytes_without_retaining_raw_payloads() {
+        let observer = DroppingObserver {
+            seen: Mutex::new(Vec::new()),
+        };
+        let output = capture_invocation_timeout_controlled_observed(
+            inv("printf", &["private-stream"]),
+            None,
+            Timeouts {
+                overall: Duration::from_secs(2),
+                idle: Duration::from_secs(2),
+            },
+            &CancellationToken::default(),
+            &NoopSpawnObserver,
+            &observer,
+        )
+        .unwrap();
+        assert!(output.success);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            observer
+                .seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            b"private-stream"
+        );
+    }
+
+    struct RejectingObserver;
+
+    impl OutputObserver for RejectingObserver {
+        fn observe(&self, _stream: OutputStream, _chunk: &[u8]) -> Result<bool, String> {
+            Err("sanitizer rejected stream".to_string())
+        }
+    }
+
+    #[test]
+    fn observer_failure_reaps_started_child_and_returns_terminal_capture() {
+        let output = capture_invocation_timeout_controlled_observed(
+            inv("sh", &["-c", "printf x; sleep 10"]),
+            None,
+            Timeouts {
+                overall: Duration::from_secs(3),
+                idle: Duration::ZERO,
+            },
+            &CancellationToken::default(),
+            &NoopSpawnObserver,
+            &RejectingObserver,
+        )
+        .unwrap();
+        assert!(!output.success);
+        assert!(!output.timed_out);
+        assert!(output.stderr.contains("output observer failed"));
+        assert!(output.stderr.contains("sanitizer rejected stream"));
+    }
+
+    struct PausingObserver;
+
+    impl OutputObserver for PausingObserver {
+        fn pause_overall_clock(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn verified_pause_suspends_only_the_overall_execution_clock() {
+        let observer = PausingObserver;
+        let output = capture_invocation_timeout_controlled_observed(
+            inv("sleep", &["0.25"]),
+            None,
+            Timeouts {
+                overall: Duration::from_millis(150),
+                idle: Duration::ZERO,
+            },
+            &CancellationToken::default(),
+            &NoopSpawnObserver,
+            &observer,
+        )
+        .unwrap();
+        assert!(output.success, "{}", output.failure_message());
+        assert!(!output.timed_out);
+    }
+
+    struct ExpiredDecisionWindow;
+
+    impl OutputObserver for ExpiredDecisionWindow {
+        fn timeout_reason(&self) -> Option<String> {
+            Some("acknowledgement decision window expired".to_string())
+        }
+    }
+
+    #[test]
+    fn observer_owned_deadline_terminates_and_reaps_the_exact_child() {
+        let output = capture_invocation_timeout_controlled_observed(
+            inv("sleep", &["10"]),
+            None,
+            Timeouts {
+                overall: Duration::from_secs(5),
+                idle: Duration::ZERO,
+            },
+            &CancellationToken::default(),
+            &NoopSpawnObserver,
+            &ExpiredDecisionWindow,
+        )
+        .unwrap();
+        assert!(output.timed_out);
+        assert!(!output.success);
+        assert!(output
+            .stderr
+            .contains("acknowledgement decision window expired"));
     }
 
     #[cfg(windows)]

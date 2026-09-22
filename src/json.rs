@@ -257,31 +257,79 @@ impl<'a> Parser<'a> {
         self.expect(b'"')?;
         let mut s = String::new();
         loop {
-            match self.next_byte() {
-                Some(b'\\') => match self.next_byte() {
-                    Some(b'"') => s.push('"'),
-                    Some(b'\\') => s.push('\\'),
-                    Some(b'/') => s.push('/'),
-                    Some(b'n') => s.push('\n'),
-                    Some(b'r') => s.push('\r'),
-                    Some(b't') => s.push('\t'),
-                    Some(b'u') => {
-                        let mut hex = String::with_capacity(4);
-                        for _ in 0..4 {
-                            hex.push(self.next_byte().ok_or("incomplete unicode escape")? as char);
-                        }
-                        let code = u32::from_str_radix(&hex, 16)
-                            .map_err(|_| format!("invalid unicode escape: \\u{hex}"))?;
-                        s.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+            match self.peek() {
+                Some(b'\\') => {
+                    self.pos += 1;
+                    match self.next_byte() {
+                        Some(b'"') => s.push('"'),
+                        Some(b'\\') => s.push('\\'),
+                        Some(b'/') => s.push('/'),
+                        Some(b'n') => s.push('\n'),
+                        Some(b'r') => s.push('\r'),
+                        Some(b't') => s.push('\t'),
+                        Some(b'u') => s.push(self.parse_unicode_escape()?),
+                        Some(b) => return Err(format!("invalid escape: \\{}", b as char)),
+                        None => return Err("unexpected end in string escape".to_string()),
                     }
-                    Some(b) => return Err(format!("invalid escape: \\{}", b as char)),
-                    None => return Err("unexpected end in string escape".to_string()),
-                },
-                Some(b'"') => return Ok(s),
-                Some(b) => s.push(b as char),
+                }
+                Some(b'"') => {
+                    self.pos += 1;
+                    return Ok(s);
+                }
+                Some(byte) if byte < 0x20 => {
+                    return Err("unescaped control character in string".to_string())
+                }
+                Some(byte) if byte.is_ascii() => {
+                    self.pos += 1;
+                    s.push(byte as char);
+                }
+                Some(_) => {
+                    let remaining = std::str::from_utf8(&self.input[self.pos..])
+                        .map_err(|_| "invalid UTF-8 in string".to_string())?;
+                    let character = remaining
+                        .chars()
+                        .next()
+                        .ok_or_else(|| "unterminated string".to_string())?;
+                    self.pos += character.len_utf8();
+                    s.push(character);
+                }
                 None => return Err("unterminated string".to_string()),
             }
         }
+    }
+
+    fn parse_unicode_escape(&mut self) -> Result<char, String> {
+        let first = self.parse_hex_quad()?;
+        let code = if (0xd800..=0xdbff).contains(&first) {
+            if self.next_byte() != Some(b'\\') || self.next_byte() != Some(b'u') {
+                return Err("high surrogate is not followed by a low surrogate".to_string());
+            }
+            let second = self.parse_hex_quad()?;
+            if !(0xdc00..=0xdfff).contains(&second) {
+                return Err("high surrogate is not followed by a low surrogate".to_string());
+            }
+            0x1_0000 + (((u32::from(first) - 0xd800) << 10) | (u32::from(second) - 0xdc00))
+        } else if (0xdc00..=0xdfff).contains(&first) {
+            return Err("unpaired low surrogate in unicode escape".to_string());
+        } else {
+            u32::from(first)
+        };
+        char::from_u32(code).ok_or_else(|| "invalid unicode scalar in escape".to_string())
+    }
+
+    fn parse_hex_quad(&mut self) -> Result<u16, String> {
+        let start = self.pos;
+        let end = start.saturating_add(4);
+        let bytes = self
+            .input
+            .get(start..end)
+            .ok_or_else(|| "incomplete unicode escape".to_string())?;
+        if !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return Err("invalid unicode escape".to_string());
+        }
+        self.pos = end;
+        let text = std::str::from_utf8(bytes).expect("ASCII hex is UTF-8");
+        u16::from_str_radix(text, 16).map_err(|_| "invalid unicode escape".to_string())
     }
 
     fn parse_object(&mut self) -> Result<Json, String> {
@@ -465,6 +513,16 @@ mod tests {
         let input = r#"{"msg": "line1\nline2\ttab"}"#;
         let json = Json::parse(input).unwrap();
         assert_eq!(json.get("msg").unwrap().as_str(), Some("line1\nline2\ttab"));
+    }
+
+    #[test]
+    fn preserves_literal_utf8_and_combines_surrogate_pairs() {
+        let literal = Json::parse(r#"{"msg":"猫 🌍"}"#).unwrap();
+        assert_eq!(literal.get("msg").unwrap().as_str(), Some("猫 🌍"));
+        let escaped = Json::parse(r#"{"msg":"\ud83c\udf0d"}"#).unwrap();
+        assert_eq!(escaped.get("msg").unwrap().as_str(), Some("🌍"));
+        assert!(Json::parse(r#"{"msg":"\ud83cX"}"#).is_err());
+        assert!(Json::parse(r#"{"msg":"\udf0d"}"#).is_err());
     }
 
     #[test]

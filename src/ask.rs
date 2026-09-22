@@ -9,6 +9,7 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cli::{AskOptions, CliOptions};
@@ -26,7 +27,8 @@ use crate::job_lock::ExecutionLease;
 use crate::lane_grants::GrantSet;
 use crate::policy::{ContextPolicyRequest, PolicyRequest, RuntimePolicy};
 use crate::process::{
-    capture_invocation_timeout_controlled, CancellationToken, Captured, SpawnObserver, Timeouts,
+    capture_invocation_timeout_controlled_observed, CancellationToken, Captured, OutputObserver,
+    OutputStream, SpawnObserver, Timeouts,
 };
 use crate::session;
 use crate::signals::fnv1a_64;
@@ -84,6 +86,14 @@ pub(crate) struct AskSpawnReceipt {
 }
 
 pub(crate) trait AskSpawnObserver: Send + Sync {
+    fn configure_invocation(&self, _invocation: &mut Invocation) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn timeouts(&self, defaults: Timeouts) -> Timeouts {
+        defaults
+    }
+
     fn process_created(&self, _receipt: &AskSpawnReceipt) -> Result<(), String> {
         Ok(())
     }
@@ -95,6 +105,26 @@ pub(crate) trait AskSpawnObserver: Send + Sync {
     fn validate_completed_reply(&self, _reply: &str) -> Result<(), String> {
         Ok(())
     }
+
+    fn observe_output(&self, _stream: OutputStream, _chunk: &[u8]) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    fn pause_execution_clock(&self) -> bool {
+        false
+    }
+
+    fn timeout_reason(&self) -> Option<String> {
+        None
+    }
+
+    fn durable_reply_ready(&self) -> bool {
+        false
+    }
+
+    fn completed_reply(&self, _captured: &Captured) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 struct NoopAskSpawnObserver;
@@ -104,6 +134,8 @@ impl AskSpawnObserver for NoopAskSpawnObserver {}
 struct ProcessObserverAdapter<'a> {
     observer: &'a dyn AskSpawnObserver,
     request: &'a EventReceipt,
+    stateful: Option<&'a StatefulPrompt>,
+    context_committed: AtomicBool,
 }
 
 impl ProcessObserverAdapter<'_> {
@@ -124,6 +156,49 @@ impl SpawnObserver for ProcessObserverAdapter<'_> {
 
     fn process_resumed(&self, process_id: u32) -> Result<(), String> {
         self.observer.process_resumed(&self.receipt(process_id))
+    }
+}
+
+impl ProcessObserverAdapter<'_> {
+    fn commit_ready_context(&self) -> Result<(), String> {
+        let Some(stateful) = self.stateful else {
+            return Ok(());
+        };
+        if !self.observer.durable_reply_ready()
+            || self
+                .context_committed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Ok(());
+        }
+        if let Err(error) = stateful.commit(&self.request.exchange_id) {
+            self.context_committed.store(false, Ordering::Release);
+            return Err(format!(
+                "commit shared-context cursor at durable handoff: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn context_committed(&self) -> bool {
+        self.context_committed.load(Ordering::Acquire)
+    }
+}
+
+impl OutputObserver for ProcessObserverAdapter<'_> {
+    fn observe(&self, stream: OutputStream, chunk: &[u8]) -> Result<bool, String> {
+        let retain = self.observer.observe_output(stream, chunk)?;
+        self.commit_ready_context()?;
+        Ok(retain)
+    }
+
+    fn pause_overall_clock(&self) -> bool {
+        self.observer.pause_execution_clock()
+    }
+
+    fn timeout_reason(&self) -> Option<String> {
+        self.observer.timeout_reason()
     }
 }
 
@@ -494,7 +569,16 @@ pub(crate) fn run_prepared_with_receipt_controlled(
             ));
         }
     };
-    let timeouts = Timeouts::from_env();
+    if let Err(error) = observer.configure_invocation(&mut invocation) {
+        return Err(preflight_failure(
+            req,
+            &resolved.text,
+            exchange_id,
+            "job_preflight_error",
+            &format!("job invocation configuration failed; agent was not started: {error}"),
+        ));
+    }
+    let timeouts = observer.timeouts(Timeouts::from_env());
     let mut invocation_files = InvocationFiles::default();
     if let Some(guarded_launch) = guarded_launch {
         let profile_path = if guarded_launch.has_children() {
@@ -735,21 +819,33 @@ pub(crate) fn run_prepared_with_receipt_controlled(
     let process_observer = ProcessObserverAdapter {
         observer,
         request: log.request_receipt(),
+        stateful: resolved.stateful.as_ref(),
+        context_committed: AtomicBool::new(false),
     };
     let spawn_cwd = guarded_launch
         .map(GuardedSubagentLaunch::spawn_cwd)
         .or_else(|| req.cwd.to_str());
-    match capture_invocation_timeout_controlled(
+    match capture_invocation_timeout_controlled_observed(
         invocation,
         spawn_cwd,
         timeouts,
         cancellation,
         &process_observer,
+        &process_observer,
     ) {
-        Ok(out) => {
+        Ok(mut out) => {
             let lane_result = consume_grants(&mut active_grants);
             let duration_ms = started.elapsed().as_millis();
-            let raw_reply_result = out.reply();
+            let replacement = observer.completed_reply(&out);
+            let raw_reply_result = match replacement {
+                Ok(Some(reply)) if out.success => {
+                    out.stdout = reply.clone();
+                    Ok(reply)
+                }
+                Ok(Some(_)) => Err(out.failure_message()),
+                Ok(None) => out.reply(),
+                Err(error) => Err(error),
+            };
             let usable_reply = raw_reply_result.as_ref().ok().cloned();
             let reply_validation_error = raw_reply_result
                 .as_deref()
@@ -760,11 +856,13 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                 (Ok(_), Some(error)) => Err(error.clone()),
                 (Err(error), _) => Err(error.clone()),
             };
-            let context_result = resolved.stateful.as_ref().map(|stateful| {
-                if reply_result.is_ok() {
-                    stateful.commit(&exchange_id)
+            let context_result = resolved.stateful.as_ref().and_then(|stateful| {
+                if process_observer.context_committed() {
+                    None
+                } else if reply_result.is_ok() {
+                    Some(stateful.commit(&exchange_id))
                 } else {
-                    stateful.uncertain(&exchange_id)
+                    Some(stateful.uncertain(&exchange_id))
                 }
             });
             let log_result = match &reply_result {
