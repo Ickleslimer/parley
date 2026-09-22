@@ -1014,11 +1014,27 @@ impl HandoffSession {
                 stream_state.parser_failed = Some(error.clone());
                 return Err(error);
             }
-            let text = std::str::from_utf8(&line)
-                .map_err(|_| "Grok streaming-json record is not UTF-8".to_string())?;
+            let text = match std::str::from_utf8(&line) {
+                Ok(text) => text,
+                Err(_) => {
+                    let error = "Grok streaming-json record is not UTF-8".to_string();
+                    stream_state.parser_failed = Some(error.clone());
+                    return Err(error);
+                }
+            };
             let timestamp = now_ms();
-            if let Some(activity) = decode_stream_line(text, timestamp)? {
-                self.accept_activity(&mut stream_state, activity)?;
+            let activity = match decode_stream_line(text, timestamp) {
+                Ok(activity) => activity,
+                Err(error) => {
+                    stream_state.parser_failed = Some(error.clone());
+                    return Err(error);
+                }
+            };
+            if let Some(activity) = activity {
+                if let Err(error) = self.accept_activity(&mut stream_state, activity) {
+                    stream_state.parser_failed = Some(error.clone());
+                    return Err(error);
+                }
             }
         }
         Ok(false)
@@ -1029,6 +1045,9 @@ impl HandoffSession {
         stream: &mut HandoffStream,
         activity: SafeActivity,
     ) -> Result<(), String> {
+        if stream.saw_end {
+            return Err("Grok streaming-json emitted a record after terminal end".to_string());
+        }
         if activity.class == ActivityClass::End {
             stream.saw_end = true;
         }
@@ -2813,5 +2832,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(repaired, newer);
+    }
+
+    #[test]
+    fn stream_fails_closed_on_records_after_end_and_incomplete_tail() {
+        let terminal = test_handoff_session("terminal-stream");
+        terminal
+            .observe_output(
+                OutputStream::Stdout,
+                b"{\"type\":\"end\",\"stopReason\":\"end_turn\"}\n",
+            )
+            .unwrap();
+        let error = terminal
+            .observe_output(
+                OutputStream::Stdout,
+                b"{\"type\":\"text\",\"data\":\"too late\"}\n",
+            )
+            .unwrap_err();
+        assert!(error.contains("after terminal end"));
+        assert!(terminal
+            .complete(&Captured {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: false,
+                timed_out: false,
+                cancelled: false,
+            })
+            .unwrap_err()
+            .contains("parser failed"));
+
+        let incomplete = test_handoff_session("incomplete-stream");
+        incomplete
+            .observe_output(
+                OutputStream::Stdout,
+                b"{\"type\":\"text\",\"data\":\"tail\"}",
+            )
+            .unwrap();
+        assert!(incomplete
+            .complete(&Captured {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+                timed_out: false,
+                cancelled: false,
+            })
+            .unwrap_err()
+            .contains("incomplete record"));
     }
 }
