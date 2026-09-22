@@ -516,10 +516,68 @@ mod tests {
             7,
         )))
         .unwrap();
-        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["schemaVersion"], 2);
         assert_eq!(value["generatedMs"], 7);
         assert!(value.get("generated_ms").is_none());
         assert_eq!(value["diagnostics"]["snapshotMissing"], true);
+
+        let mut legacy = QueryDocument::unavailable(UnavailableReason::Missing, 7);
+        legacy.schema_version = 1;
+        let legacy_value = serde_json::to_value(PeerHealthSnapshot::from(legacy)).unwrap();
+        assert_eq!(legacy_value["schemaVersion"], 1);
+    }
+
+    #[test]
+    fn handoff_unacknowledged_is_not_an_event_log_handoff() {
+        let path = std::env::temp_dir().join(format!(
+            "parley-viewer-health-handoff-{}-{}.jsonl",
+            std::process::id(),
+            CONTROL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                response_line("event-a", "exchange-a", "session-a", "exact reply", 10)
+            ),
+        )
+        .unwrap();
+        let engine = EventEngine::new();
+        engine.set_source(Some(path.clone())).unwrap();
+        engine.poll();
+
+        let mut document = document_with(incident(ClosedClass::QuotaExhausted, 20));
+        document
+            .active_incidents
+            .push(incident(ClosedClass::HandoffUnacknowledged, 90));
+        let selection = select_handoff(&document, &engine);
+        assert_eq!(
+            selection.incident_id.as_deref(),
+            Some("incident-quota_exhausted")
+        );
+        assert!(!selection.exact_undelivered);
+        assert!(selection.label.contains("not proven undelivered"));
+        assert_eq!(selection.event.unwrap().event_id, "event-a");
+
+        let only = select_handoff(
+            &document_with(incident(ClosedClass::HandoffUnacknowledged, 90)),
+            &engine,
+        );
+        assert!(only.event.is_none());
+        assert_eq!(only.label, NO_HANDOFF_LABEL);
+        assert!(!only.exact_undelivered);
+        assert!(only.diagnostic.is_none());
+
+        let mut schema = document_with(incident(ClosedClass::HandoffUnacknowledged, 90));
+        schema.schema_version = 2;
+        let value = serde_json::to_value(PeerHealthSnapshot::from(schema)).unwrap();
+        assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(
+            value["activeIncidents"][0]["class"],
+            "handoff_unacknowledged"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

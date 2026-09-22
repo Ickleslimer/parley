@@ -5,6 +5,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::event_engine::{EventContent, ExchangePage, SearchPage, SessionPage, WidgetSnapshot};
 use crate::lifecycle;
+use crate::peer_activity::{self, PeerActivitySnapshot};
 use crate::peer_health::{self, HandoffSelection, PeerHealthSnapshot};
 use crate::runtime::{AppState, MonitorInfo, ViewerStatus};
 use crate::settings::ViewerSettings;
@@ -72,6 +73,11 @@ pub fn test_peer_health_chime() -> Result<(), String> {
 #[tauri::command]
 pub fn open_latest_handoff(state: State<'_, AppState>) -> HandoffSelection {
     peer_health::open_latest_handoff(&state.engine)
+}
+
+#[tauri::command]
+pub fn get_peer_activity() -> PeerActivitySnapshot {
+    peer_activity::snapshot()
 }
 
 #[tauri::command]

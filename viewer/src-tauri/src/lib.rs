@@ -5,7 +5,6 @@ mod commands;
 pub mod event_engine;
 mod launch;
 mod lifecycle;
-#[allow(dead_code)]
 mod peer_activity;
 mod peer_health;
 mod runtime;
@@ -36,6 +35,7 @@ pub fn run() {
             commands::set_peer_health_muted,
             commands::test_peer_health_chime,
             commands::open_latest_handoff,
+            commands::get_peer_activity,
             commands::get_settings,
             commands::save_settings,
             commands::list_monitors,
