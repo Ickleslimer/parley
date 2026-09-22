@@ -126,3 +126,36 @@ automatically retries Grok.
 The integration worktree is read-only while lane writers are active. Codex
 checkpoints each stopped lane and cherry-picks accepted commits in dependency
 order. Conflicts stop integration.
+
+## Milestone 6 acknowledged-handoff contract
+
+Acknowledgement-required asynchronous `write` and `review` jobs add a sibling
+handoff-schema-v1 journal without changing job schema v1 or event schema v1.
+`probe` and synchronous calls remain unacknowledged. The job fingerprint binds
+the selected `handoff_mode`.
+
+The handoff lifecycle is `pending`, `ready`, `awaiting_ack`, `acknowledged`,
+`detached_unacked`, or `catastrophe_exit`. Job `succeeded` requires a durable
+complete report, an explicit Codex receipt, and a clean Grok exit. Receipt means
+delivery only; it is not approval, recovery, or continuity authorization.
+
+The model-execution clock runs while the contained Grok process is alive and
+outside a verified five-minute handoff wait. It has a six-hour ceiling and no
+idle timeout. A separate six-hour receipt clock starts only after the exact
+report is flushed. Synchronous calls and probes retain the locked 30-minute
+total, 10-minute idle, and 30-turn limits; required handoff jobs use 128 turns.
+
+Manual activity peeks expose only event classes, timestamps, safe tool names,
+and a bounded exact visible-output excerpt. Hidden reasoning and raw tool
+inputs, outputs, locations, and content are discarded before storage. Peeks
+never emit a `stalled` verdict.
+
+The desktop widget continues to show completed event-log conversations. A
+pending acknowledged handoff is available only in the interactive detail
+window. Neither viewing it nor acknowledging its sound incident records a
+Codex receipt.
+
+Milestone 6 lane ownership is disjoint: Codex owns policy, MCP, ask/process
+integration, containment, installer wiring, and final acceptance;
+`grok-parent` owns `src/stream_activity.rs`; `grok-child-1` owns `handoff/`;
+`grok-child-2` owns health schema/model changes and viewer presentation.

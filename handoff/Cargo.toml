@@ -1,0 +1,37 @@
+[package]
+name = "parley-handoff"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+description = "Parley acknowledged-handoff evidence and constrained peer helpers"
+license = "MIT"
+publish = false
+
+[lib]
+name = "parley_handoff"
+path = "src/lib.rs"
+
+[[bin]]
+name = "parley-peer-peek"
+path = "src/bin/parley-peer-peek.rs"
+
+[[bin]]
+name = "parley-handoff-wait"
+path = "src/bin/parley-handoff-wait.rs"
+
+[[bin]]
+name = "parley-peer-alert"
+path = "src/bin/parley-peer-alert.rs"
+
+[[bin]]
+name = "parley-handoff-hook"
+path = "src/bin/parley-handoff-hook.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

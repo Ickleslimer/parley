@@ -1,0 +1,1 @@
+{"schema_version":2,"inbox_id":"handoff-example","kind":"peer_alert_requested","as_of_ms":1000,"source":"grok","class":"handoff_unacknowledged","incident_id":"handoff-11111111-1111-4111-8111-111111111111","session_id":"33333333-3333-4333-8333-333333333333","event_id":null,"exchange_id":"44444444-4444-4444-8444-444444444444"}

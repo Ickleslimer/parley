@@ -25,7 +25,7 @@ use crate::fuse;
 use crate::harness::{normalize_harness, Invocation};
 use crate::health_report::HealthReporter;
 use crate::job_runtime::{self, JobRuntime};
-use crate::jobs::{JobMode, JobSpec, MAX_LISTED_JOBS};
+use crate::jobs::{HandoffMode, JobMode, JobSpec, MAX_LISTED_JOBS};
 use crate::json::Json;
 use crate::policy::RuntimePolicy;
 use crate::process::{capture_invocation, run_invocation};
@@ -797,6 +797,21 @@ fn tools_list_result() -> Json {
             ),
         ]),
     );
+    start_properties.insert(
+        "handoff_mode".to_string(),
+        obj(vec![
+            ("type", Json::Str("string".to_string())),
+            (
+                "enum",
+                Json::Array(
+                    ["none", "required"]
+                        .into_iter()
+                        .map(|value| Json::Str(value.to_string()))
+                        .collect(),
+                ),
+            ),
+        ]),
+    );
     start_properties.insert("lane_plan".to_string(), lane_plan_prop);
     let start_job_tool = tool(
         "start_agent_job",
@@ -920,6 +935,13 @@ fn call_tool(
             let job_id = required_arg_string(args, "job_id")?;
             let mode = JobMode::parse(&required_arg_string(args, "job_mode")?)
                 .map_err(|error| (-32602, error))?;
+            let handoff_mode = args
+                .get("handoff_mode")
+                .and_then(Json::as_str)
+                .map(HandoffMode::parse)
+                .transpose()
+                .map_err(|error| (-32602, error))?
+                .unwrap_or_default();
             let request = parse_ask_request(args, default_cwd, policy)?;
             let lane_plan = args
                 .get("lane_plan")
@@ -929,6 +951,7 @@ fn call_tool(
             match jobs.start(JobSpec {
                 job_id,
                 mode,
+                handoff_mode,
                 request,
                 lane_plan,
             }) {
@@ -1485,6 +1508,17 @@ mod tests {
                 .filter_map(Json::as_str)
                 .collect::<Vec<_>>(),
             vec!["write", "review", "probe"]
+        );
+        assert_eq!(
+            properties
+                .get("handoff_mode")
+                .and_then(|property| property.get("enum"))
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Json::as_str)
+                .collect::<Vec<_>>(),
+            vec!["none", "required"]
         );
         let plan = properties.get("lane_plan").unwrap();
         let lanes = plan

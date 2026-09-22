@@ -5,6 +5,8 @@ mod commands;
 pub mod event_engine;
 mod launch;
 mod lifecycle;
+#[allow(dead_code)]
+mod peer_activity;
 mod peer_health;
 mod runtime;
 mod settings;

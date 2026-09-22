@@ -25,6 +25,7 @@ mod profile_namespace;
 mod session;
 mod sha256;
 mod signals;
+mod stream_activity;
 #[cfg(windows)]
 mod winjob;
 

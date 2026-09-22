@@ -446,6 +446,10 @@ fn canonical_request_json(spec: &JobSpec) -> Result<String, JobError> {
         Json::Str(spec.request.harness.clone()),
     );
     map.insert(
+        "handoff_mode".to_string(),
+        Json::Str(spec.handoff_mode.as_str().to_string()),
+    );
+    map.insert(
         "lane_plan".to_string(),
         lane_plan_json(spec.lane_plan.as_ref())?,
     );
@@ -1916,6 +1920,7 @@ mod tests {
         JobSpec {
             job_id: job_id.to_string(),
             mode: JobMode::Write,
+            handoff_mode: crate::jobs::HandoffMode::None,
             request: request(prompt),
             lane_plan: None,
         }
@@ -2066,6 +2071,9 @@ mod tests {
         forward.request.yolo = true;
         assert_ne!(forward_hash, request_fingerprint(&forward).unwrap());
         forward.request.yolo = false;
+        forward.handoff_mode = crate::jobs::HandoffMode::Required;
+        assert_ne!(forward_hash, request_fingerprint(&forward).unwrap());
+        forward.handoff_mode = crate::jobs::HandoffMode::None;
         forward.request.context.as_mut().unwrap().recovery = Some(ContextRecovery::Skip);
         assert_ne!(forward_hash, request_fingerprint(&forward).unwrap());
 

@@ -19,6 +19,32 @@ pub(crate) enum JobMode {
     Probe,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum HandoffMode {
+    #[default]
+    None,
+    Required,
+}
+
+impl HandoffMode {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "required" => Ok(Self::Required),
+            _ => Err(format!(
+                "handoff_mode must be none or required, got {value}"
+            )),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Required => "required",
+        }
+    }
+}
+
 impl JobMode {
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
@@ -163,6 +189,7 @@ pub(crate) struct LanePlan {
 pub(crate) struct JobSpec {
     pub job_id: String,
     pub mode: JobMode,
+    pub handoff_mode: HandoffMode,
     pub request: AskRequest,
     pub lane_plan: Option<LanePlan>,
 }
@@ -194,5 +221,10 @@ mod tests {
         assert!(JobState::parse("canceled").is_err());
         assert!(!JobState::Running.is_terminal());
         assert!(JobState::Interrupted.is_terminal());
+        assert_eq!(
+            HandoffMode::parse("required").unwrap(),
+            HandoffMode::Required
+        );
+        assert!(HandoffMode::parse("auto").is_err());
     }
 }

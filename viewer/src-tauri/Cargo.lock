@@ -2451,6 +2451,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "parley-handoff"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "parley-health"
 version = "0.1.0"
 dependencies = [
@@ -2463,6 +2471,7 @@ dependencies = [
 name = "parley-viewer"
 version = "0.1.0"
 dependencies = [
+ "parley-handoff",
  "parley-health",
  "serde",
  "serde_json",
