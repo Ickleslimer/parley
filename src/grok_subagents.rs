@@ -785,7 +785,7 @@ mod tests {
         assert!(!invocation
             .args
             .iter()
-            .any(|argument| argument.contains(r"\\?\")));
+            .any(|argument| argument.contains("\\\\?\\")));
     }
 
     #[test]
