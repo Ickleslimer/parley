@@ -490,7 +490,7 @@ fn build_prepared(req: &AskRequest, prompt: String) -> Result<Invocation, String
         ..CliOptions::default()
     };
 
-    let request = Request::from_options(options, String::new())?;
+    let request = Request::from_prepared_options(options, String::new());
     let harness = HarnessFactory::default().create(&request.harness)?;
     let mut invocation = harness.build(&request)?;
     enforce_subagent_boundary(req, &mut invocation);
@@ -1450,5 +1450,33 @@ mod tests {
         );
         enforce_subagent_boundary(&request, &mut guarded);
         assert!(!guarded.args.iter().any(|arg| arg == "--no-subagents"));
+    }
+
+    #[test]
+    fn prepared_handoff_turn_limit_reaches_the_grok_invocation() {
+        let request = AskRequest {
+            harness: "grok".to_string(),
+            prompt: "task".to_string(),
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            cwd: env::current_dir().unwrap(),
+            permission_mode: None,
+            max_turns: Some("128".to_string()),
+            session_id: Some("d86f917a-e10f-46b3-8519-849826fb046f".to_string()),
+            resume_id: None,
+            yolo: false,
+            context: None,
+            max_context_chars: None,
+            allow_subagents: false,
+        };
+
+        let invocation = build_prepared(&request, request.prompt.clone()).unwrap();
+        let max_turns = invocation
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--max-turns")
+            .map(|pair| pair[1].as_str());
+        assert_eq!(max_turns, Some("128"));
     }
 }

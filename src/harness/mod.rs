@@ -54,9 +54,25 @@ pub(crate) struct Request {
 
 impl Request {
     pub(crate) fn from_options(options: CliOptions, piped_input: String) -> Result<Self, String> {
+        let mut request = Self::from_prepared_options(options, piped_input);
+        crate::policy::RuntimePolicy::from_env()?.apply_request(crate::policy::PolicyRequest {
+            harness: &request.harness,
+            yolo: request.yolo,
+            model: &mut request.model,
+            reasoning_effort: &mut request.reasoning_effort,
+            permission_mode: &mut request.permission_mode,
+            max_turns: &mut request.max_turns,
+            session_id: request.session_id.as_deref(),
+            resume_id: request.resume_id.as_deref(),
+            passthrough: &request.passthrough,
+        })?;
+        Ok(request)
+    }
+
+    pub(crate) fn from_prepared_options(options: CliOptions, piped_input: String) -> Self {
         let prompt = merge_prompt(&piped_input, options.prompt.as_deref());
 
-        let mut request = Self {
+        Self {
             harness: normalize_harness(&options.harness),
             provider: options.provider,
             model: options.model,
@@ -73,19 +89,7 @@ impl Request {
             yolo: options.yolo,
             session_id: options.session_id,
             resume_id: options.resume_id,
-        };
-        crate::policy::RuntimePolicy::from_env()?.apply_request(crate::policy::PolicyRequest {
-            harness: &request.harness,
-            yolo: request.yolo,
-            model: &mut request.model,
-            reasoning_effort: &mut request.reasoning_effort,
-            permission_mode: &mut request.permission_mode,
-            max_turns: &mut request.max_turns,
-            session_id: request.session_id.as_deref(),
-            resume_id: request.resume_id.as_deref(),
-            passthrough: &request.passthrough,
-        })?;
-        Ok(request)
+        }
     }
 }
 
@@ -453,6 +457,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.prompt.as_deref(), Some("hello\n\nsummarize"));
+    }
+
+    #[test]
+    fn prepared_options_preserve_runtime_authorized_turns() {
+        let request = Request::from_prepared_options(
+            CliOptions {
+                harness: "grok".to_string(),
+                max_turns: Some("128".to_string()),
+                ..CliOptions::default()
+            },
+            String::new(),
+        );
+        assert_eq!(request.max_turns.as_deref(), Some("128"));
     }
 
     #[test]
