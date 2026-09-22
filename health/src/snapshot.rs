@@ -4,12 +4,14 @@ use std::time::Duration;
 use crate::fsutil;
 use crate::paths::HealthPaths;
 use crate::schema::{
-    now_ms, HealthError, QueryDocument, UnavailableReason, MAX_SNAPSHOT_BYTES, SCHEMA_VERSION,
-    SNAPSHOT_RETRY_COUNT, SNAPSHOT_RETRY_MS, STALE_AFTER_MS,
+    accepted_schema, now_ms, HealthError, QueryDocument, UnavailableReason, MAX_SNAPSHOT_BYTES,
+    SCHEMA_VERSION, SNAPSHOT_RETRY_COUNT, SNAPSHOT_RETRY_MS, STALE_AFTER_MS,
 };
 
 pub fn write(paths: &HealthPaths, document: &QueryDocument) -> Result<(), HealthError> {
-    let bytes = serde_json::to_vec_pretty(document)?;
+    let mut stored = document.clone();
+    stored.schema_version = SCHEMA_VERSION;
+    let bytes = serde_json::to_vec_pretty(&stored)?;
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(HealthError::msg("snapshot exceeds bound"));
     }
@@ -71,11 +73,12 @@ fn read_once(paths: &HealthPaths) -> Result<QueryDocument, ReadFailure> {
     if read.clipped {
         return Err(ReadFailure::Malformed);
     }
-    let document: QueryDocument = serde_json::from_slice(fsutil::strip_bom(&read.bytes))
+    let mut document: QueryDocument = serde_json::from_slice(fsutil::strip_bom(&read.bytes))
         .map_err(|_| ReadFailure::Malformed)?;
-    if document.schema_version != SCHEMA_VERSION {
+    if !accepted_schema(document.schema_version) {
         return Err(ReadFailure::Malformed);
     }
+    document.schema_version = SCHEMA_VERSION;
     if document.unavailable.is_some() {
         return Ok(document);
     }

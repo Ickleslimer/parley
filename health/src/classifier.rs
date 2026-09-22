@@ -72,6 +72,7 @@ pub fn classify_parley(success: bool, class_hint: Option<ClosedClass>) -> Classi
             Some(ClosedClass::McpStdoutUndelivered) => ClosedClass::McpStdoutUndelivered,
             Some(ClosedClass::CapacityThrottle) => ClosedClass::CapacityThrottle,
             Some(ClosedClass::QuotaExhausted) => ClosedClass::TurnError,
+            Some(ClosedClass::HandoffUnacknowledged) => ClosedClass::UsageSample,
             Some(ClosedClass::TurnError) | Some(ClosedClass::UsageSample) | None => {
                 ClosedClass::TurnError
             }

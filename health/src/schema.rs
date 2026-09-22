@@ -4,7 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+pub fn accepted_schema(version: u32) -> bool {
+    matches!(version, 1 | SCHEMA_VERSION)
+}
 pub const SOUND_COOLDOWN_MS: u64 = 60_000;
 pub const STALE_AFTER_MS: u64 = 120_000;
 pub const MAX_HOOK_STDIN: usize = 256 * 1024;
@@ -68,6 +72,7 @@ pub enum ClosedClass {
     TurnError,
     WatchdogKilled,
     McpStdoutUndelivered,
+    HandoffUnacknowledged,
 }
 
 impl ClosedClass {
@@ -79,6 +84,7 @@ impl ClosedClass {
             Self::TurnError => "turn_error",
             Self::WatchdogKilled => "watchdog_killed",
             Self::McpStdoutUndelivered => "mcp_stdout_undelivered",
+            Self::HandoffUnacknowledged => "handoff_unacknowledged",
         }
     }
 
@@ -87,7 +93,10 @@ impl ClosedClass {
     }
 
     pub fn is_audible(self) -> bool {
-        matches!(self, Self::QuotaExhausted | Self::McpStdoutUndelivered)
+        matches!(
+            self,
+            Self::QuotaExhausted | Self::McpStdoutUndelivered | Self::HandoffUnacknowledged
+        )
     }
 }
 
@@ -122,6 +131,8 @@ pub enum InboxKind {
     Acknowledge,
     Mute,
     TestSound,
+    PeerAlertRequested,
+    HandoffReceived,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -120,6 +120,26 @@ pub fn mcp_undelivered(inbox_id: &str, as_of_ms: u64) -> HealthRecord {
     record
 }
 
+pub fn peer_alert(incident_id: &str, as_of_ms: u64) -> HealthRecord {
+    inbox::peer_alert_requested_record(
+        incident_id,
+        as_of_ms,
+        Some("grok-session"),
+        Some("exchange-1"),
+    )
+    .expect("peer alert")
+}
+
+pub fn handoff_receipt(incident_id: &str, as_of_ms: u64) -> HealthRecord {
+    inbox::handoff_received_record(
+        incident_id,
+        as_of_ms,
+        Some("grok-session"),
+        Some("exchange-1"),
+    )
+    .expect("handoff receipt")
+}
+
 pub fn put_inbox(home: &TempHome, record: &HealthRecord) {
     inbox::write_record(&home.paths, record).expect("inbox write");
 }

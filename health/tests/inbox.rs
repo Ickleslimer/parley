@@ -1,7 +1,7 @@
 use std::fs;
 
 use parley_health::inbox;
-use parley_health::schema::InboxKind;
+use parley_health::schema::{InboxKind, SCHEMA_VERSION};
 
 mod common;
 
@@ -62,4 +62,21 @@ fn viewer_control_records_are_explicit() {
     assert_eq!(test.kind, InboxKind::TestSound);
     assert_eq!(test.test_sound, Some(true));
     assert!(test.class.is_none());
+}
+
+#[test]
+fn v1_inbox_is_accepted_and_all_new_writes_are_v2() {
+    let home = common::TempHome::new("inbox-migration");
+    let mut legacy = common::codex_sample("legacy-inbox", 1, None);
+    legacy.schema_version = 1;
+    let path = inbox::write_record(&home.paths, &legacy).unwrap();
+    let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(written["schema_version"], SCHEMA_VERSION);
+
+    let mut direct_legacy = common::codex_sample("direct-legacy", 2, None);
+    direct_legacy.schema_version = 1;
+    let direct_path = home.paths.inbox().join("direct-legacy.json");
+    fs::write(&direct_path, serde_json::to_vec(&direct_legacy).unwrap()).unwrap();
+    let parsed = inbox::read_record(&direct_path).unwrap();
+    assert_eq!(parsed.schema_version, 1);
 }

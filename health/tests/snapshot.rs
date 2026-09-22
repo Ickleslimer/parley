@@ -52,3 +52,35 @@ fn query_document_has_no_peer_alive_or_continuity_fields() {
     assert!(!json.contains("continuity"));
     assert!(!json.contains("authorization"));
 }
+
+#[test]
+fn reads_v1_as_v2_and_rejects_v3() {
+    let home = common::TempHome::new("snapshot-migration");
+    let mut legacy =
+        QueryDocument::unavailable(parley_health::schema::UnavailableReason::Missing, 1);
+    legacy.schema_version = 1;
+    fs::write(home.paths.snapshot(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let read = snapshot::read_with_retry(&home.paths);
+    assert_eq!(read.schema_version, SCHEMA_VERSION);
+    assert_eq!(read.unavailable, legacy.unavailable);
+
+    legacy.schema_version = 3;
+    fs::write(home.paths.snapshot(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let rejected = snapshot::read_with_retry(&home.paths);
+    assert_eq!(
+        rejected.unavailable.unwrap().reason,
+        parley_health::schema::UnavailableReason::Malformed
+    );
+}
+
+#[test]
+fn snapshot_writer_normalizes_legacy_documents_to_v2() {
+    let home = common::TempHome::new("snapshot-write-migration");
+    let mut legacy =
+        QueryDocument::unavailable(parley_health::schema::UnavailableReason::Missing, 1);
+    legacy.schema_version = 1;
+    snapshot::write(&home.paths, &legacy).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.paths.snapshot()).unwrap()).unwrap();
+    assert_eq!(json["schema_version"], SCHEMA_VERSION);
+}

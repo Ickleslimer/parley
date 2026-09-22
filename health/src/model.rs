@@ -6,10 +6,10 @@ use crate::classifier::{
     GrokErrorEvidence,
 };
 use crate::schema::{
-    bound_string, nonempty_reached_type, sanitize_percent, ClosedClass, CodexSampleView,
-    GrokObservationView, HealthRecord, InboxKind, IncidentStatus, IncidentView, QueryDiagnostics,
-    QueryDocument, Source, MAX_ACTIVE_INCIDENTS, MAX_PLAN_LEN, MAX_RECENT_INCIDENTS,
-    SCHEMA_VERSION, SOUND_COOLDOWN_MS,
+    bound_string, nonempty_reached_type, sanitize_id, sanitize_percent, ClosedClass,
+    CodexSampleView, GrokObservationView, HealthRecord, InboxKind, IncidentStatus, IncidentView,
+    QueryDiagnostics, QueryDocument, Source, MAX_ACTIVE_INCIDENTS, MAX_PLAN_LEN,
+    MAX_RECENT_INCIDENTS, SCHEMA_VERSION, SOUND_COOLDOWN_MS,
 };
 use crate::sound::SoundKind;
 
@@ -38,6 +38,7 @@ pub struct HealthModel {
     pub latest_codex: Option<CodexSampleView>,
     pub latest_grok: Option<GrokObservationView>,
     pub diagnostics: QueryDiagnostics,
+    pub receipts: HashMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,6 +78,8 @@ impl HealthModel {
             InboxKind::Acknowledge => self.apply_ack(&mut record, now_ms),
             InboxKind::Mute => self.apply_mute(&mut record),
             InboxKind::TestSound => self.apply_test_sound(&mut record, now_ms, replay),
+            InboxKind::PeerAlertRequested => self.apply_peer_alert(&mut record, now_ms),
+            InboxKind::HandoffReceived => self.apply_handoff_receipt(&mut record, now_ms),
         };
         if !replay {
             if let Some(sound) = outcome.sound {
@@ -304,6 +307,130 @@ impl HealthModel {
             record.last_sound_ms = Some(now_ms);
         }
         outcome
+    }
+
+    fn apply_peer_alert(&mut self, record: &mut HealthRecord, now_ms: u64) -> ApplyOutcome {
+        if record.source != Some(Source::Grok) {
+            return ApplyOutcome::default();
+        }
+        if record.class != Some(ClosedClass::HandoffUnacknowledged) {
+            return ApplyOutcome::default();
+        }
+        let Some(incident_id) = record.incident_id.as_deref().and_then(sanitize_id) else {
+            return ApplyOutcome::default();
+        };
+        record.source = Some(Source::Grok);
+        record.class = Some(ClosedClass::HandoffUnacknowledged);
+        record.incident_id = Some(incident_id.clone());
+        if let Some(existing) = self
+            .incidents
+            .iter_mut()
+            .find(|incident| incident.incident_id == incident_id)
+        {
+            if existing.class != ClosedClass::HandoffUnacknowledged {
+                return ApplyOutcome::default();
+            }
+            if existing.session_id.is_none() {
+                existing.session_id = record.session_id.clone();
+            }
+            if existing.event_id.is_none() {
+                existing.event_id = record.event_id.clone();
+            }
+            if existing.exchange_id.is_none() {
+                existing.exchange_id = record.exchange_id.clone();
+            }
+            return ApplyOutcome::default();
+        }
+        let mut incident = Incident {
+            incident_id: incident_id.clone(),
+            class: ClosedClass::HandoffUnacknowledged,
+            source: Source::Grok,
+            status: IncidentStatus::Active,
+            opened_ms: now_ms,
+            as_of_ms: record.as_of_ms,
+            recovered_ms: None,
+            session_id: record.session_id.clone(),
+            event_id: record.event_id.clone(),
+            exchange_id: record.exchange_id.clone(),
+        };
+        let mut outcome = ApplyOutcome {
+            opened: true,
+            ..ApplyOutcome::default()
+        };
+        if self.receipt_covers(&incident_id, record.as_of_ms) {
+            incident.status = IncidentStatus::Recovered;
+            incident.recovered_ms = Some(now_ms);
+            record.recovered_incident_id = Some(incident_id);
+            outcome.recovered = true;
+        } else {
+            outcome.sound = self.consider_sound(
+                &incident.incident_id,
+                ClosedClass::HandoffUnacknowledged,
+                now_ms,
+                false,
+            );
+        }
+        self.incidents.push(incident);
+        outcome
+    }
+
+    fn apply_handoff_receipt(&mut self, record: &mut HealthRecord, now_ms: u64) -> ApplyOutcome {
+        if record.source != Some(Source::Codex) {
+            return ApplyOutcome::default();
+        }
+        if record.class != Some(ClosedClass::HandoffUnacknowledged) {
+            return ApplyOutcome::default();
+        }
+        let Some(incident_id) = record.incident_id.as_deref().and_then(sanitize_id) else {
+            return ApplyOutcome::default();
+        };
+        record.incident_id = Some(incident_id.clone());
+        record.class = Some(ClosedClass::HandoffUnacknowledged);
+        let receipt_ms = record.as_of_ms;
+        let entry = self
+            .receipts
+            .entry(incident_id.clone())
+            .or_insert(receipt_ms);
+        if receipt_ms > *entry {
+            *entry = receipt_ms;
+        }
+        let mut outcome = ApplyOutcome::default();
+        if self.recover_named_handoff(&incident_id, receipt_ms, now_ms, record) {
+            outcome.recovered = true;
+        }
+        outcome
+    }
+
+    fn receipt_covers(&self, incident_id: &str, alert_ms: u64) -> bool {
+        self.receipts
+            .get(incident_id)
+            .is_some_and(|receipt_ms| *receipt_ms >= alert_ms)
+    }
+
+    fn recover_named_handoff(
+        &mut self,
+        incident_id: &str,
+        receipt_ms: u64,
+        now_ms: u64,
+        record: &mut HealthRecord,
+    ) -> bool {
+        let Some(incident) = self
+            .incidents
+            .iter_mut()
+            .find(|incident| incident.incident_id == incident_id)
+        else {
+            return false;
+        };
+        if incident.class != ClosedClass::HandoffUnacknowledged
+            || incident.status != IncidentStatus::Active
+            || receipt_ms < incident.as_of_ms
+        {
+            return false;
+        }
+        incident.status = IncidentStatus::Recovered;
+        incident.recovered_ms = Some(now_ms);
+        record.recovered_incident_id = Some(incident_id.to_string());
+        true
     }
 
     fn apply_policy_diagnostic(&mut self, record: &mut HealthRecord) -> ApplyOutcome {

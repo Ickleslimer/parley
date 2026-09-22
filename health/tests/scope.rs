@@ -1,7 +1,7 @@
 use parley_health::command::{analyze_command, HealthBinary};
 use parley_health::scope::{
     canonical_contains, canonical_contains_existing, normalize_windows_path, paths_equivalent,
-    query_matches_installed, worktrees_from_common_dir, ExecutableIdentity,
+    query_matches_installed, worktrees_from_common_dir, ExecutableIdentity, ScopeFile,
 };
 
 mod common;
@@ -100,4 +100,23 @@ fn command_analysis_unescapes_powershell_direct_paths() {
         Some(r"C:\Program Files\Parley Conversation Viewer\health\parley-health-query.exe")
     );
     assert!(query.is_exact_query());
+}
+
+#[test]
+fn scope_accepts_v1_normalizes_writes_and_rejects_v3() {
+    let home = common::TempHome::new("scope-migration");
+    let mut legacy = ScopeFile::empty();
+    legacy.schema_version = 1;
+    std::fs::write(home.paths.scope(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let loaded = ScopeFile::load(&home.paths.scope()).unwrap();
+    assert_eq!(loaded.schema_version, 2);
+
+    legacy.save(&home.paths.scope()).unwrap();
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.paths.scope()).unwrap()).unwrap();
+    assert_eq!(written["schema_version"], 2);
+
+    legacy.schema_version = 3;
+    std::fs::write(home.paths.scope(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(ScopeFile::load(&home.paths.scope()).is_err());
 }

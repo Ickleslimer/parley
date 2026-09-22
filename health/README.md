@@ -35,16 +35,22 @@ query may run; it does not admit `StopFailure` evidence from that repository.
 
 ## Evidence boundaries
 
-Health schema v1 stores sanitized classes, identifiers, timestamps, provider
-usage fields, and transport references only. It never stores prompts, replies,
-credentials, raw environment values, command arguments, or raw provider error
-payloads. Silence is never evidence of failure. Acknowledgement suppresses a
-repeat alert but never means recovery.
+Health schema v2 stores sanitized classes, identifiers, timestamps, provider
+usage fields, and transport references only. Readers accept schema v1 and v2
+journals, inbox records, durable state, cached scope, and snapshots, then
+normalize new writes to v2. Any other schema version is rejected. The package
+never stores prompts, replies, credentials, raw environment values, command
+arguments, or raw provider error payloads. Silence is never evidence of
+failure. Viewer acknowledgement suppresses a repeat alert but never means
+recovery.
 
-Only `quota_exhausted` and `mcp_stdout_undelivered` incidents are audible. The
-global acoustic cooldown is 60 seconds and each incident can sound once. The
-user-triggered test chime creates no incident and remains available while
-incident sounds are muted.
+Only `quota_exhausted`, `mcp_stdout_undelivered`, and explicit
+`handoff_unacknowledged` incidents are audible. A handoff incident is opened
+only by `peer_alert_requested` and keeps the supplied incident id. It is
+recovered only by `handoff_received` for that same id when the receipt time is
+greater than or equal to the alert evidence time. The global acoustic cooldown
+is 60 seconds and each incident can sound once. The user-triggered test chime
+creates no incident and remains available while incident sounds are muted.
 
 ## Chime
 

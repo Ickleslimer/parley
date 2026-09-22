@@ -8,7 +8,7 @@ use crate::model::{codex_record, durable_state, ApplyOutcome, HealthModel};
 use crate::paths::HealthPaths;
 use crate::sampler::{AppServerSampler, CodexSampler};
 use crate::schema::{
-    now_ms, HealthError, HealthRecord, CODEX_SAMPLE_MS, INBOX_BATCH, POLL_MS, SCHEMA_VERSION,
+    accepted_schema, now_ms, HealthError, HealthRecord, CODEX_SAMPLE_MS, INBOX_BATCH, POLL_MS,
 };
 use crate::scope::{ScopeFile, ScopeUpdate};
 use crate::snapshot;
@@ -49,7 +49,7 @@ impl Supervisor {
                 if let Ok(state) = serde_json::from_slice::<crate::model::DurableState>(
                     crate::fsutil::strip_bom(&bytes.bytes),
                 ) {
-                    if state.schema_version == SCHEMA_VERSION {
+                    if accepted_schema(state.schema_version) {
                         model.muted = state.muted;
                         model.acks = state.acknowledgements;
                         model.sounded_incident_ids =

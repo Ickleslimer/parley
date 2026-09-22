@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::HealthBinary;
 use crate::fsutil::{self, FileIdentity};
-use crate::schema::{HealthError, SCHEMA_VERSION};
+use crate::schema::{accepted_schema, HealthError, SCHEMA_VERSION};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ScopeFile {
@@ -84,10 +84,11 @@ impl ScopeFile {
         if bytes.clipped {
             return Err(HealthError::msg("scope.json exceeds bound"));
         }
-        let parsed: Self = serde_json::from_slice(fsutil::strip_bom(&bytes.bytes))?;
-        if parsed.schema_version != SCHEMA_VERSION {
+        let mut parsed: Self = serde_json::from_slice(fsutil::strip_bom(&bytes.bytes))?;
+        if !accepted_schema(parsed.schema_version) {
             return Err(HealthError::msg("unsupported scope schema"));
         }
+        parsed.schema_version = SCHEMA_VERSION;
         Ok(parsed)
     }
 
@@ -96,7 +97,9 @@ impl ScopeFile {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), HealthError> {
-        let bytes = serde_json::to_vec_pretty(self)?;
+        let mut stored = self.clone();
+        stored.schema_version = SCHEMA_VERSION;
+        let bytes = serde_json::to_vec_pretty(&stored)?;
         fsutil::atomic_write(path, &bytes)
     }
 

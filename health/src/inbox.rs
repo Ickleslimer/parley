@@ -4,17 +4,20 @@ use std::path::{Path, PathBuf};
 use crate::fsutil;
 use crate::paths::HealthPaths;
 use crate::schema::{
-    sanitize_id, HealthError, HealthRecord, InboxKind, MAX_INBOX_BYTES, SCHEMA_VERSION,
+    accepted_schema, sanitize_id, ClosedClass, HealthError, HealthRecord, InboxKind, Source,
+    MAX_INBOX_BYTES, SCHEMA_VERSION,
 };
 
 pub fn write_record(paths: &HealthPaths, record: &HealthRecord) -> Result<PathBuf, HealthError> {
     paths.ensure()?;
     let inbox_id = sanitize_id(&record.inbox_id)
         .ok_or_else(|| HealthError::msg("inbox_id missing or invalid"))?;
-    if record.schema_version != SCHEMA_VERSION {
-        return Err(HealthError::msg("inbox schema_version must be 1"));
+    if !accepted_schema(record.schema_version) {
+        return Err(HealthError::msg("inbox schema_version must be 1 or 2"));
     }
-    let bytes = serde_json::to_vec(record)?;
+    let mut stored = record.clone();
+    stored.schema_version = SCHEMA_VERSION;
+    let bytes = serde_json::to_vec(&stored)?;
     if bytes.len() > MAX_INBOX_BYTES {
         return Err(HealthError::msg("inbox record exceeds bound"));
     }
@@ -46,6 +49,43 @@ pub fn mute_record(muted: bool, as_of_ms: u64) -> HealthRecord {
     record.source = Some(crate::schema::Source::Viewer);
     record.muted = Some(muted);
     record
+}
+
+pub fn peer_alert_requested_record(
+    incident_id: &str,
+    as_of_ms: u64,
+    session_id: Option<&str>,
+    exchange_id: Option<&str>,
+) -> Result<HealthRecord, HealthError> {
+    let incident_id =
+        sanitize_id(incident_id).ok_or_else(|| HealthError::msg("invalid incident_id"))?;
+    let mut record =
+        HealthRecord::new(InboxKind::PeerAlertRequested, incident_id.clone(), as_of_ms);
+    record.source = Some(Source::Grok);
+    record.class = Some(ClosedClass::HandoffUnacknowledged);
+    record.incident_id = Some(incident_id);
+    record.session_id = optional_id(session_id)?;
+    record.exchange_id = optional_id(exchange_id)?;
+    Ok(record)
+}
+
+pub fn handoff_received_record(
+    incident_id: &str,
+    as_of_ms: u64,
+    session_id: Option<&str>,
+    exchange_id: Option<&str>,
+) -> Result<HealthRecord, HealthError> {
+    let incident_id =
+        sanitize_id(incident_id).ok_or_else(|| HealthError::msg("invalid incident_id"))?;
+    let inbox_id = sanitize_id(&format!("receipt-{incident_id}-{as_of_ms}"))
+        .ok_or_else(|| HealthError::msg("receipt inbox_id exceeds bound"))?;
+    let mut record = HealthRecord::new(InboxKind::HandoffReceived, inbox_id, as_of_ms);
+    record.source = Some(Source::Codex);
+    record.class = Some(ClosedClass::HandoffUnacknowledged);
+    record.incident_id = Some(incident_id);
+    record.session_id = optional_id(session_id)?;
+    record.exchange_id = optional_id(exchange_id)?;
+    Ok(record)
 }
 
 pub fn test_sound_record(as_of_ms: u64) -> HealthRecord {
@@ -92,12 +132,13 @@ pub fn read_record(path: &Path) -> Result<HealthRecord, InboxReadError> {
     }
     let parsed: HealthRecord = serde_json::from_slice(fsutil::strip_bom(&read.bytes))
         .map_err(|error| InboxReadError::Malformed(error.to_string()))?;
-    if parsed.schema_version != SCHEMA_VERSION {
+    if !accepted_schema(parsed.schema_version) {
         return Err(InboxReadError::Malformed("unsupported inbox schema".into()));
     }
     if sanitize_id(&parsed.inbox_id).is_none() {
         return Err(InboxReadError::Malformed("invalid inbox_id".into()));
     }
+    validate_handoff(&parsed)?;
     Ok(parsed)
 }
 
@@ -128,6 +169,66 @@ pub fn remove_consumed(path: &Path) -> Result<(), HealthError> {
 pub enum InboxReadError {
     Io(String),
     Malformed(String),
+}
+
+fn optional_id(value: Option<&str>) -> Result<Option<String>, HealthError> {
+    match value {
+        None => Ok(None),
+        Some(value) => sanitize_id(value)
+            .map(Some)
+            .ok_or_else(|| HealthError::msg("invalid identifier")),
+    }
+}
+
+fn validate_handoff(record: &HealthRecord) -> Result<(), InboxReadError> {
+    match record.kind {
+        InboxKind::PeerAlertRequested => {
+            if record.class != Some(ClosedClass::HandoffUnacknowledged) {
+                return Err(InboxReadError::Malformed(
+                    "peer alert class must be handoff_unacknowledged".into(),
+                ));
+            }
+            if record
+                .incident_id
+                .as_deref()
+                .and_then(sanitize_id)
+                .is_none()
+            {
+                return Err(InboxReadError::Malformed(
+                    "peer alert incident_id invalid".into(),
+                ));
+            }
+            if record.source != Some(Source::Grok) {
+                return Err(InboxReadError::Malformed(
+                    "peer alert source must be grok".into(),
+                ));
+            }
+        }
+        InboxKind::HandoffReceived => {
+            if record.source != Some(Source::Codex) {
+                return Err(InboxReadError::Malformed(
+                    "handoff receipt source must be codex".into(),
+                ));
+            }
+            if record.class != Some(ClosedClass::HandoffUnacknowledged) {
+                return Err(InboxReadError::Malformed(
+                    "handoff receipt class is not handoff_unacknowledged".into(),
+                ));
+            }
+            if record
+                .incident_id
+                .as_deref()
+                .and_then(sanitize_id)
+                .is_none()
+            {
+                return Err(InboxReadError::Malformed(
+                    "handoff receipt incident_id invalid".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn unique_dest(path: &Path) -> PathBuf {

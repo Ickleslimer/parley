@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::fsutil;
 use crate::schema::{
-    HealthError, HealthRecord, QueryDiagnostics, MAX_JOURNAL_LINE, SCHEMA_VERSION,
+    accepted_schema, HealthError, HealthRecord, QueryDiagnostics, MAX_JOURNAL_LINE, SCHEMA_VERSION,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -60,7 +60,7 @@ fn read_records(file: File, loaded: &mut JournalLoad) -> Result<(), HealthError>
 
 fn ingest_line(line: &str, loaded: &mut JournalLoad) {
     match serde_json::from_str::<HealthRecord>(line) {
-        Ok(record) if record.schema_version == SCHEMA_VERSION => loaded.records.push(record),
+        Ok(record) if accepted_schema(record.schema_version) => loaded.records.push(record),
         Ok(_) => loaded.diagnostics.unsupported_journal_records += 1,
         Err(_) => loaded.diagnostics.malformed_journal_lines += 1,
     }
@@ -70,7 +70,9 @@ pub fn append(path: &Path, record: &HealthRecord) -> Result<(), HealthError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut encoded = serde_json::to_vec(record)?;
+    let mut stored = record.clone();
+    stored.schema_version = SCHEMA_VERSION;
+    let mut encoded = serde_json::to_vec(&stored)?;
     if encoded.len() > MAX_JOURNAL_LINE {
         return Err(HealthError::msg("journal record exceeds bound"));
     }
