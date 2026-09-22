@@ -34,6 +34,7 @@ pub(crate) struct GuardedSubagentLaunch {
     reasoning_effort: String,
     base_commit: String,
     parent_cwd: PathBuf,
+    parent_spawn_cwd: String,
     parent_writable_paths: Vec<StoredPathGrant>,
     protected_roots: Vec<PathBuf>,
     children: Vec<ChildSpec>,
@@ -63,6 +64,11 @@ impl GuardedSubagentLaunch {
             .find(|lane| lane.owner == LaneOwner::GrokParent)
             .ok_or_else(|| "guarded Grok launch has no parent lane".to_string())?;
         let parent_writable_paths = stored_path_grants(parent)?;
+        let parent_spawn_cwd = parent
+            .cwd
+            .to_str()
+            .map(normalize_windows_extended_path)
+            .ok_or_else(|| "Grok parent worktree path is not valid Unicode".to_string())?;
         let writer_count = children
             .iter()
             .filter(|lane| lane.role == LaneRole::Writer)
@@ -119,6 +125,7 @@ impl GuardedSubagentLaunch {
             reasoning_effort: guarded.reasoning_effort.clone(),
             base_commit: plan.base_commit.to_ascii_lowercase(),
             parent_cwd: parent.cwd.clone(),
+            parent_spawn_cwd,
             parent_writable_paths,
             protected_roots,
             children: specs,
@@ -127,6 +134,10 @@ impl GuardedSubagentLaunch {
 
     pub(crate) fn has_children(&self) -> bool {
         !self.children.is_empty()
+    }
+
+    pub(crate) fn spawn_cwd(&self) -> &str {
+        &self.parent_spawn_cwd
     }
 
     pub(crate) fn parent_profile_contents(&self) -> String {
@@ -303,16 +314,17 @@ fn append_permission_allows(
     writable_paths: &[StoredPathGrant],
 ) -> Result<(), String> {
     for grant in writable_paths {
-        let pattern = permission_pattern(cwd, grant)?;
-        for prefix in ["Edit", "Write"] {
-            arguments.push("--allow".to_string());
-            arguments.push(format!("{prefix}({pattern})"));
+        for pattern in permission_patterns(cwd, grant)? {
+            for prefix in ["Edit", "Write"] {
+                arguments.push("--allow".to_string());
+                arguments.push(format!("{prefix}({pattern})"));
+            }
         }
     }
     Ok(())
 }
 
-pub(crate) fn append_parent_contract(prompt: &mut String, plan: &LanePlan) {
+pub(crate) fn append_parent_contract(prompt: &mut String, plan: &LanePlan, job_id: &str) {
     let mut lanes = plan.lanes.iter().collect::<Vec<_>>();
     lanes.sort_by(|left, right| left.lane_id.cmp(&right.lane_id));
     let mut contract = String::from("\n\nTWO CHAIRS PARALLEL LANE CONTRACT\n");
@@ -324,7 +336,7 @@ pub(crate) fn append_parent_contract(prompt: &mut String, plan: &LanePlan) {
     {
         contract.push_str("Spawn each declared Grok child exactly once with its exact subagent_type, cwd, isolation=none, and no model, effort, tool, MCP, sandbox, hook, resume, or permission override. Child prompts must repeat only the bounded assignment and exact granted paths.\n");
     } else {
-        contract.push_str("No Grok child lane is declared. Do not spawn a subagent. Perform only the bounded Grok-parent assignment in its exact worktree and grants.\n");
+        contract.push_str("No Grok child lane is declared. Do not spawn a subagent. Perform only the bounded Grok-parent assignment in its exact worktree and grants. Use worktree-relative paths in file tools.\n");
     }
     contract.push_str(&format!("base_commit: {}\n", plan.base_commit));
     contract.push_str(&format!(
@@ -352,6 +364,10 @@ pub(crate) fn append_parent_contract(prompt: &mut String, plan: &LanePlan) {
         }
     }
     contract.push_str("The final response must enumerate every declared lane, role, branch/worktree, granted paths, changed paths, tests, failures or denials, and the parent\'s independent review. For child lanes, include every child ID and do not claim a result you did not receive.\n");
+    contract.push_str("A completed write job must include this exact block immediately before the Two Chairs handoff footer, or at the end when no handoff footer is required:\n");
+    contract.push_str("TWO_CHAIRS_LANE_RESULT\n");
+    contract.push_str(&format!("job_id: {job_id}\n"));
+    contract.push_str("status: completed\n");
     let handoff_marker = "\n\nTWO CHAIRS LOCKED RESPONSE CONTRACT\n";
     if let Some(index) = prompt.rfind(handoff_marker) {
         prompt.insert_str(index, &contract);
@@ -480,6 +496,19 @@ fn permission_pattern(cwd: &Path, grant: &StoredPathGrant) -> Result<String, Str
     Ok(pattern)
 }
 
+fn permission_patterns(cwd: &Path, grant: &StoredPathGrant) -> Result<Vec<String>, String> {
+    let absolute = permission_pattern(cwd, grant)?;
+    let mut relative = permission_path(Path::new(&grant.path))?;
+    if grant.kind == GrantKind::Tree {
+        relative.push_str("/**");
+    }
+    if relative == absolute {
+        Ok(vec![absolute])
+    } else {
+        Ok(vec![absolute, relative])
+    }
+}
+
 fn permission_tree_pattern(path: &Path) -> Result<String, String> {
     let mut pattern = permission_path(path)?;
     pattern.push_str("/**");
@@ -558,6 +587,7 @@ mod tests {
             reasoning_effort: "xhigh".to_string(),
             base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
             parent_cwd: PathBuf::from(r"C:\repo\parent"),
+            parent_spawn_cwd: r"C:\repo\parent".to_string(),
             parent_writable_paths: vec![StoredPathGrant {
                 kind: GrantKind::File,
                 path: "README.md".to_string(),
@@ -708,6 +738,10 @@ mod tests {
         assert!(invocation
             .args
             .iter()
+            .any(|argument| argument == "Write(README.md)"));
+        assert!(invocation
+            .args
+            .iter()
             .any(|argument| argument == "Edit(C:/repo/integration/**)"));
         assert!(!invocation
             .env
@@ -771,5 +805,16 @@ mod tests {
             "//server/share/repo/README.md"
         );
         assert!(permission_pattern(Path::new(r"C:\repo?\parent"), &grant).is_err());
+    }
+
+    #[test]
+    fn spawn_cwd_uses_the_normal_windows_drive_spelling() {
+        let mut launch = launch();
+        launch.parent_spawn_cwd =
+            normalize_windows_extended_path(r"\\?\D:\Workplaces\.parley-worktrees\Parley\lane");
+        assert_eq!(
+            launch.spawn_cwd(),
+            r"D:\Workplaces\.parley-worktrees\Parley\lane"
+        );
     }
 }

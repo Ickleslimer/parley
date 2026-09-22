@@ -91,6 +91,10 @@ pub(crate) trait AskSpawnObserver: Send + Sync {
     fn process_resumed(&self, _receipt: &AskSpawnReceipt) -> Result<(), String> {
         Ok(())
     }
+
+    fn validate_completed_reply(&self, _reply: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 struct NoopAskSpawnObserver;
@@ -732,9 +736,12 @@ pub(crate) fn run_prepared_with_receipt_controlled(
         observer,
         request: log.request_receipt(),
     };
+    let spawn_cwd = guarded_launch
+        .map(GuardedSubagentLaunch::spawn_cwd)
+        .or_else(|| req.cwd.to_str());
     match capture_invocation_timeout_controlled(
         invocation,
-        req.cwd.to_str(),
+        spawn_cwd,
         timeouts,
         cancellation,
         &process_observer,
@@ -742,8 +749,17 @@ pub(crate) fn run_prepared_with_receipt_controlled(
         Ok(out) => {
             let lane_result = consume_grants(&mut active_grants);
             let duration_ms = started.elapsed().as_millis();
-            let reply_result = out.reply();
-            let usable_reply = reply_result.as_ref().ok().cloned();
+            let raw_reply_result = out.reply();
+            let usable_reply = raw_reply_result.as_ref().ok().cloned();
+            let reply_validation_error = raw_reply_result
+                .as_deref()
+                .ok()
+                .and_then(|reply| observer.validate_completed_reply(reply).err());
+            let reply_result = match (&raw_reply_result, &reply_validation_error) {
+                (Ok(reply), None) => Ok(reply.clone()),
+                (Ok(_), Some(error)) => Err(error.clone()),
+                (Err(error), _) => Err(error.clone()),
+            };
             let context_result = resolved.stateful.as_ref().map(|stateful| {
                 if reply_result.is_ok() {
                     stateful.commit(&exchange_id)
@@ -876,6 +892,16 @@ pub(crate) fn run_prepared_with_receipt_controlled(
                 return Err(AskFailure::after_completion(
                     format!(
                         "guarded lane state finalization failed after Grok ran; do not retry automatically: {lane_error}\nCaptured result:\n{captured}"
+                    ),
+                    receipt,
+                )
+                .with_captured_reply(usable_reply)
+                .with_execution_state(out.timed_out, out.cancelled));
+            }
+            if let Some(validation_error) = reply_validation_error {
+                return Err(AskFailure::after_completion(
+                    format!(
+                        "locked lane completion validation failed after Grok ran; do not retry automatically: {validation_error}"
                     ),
                     receipt,
                 )

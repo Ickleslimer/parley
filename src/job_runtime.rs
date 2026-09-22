@@ -169,7 +169,7 @@ impl JobRuntime {
             .as_ref()
             .is_some_and(GuardedSubagentLaunch::has_children);
         if let Some(plan) = &spec.lane_plan {
-            append_parent_contract(&mut request.prompt, plan);
+            append_parent_contract(&mut request.prompt, plan, &spec.job_id);
         }
         spec.request = request;
 
@@ -419,6 +419,7 @@ fn run_worker(
     let observer = JobObserver {
         store: Arc::clone(&inner.store),
         job_id: job_id.clone(),
+        require_lane_result: spec.mode == JobMode::Write && spec.lane_plan.is_some(),
         started_tx: started_tx.clone(),
         sent: Arc::clone(&sent),
     };
@@ -490,6 +491,7 @@ fn run_worker(
 struct JobObserver {
     store: Arc<JobStore>,
     job_id: String,
+    require_lane_result: bool,
     started_tx: mpsc::SyncSender<StartSignal>,
     sent: Arc<AtomicBool>,
 }
@@ -517,6 +519,25 @@ impl AskSpawnObserver for JobObserver {
         self.started_tx
             .send(StartSignal::Running)
             .map_err(|error| format!("report running job state: {error}"))
+    }
+
+    fn validate_completed_reply(&self, reply: &str) -> Result<(), String> {
+        if !self.require_lane_result {
+            return Ok(());
+        }
+        validate_lane_result(reply, &self.job_id)
+    }
+}
+
+fn validate_lane_result(reply: &str, job_id: &str) -> Result<(), String> {
+    let normalized = reply.replace("\r\n", "\n");
+    let expected = format!("TWO_CHAIRS_LANE_RESULT\njob_id: {job_id}\nstatus: completed");
+    if normalized.contains(&expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "write job reply omitted the exact completed lane result for job {job_id}"
+        ))
     }
 }
 
@@ -1062,5 +1083,20 @@ mod tests {
         let json = view_json(&view, false).to_compact_string();
         assert!(!json.contains("reply"));
         assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn lane_result_validation_rejects_partial_or_mismatched_replies() {
+        let job_id = "32f0a181-6822-416c-b2c0-1a5fd4062d9f";
+        let valid = format!(
+            "report\n\nTWO_CHAIRS_LANE_RESULT\r\njob_id: {job_id}\r\nstatus: completed\r\n\r\nTWO_CHAIRS_HANDOFF"
+        );
+        assert!(validate_lane_result(&valid, job_id).is_ok());
+        assert!(validate_lane_result("I will write the file now.", job_id).is_err());
+        assert!(validate_lane_result(
+            "TWO_CHAIRS_LANE_RESULT\njob_id: other\nstatus: completed",
+            job_id
+        )
+        .is_err());
     }
 }
