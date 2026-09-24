@@ -154,7 +154,6 @@ pub(crate) struct HandoffPolicy {
     pub(crate) execution_ceiling_secs: u64,
     pub(crate) acknowledgement_ceiling_secs: u64,
     pub(crate) excerpt_chars: usize,
-    pub(crate) max_turns: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -419,6 +418,9 @@ impl RuntimePolicy {
         {
             None | Some("off") => None,
             Some("required") => {
+                if env::var_os("PARLEY_HANDOFF_MAX_TURNS").is_some() {
+                    return Err("PARLEY_HANDOFF_MAX_TURNS is obsolete; acknowledgement-required asynchronous jobs have no numeric turn cap".to_string());
+                }
                 if grok_locked_permission_mode.is_none()
                     || grok_locked_model.as_deref() != Some("grok-4.7")
                     || grok_locked_reasoning_effort.as_deref() != Some("xhigh")
@@ -438,7 +440,6 @@ impl RuntimePolicy {
                     required_exact_u64("PARLEY_HANDOFF_ACK_CEILING_SEC", 21_600)?;
                 let excerpt_chars =
                     required_exact_u64("PARLEY_HANDOFF_EXCERPT_CHARS", 4_096)? as usize;
-                let max_turns = required_exact_u64("PARLEY_HANDOFF_MAX_TURNS", 128)?;
                 let peer_peek_command = powershell_direct_command(&peer_peek_exe)?;
                 let wait_command = powershell_direct_command(&wait_exe)?;
                 let alert_command = powershell_direct_command(&alert_exe)?;
@@ -461,7 +462,6 @@ impl RuntimePolicy {
                     execution_ceiling_secs,
                     acknowledgement_ceiling_secs,
                     excerpt_chars,
-                    max_turns,
                 })
             }
             Some(value) => {
@@ -1598,7 +1598,6 @@ mod tests {
                 execution_ceiling_secs: 21_600,
                 acknowledgement_ceiling_secs: 21_600,
                 excerpt_chars: 4_096,
-                max_turns: 128,
             }),
             ..RuntimePolicy::default()
         };

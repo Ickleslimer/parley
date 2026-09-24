@@ -143,7 +143,9 @@ The model-execution clock runs while the contained Grok process is alive and
 outside a verified five-minute handoff wait. It has a six-hour ceiling and no
 idle timeout. A separate six-hour receipt clock starts only after the exact
 report is flushed. Synchronous calls and probes retain the locked 30-minute
-total, 10-minute idle, and 30-turn limits; required handoff jobs use 128 turns.
+total, 10-minute idle, and 30-turn limits. Required handoff jobs carry no
+numeric turn cap; their six-hour ceilings and manual cancellation remain the
+hard runtime bounds.
 
 Manual activity peeks expose only event classes, timestamps, safe tool names,
 and a bounded exact visible-output excerpt. Hidden reasoning and raw tool

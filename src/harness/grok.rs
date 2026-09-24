@@ -144,6 +144,15 @@ mod tests {
     }
 
     #[test]
+    fn omits_max_turns_when_unset() {
+        let mut req = request();
+        req.prompt = Some("review this".to_string());
+        req.session_id = Some("01a06582-d66e-7811-b0c9-0b0266e17903".to_string());
+        let args = build_args(&req, &[], &[], true);
+        assert!(!args.iter().any(|argument| argument == "--max-turns"));
+    }
+
+    #[test]
     fn maps_resume_latest_yolo_and_passthrough() {
         let mut req = request();
         req.prompt = Some("continue".to_string());

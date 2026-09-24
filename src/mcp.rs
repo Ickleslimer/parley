@@ -980,6 +980,7 @@ fn call_tool(
             let handoff_mode = policy
                 .resolve_handoff_mode(mode, requested_handoff_mode)
                 .map_err(|error| (-32602, error))?;
+            reject_explicit_handoff_max_turns(args, handoff_mode)?;
             let request = parse_ask_request(args, default_cwd, policy)?;
             let lane_plan = args
                 .get("lane_plan")
@@ -1258,6 +1259,19 @@ fn required_arg_string(args: &Json, name: &str) -> Result<String, (i64, String)>
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or((-32602, format!("missing {name}")))
+}
+
+fn reject_explicit_handoff_max_turns(
+    args: &Json,
+    handoff_mode: HandoffMode,
+) -> Result<(), (i64, String)> {
+    if handoff_mode == HandoffMode::Required && args.get("max_turns").is_some() {
+        return Err((
+            -32602,
+            "max_turns is not accepted for acknowledgement-required asynchronous jobs".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_logged_grok_response(receipt: &ExchangeReceipt) -> bool {
@@ -1760,6 +1774,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["replay", "skip"]
         );
+    }
+
+    #[test]
+    fn required_handoffs_reject_even_null_explicit_turn_caps() {
+        for arguments in [r#"{"max_turns":null}"#, r#"{"max_turns":12}"#] {
+            let args = Json::parse(arguments).unwrap();
+            assert!(reject_explicit_handoff_max_turns(&args, HandoffMode::Required).is_err());
+            assert!(reject_explicit_handoff_max_turns(&args, HandoffMode::None).is_ok());
+        }
+        let args = Json::parse("{}").unwrap();
+        assert!(reject_explicit_handoff_max_turns(&args, HandoffMode::Required).is_ok());
     }
 
     #[test]

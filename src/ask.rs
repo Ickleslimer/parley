@@ -1453,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_handoff_turn_limit_reaches_the_grok_invocation() {
+    fn prepared_max_turns_reaches_the_grok_invocation() {
         let request = AskRequest {
             harness: "grok".to_string(),
             prompt: "task".to_string(),

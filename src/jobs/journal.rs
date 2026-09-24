@@ -2065,6 +2065,12 @@ mod tests {
         let forward_hash = request_fingerprint(&forward).unwrap();
         assert_eq!(forward_hash, request_fingerprint(&reverse).unwrap());
         assert_eq!(forward_hash.len(), 16);
+        let mut uncapped = forward.clone();
+        uncapped.request.max_turns = None;
+        assert_ne!(forward_hash, request_fingerprint(&uncapped).unwrap());
+        assert!(canonical_request_json(&uncapped)
+            .unwrap()
+            .contains("\"max_turns\":null"));
         forward.request.prompt = "different prompt".to_string();
         assert_ne!(forward_hash, request_fingerprint(&forward).unwrap());
         forward.request.prompt = PROMPT.to_string();

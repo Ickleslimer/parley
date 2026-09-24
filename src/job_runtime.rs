@@ -33,6 +33,9 @@ const PEER_ACTIVITY_SCHEMA_VERSION: u64 = 1;
 const MAX_HANDOFF_REPORT_CHARS: usize = 256_000;
 const MAX_STREAM_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVITY_EVENTS: usize = 64;
+const MAX_HANDOFF_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HANDOFF_JOURNAL_LINE_BYTES: usize = 512 * 1024;
+const ACTIVITY_FLUSH_INTERVAL_MS: u128 = 120_000;
 static HANDOFF_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -170,11 +173,13 @@ impl JobRuntime {
         if spec.request.harness != "grok" && spec.request.harness != "gr" {
             return Err("start_agent_job supports only Grok".to_string());
         }
+        validate_handoff_turn_request(spec.handoff_mode, spec.request.max_turns.as_deref())?;
 
         let (mut request, policy) = ask::prepare_for_job(&spec.request)?;
         if request.harness != "grok" {
             return Err("start_agent_job supports only Grok".to_string());
         }
+        canonicalize_handoff_turn_limit(spec.handoff_mode, &mut request.max_turns);
         let existing = inner
             .store
             .get(&spec.job_id)
@@ -250,7 +255,6 @@ impl JobRuntime {
                     return Err(format!("handoff preflight failed: {error}"));
                 }
             };
-            spec.request.max_turns = Some(config.max_turns.to_string());
             append_handoff_contract(&mut spec.request.prompt, &job_id, &handoff, config);
             Some(handoff)
         } else {
@@ -381,16 +385,11 @@ impl JobRuntime {
             .handoff_dir
             .as_ref()
             .ok_or_else(|| "peer activity is unavailable for this profile".to_string())?;
-        let _guard = inner
-            .handoff_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = root.join("jobs").join(job_id);
         if !directory.exists() {
             return Err(format!("job {job_id} has no acknowledgement activity"));
         }
-        let _lock = HandoffFileLock::acquire(&directory)?;
-        let record = load_handoff(&directory)?;
+        let record = load_handoff_readonly(&directory)?;
         Ok(peer_activity_json(&record, since_ms))
     }
 
@@ -515,7 +514,7 @@ impl JobRuntime {
         }
         if !view.state.is_terminal() {
             let handoff = match &inner.handoff_dir {
-                Some(root) => read_handoff_view(root, &view.job_id, &inner.handoff_lock)?,
+                Some(root) => read_handoff_view(root, &view.job_id)?,
                 None => None,
             };
             return Ok(JobLookup {
@@ -537,7 +536,7 @@ impl JobRuntime {
             }
         }
         let handoff = match &inner.handoff_dir {
-            Some(root) => read_handoff_view(root, &view.job_id, &inner.handoff_lock)?,
+            Some(root) => read_handoff_view(root, &view.job_id)?,
             None => None,
         };
         Ok(JobLookup {
@@ -545,6 +544,24 @@ impl JobRuntime {
             delivery,
             handoff,
         })
+    }
+}
+
+fn validate_handoff_turn_request(
+    handoff_mode: HandoffMode,
+    max_turns: Option<&str>,
+) -> Result<(), String> {
+    if handoff_mode == HandoffMode::Required && max_turns.is_some() {
+        return Err(
+            "max_turns is not accepted for acknowledgement-required asynchronous jobs".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn canonicalize_handoff_turn_limit(handoff_mode: HandoffMode, max_turns: &mut Option<String>) {
+    if handoff_mode == HandoffMode::Required {
+        *max_turns = None;
     }
 }
 
@@ -753,6 +770,7 @@ impl AskSpawnObserver for JobObserver {
 
 #[derive(Clone)]
 struct HandoffSession {
+    state_dir: PathBuf,
     directory: PathBuf,
     job_id: String,
     handoff_id: String,
@@ -768,8 +786,15 @@ struct HandoffStream {
     pending: Vec<u8>,
     first_line: bool,
     visible_tail: String,
+    visible_dirty: bool,
+    next_visible_starts_message: bool,
+    visible_message_start: Option<usize>,
     saw_end: bool,
     parser_failed: Option<String>,
+    last_persisted_activity: Option<ActivityRecord>,
+    last_visible_persisted_ms: Option<u128>,
+    pending_activities: Vec<ActivityRecord>,
+    report_persisted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -818,6 +843,12 @@ impl HandoffSession {
         let _guard = process_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let profile_parent = root
+            .parent()
+            .ok_or_else(|| "handoff profile state root has no parent".to_string())?;
+        if path_key(profile_parent) != path_key(&config.state_dir) {
+            return Err("handoff profile state root is outside its configured base".to_string());
+        }
         let source_session_id = source_session_id.unwrap_or("unavailable").to_string();
         prepare_handoff_root(root)?;
         let directory = root.join("jobs").join(job_id);
@@ -862,6 +893,7 @@ impl HandoffSession {
         };
         commit_handoff(&directory, &record)?;
         Ok(Self {
+            state_dir: root.to_path_buf(),
             directory,
             job_id: job_id.to_string(),
             handoff_id,
@@ -895,7 +927,7 @@ impl HandoffSession {
         let values = [
             (
                 "PARLEY_HANDOFF_STATE_DIR",
-                self.config.state_dir.to_string_lossy().to_string(),
+                self.state_dir.to_string_lossy().to_string(),
             ),
             (
                 "PARLEY_HANDOFF_JOB_DIR",
@@ -987,15 +1019,21 @@ impl HandoffSession {
     fn observe_output(&self, stream: OutputStream, chunk: &[u8]) -> Result<bool, String> {
         if stream == OutputStream::Stderr {
             if !chunk.is_empty() {
-                self.record_activity(
-                    ActivityRecord {
-                        class: "error".to_string(),
-                        timestamp_ms: now_ms(),
-                        tool_name: None,
-                        status: Some("stderr_output".to_string()),
-                    },
-                    None,
-                )?;
+                let mut stream_state = self
+                    .stream
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let activity = ActivityRecord {
+                    class: "error".to_string(),
+                    timestamp_ms: now_ms(),
+                    tool_name: None,
+                    status: Some("stderr_output".to_string()),
+                };
+                enqueue_activity(&mut stream_state, activity.clone());
+                if activity_persistence_due(&stream_state, &activity, false, false) {
+                    let persist_visible = stream_state.visible_dirty;
+                    self.persist_pending_activity(&mut stream_state, persist_visible)?;
+                }
             }
             return Ok(false);
         }
@@ -1069,8 +1107,25 @@ impl HandoffSession {
         if activity.class == ActivityClass::End {
             stream.saw_end = true;
         }
+        if matches!(
+            activity.class,
+            ActivityClass::ToolCall | ActivityClass::ToolCallUpdate
+        ) && !stream.visible_tail.is_empty()
+        {
+            stream.next_visible_starts_message = true;
+        }
+        let has_visible_text = activity.visible_text.is_some();
         if let Some(text) = activity.visible_text.as_deref() {
-            append_visible_tail(&mut stream.visible_tail, text);
+            let previous_len = stream.visible_tail.len();
+            let removed = append_visible_tail(&mut stream.visible_tail, text);
+            stream.visible_message_start = stream
+                .visible_message_start
+                .and_then(|start| start.checked_sub(removed));
+            if stream.next_visible_starts_message {
+                stream.visible_message_start = previous_len.checked_sub(removed);
+                stream.next_visible_starts_message = false;
+            }
+            stream.visible_dirty = true;
         }
         let record = ActivityRecord {
             class: activity_class_name(activity.class).to_string(),
@@ -1084,28 +1139,78 @@ impl HandoffSession {
                 .as_deref()
                 .map(|value| sanitize_label(value, 120)),
         };
-        let visible = activity
-            .visible_text
-            .as_deref()
-            .map(|_| stream.visible_tail.as_str());
-        self.record_activity(record, visible)?;
-        if let Some(report) =
-            extract_handoff_report(&stream.visible_tail, &self.job_id, &self.handoff_id)?
-        {
+        enqueue_activity(stream, record.clone());
+        let extracted_report = if has_visible_text && !stream.report_persisted {
+            extract_handoff_report(
+                &stream.visible_tail,
+                &self.job_id,
+                &self.handoff_id,
+                stream.visible_message_start,
+            )?
+        } else {
+            if has_visible_text {
+                reject_duplicate_handoff_start(
+                    &stream.visible_tail,
+                    &self.job_id,
+                    &self.handoff_id,
+                )?;
+            }
+            None
+        };
+        let report = if stream.report_persisted {
+            None
+        } else {
+            extracted_report
+        };
+        let force = activity.class == ActivityClass::End || report.is_some();
+        if activity_persistence_due(stream, &record, has_visible_text, force) {
+            let persist_visible = stream.visible_dirty || force;
+            self.persist_pending_activity(stream, persist_visible)?;
+        }
+        if let Some(report) = report {
             self.persist_report(&report)?;
+            stream.report_persisted = true;
         }
         Ok(())
     }
 
-    fn record_activity(
+    fn persist_pending_activity(
         &self,
-        activity: ActivityRecord,
+        stream: &mut HandoffStream,
+        persist_visible: bool,
+    ) -> Result<(), String> {
+        if stream.pending_activities.is_empty() {
+            return Ok(());
+        }
+        let activities = stream.pending_activities.clone();
+        self.record_activities(
+            &activities,
+            persist_visible.then_some(stream.visible_tail.as_str()),
+        )?;
+        let latest = activities
+            .last()
+            .cloned()
+            .ok_or_else(|| "peer activity batch unexpectedly became empty".to_string())?;
+        stream.pending_activities.clear();
+        note_persisted_activity(stream, latest, persist_visible);
+        if persist_visible {
+            stream.visible_dirty = false;
+        }
+        Ok(())
+    }
+
+    fn record_activities(
+        &self,
+        activities: &[ActivityRecord],
         visible_tail: Option<&str>,
     ) -> Result<(), String> {
+        let latest = activities
+            .last()
+            .ok_or_else(|| "peer activity batch is empty".to_string())?;
         self.update(|record| {
-            record.last_activity_ms = Some(activity.timestamp_ms);
-            record.phase = phase_for_activity(&activity.class).to_string();
-            record.activities.push(activity);
+            record.last_activity_ms = Some(latest.timestamp_ms);
+            record.phase = phase_for_activity(&latest.class).to_string();
+            record.activities.extend_from_slice(activities);
             if record.activities.len() > MAX_ACTIVITY_EVENTS {
                 let excess = record.activities.len() - MAX_ACTIVITY_EVENTS;
                 record.activities.drain(..excess);
@@ -1308,6 +1413,7 @@ fn append_handoff_contract(
         "=== TWO_CHAIRS_HANDOFF_READY_V1 job={job_id} handoff={} ===\n<self-contained exact report>\n=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===\n",
         handoff.handoff_id, handoff.handoff_id
     ));
+    prompt.push_str("The durable report inside those markers must itself contain every other locked response requirement, including the complete TWO_CHAIRS_HANDOFF footer when required. Put that footer before the end marker, and emit no visible report text outside the markers.\n");
     prompt.push_str("After emitting the complete block, remain in this same turn and invoke exactly the following zero-argument wait command. It waits at most five minutes and reports receipt/deadline evidence; repeat it only while receipt remains pending:\n");
     prompt.push_str(&config.wait_command);
     prompt.push('\n');
@@ -1332,6 +1438,50 @@ fn activity_class_name(class: ActivityClass) -> &'static str {
     }
 }
 
+fn activity_persistence_due(
+    stream: &HandoffStream,
+    activity: &ActivityRecord,
+    has_visible_text: bool,
+    force: bool,
+) -> bool {
+    if force {
+        return true;
+    }
+    let Some(previous) = &stream.last_persisted_activity else {
+        return true;
+    };
+    activity.timestamp_ms.saturating_sub(previous.timestamp_ms) >= ACTIVITY_FLUSH_INTERVAL_MS
+        || (has_visible_text && stream.last_visible_persisted_ms.is_none())
+}
+
+fn enqueue_activity(stream: &mut HandoffStream, activity: ActivityRecord) {
+    if let Some(previous) = stream.pending_activities.last_mut() {
+        if previous.class == activity.class
+            && previous.tool_name == activity.tool_name
+            && previous.status == activity.status
+        {
+            previous.timestamp_ms = activity.timestamp_ms;
+            return;
+        }
+    }
+    stream.pending_activities.push(activity);
+    if stream.pending_activities.len() > MAX_ACTIVITY_EVENTS {
+        let excess = stream.pending_activities.len() - MAX_ACTIVITY_EVENTS;
+        stream.pending_activities.drain(..excess);
+    }
+}
+
+fn note_persisted_activity(
+    stream: &mut HandoffStream,
+    activity: ActivityRecord,
+    persisted_visible: bool,
+) {
+    if persisted_visible {
+        stream.last_visible_persisted_ms = Some(activity.timestamp_ms);
+    }
+    stream.last_persisted_activity = Some(activity);
+}
+
 fn phase_for_activity(class: &str) -> &'static str {
     match class {
         "thought" => "reasoning",
@@ -1345,12 +1495,12 @@ fn phase_for_activity(class: &str) -> &'static str {
     }
 }
 
-fn append_visible_tail(buffer: &mut String, text: &str) {
+fn append_visible_tail(buffer: &mut String, text: &str) -> usize {
     buffer.push_str(text);
     let maximum = MAX_HANDOFF_REPORT_CHARS.saturating_mul(2);
     let count = buffer.chars().count();
     if count <= maximum {
-        return;
+        return 0;
     }
     let keep_from = buffer
         .char_indices()
@@ -1358,12 +1508,14 @@ fn append_visible_tail(buffer: &mut String, text: &str) {
         .map(|(index, _)| index)
         .unwrap_or(0);
     buffer.drain(..keep_from);
+    keep_from
 }
 
 fn extract_handoff_report(
     visible: &str,
     job_id: &str,
     handoff_id: &str,
+    accepted_start_boundary: Option<usize>,
 ) -> Result<Option<String>, String> {
     let start_marker =
         format!("=== TWO_CHAIRS_HANDOFF_READY_V1 job={job_id} handoff={handoff_id} ===");
@@ -1375,14 +1527,24 @@ fn extract_handoff_report(
     let Some((start, _)) = starts.first().copied() else {
         return Ok(None);
     };
-    if start > 0 && visible.as_bytes().get(start - 1) != Some(&b'\n') {
+    if start > 0
+        && visible.as_bytes().get(start - 1) != Some(&b'\n')
+        && accepted_start_boundary != Some(start)
+    {
         return Err("handoff start marker is not on its own line".to_string());
     }
     let body_start = start + start_marker.len();
-    if !visible[body_start..].starts_with('\n') {
+    let remainder = &visible[body_start..];
+    let separator_len = if remainder.starts_with("\r\n") {
+        2
+    } else if remainder.starts_with('\n') {
+        1
+    } else if remainder.is_empty() || remainder == "\r" {
+        return Ok(None);
+    } else {
         return Err("handoff start marker is not newline terminated".to_string());
-    }
-    let search_start = body_start + 1;
+    };
+    let search_start = body_start + separator_len;
     let Some(relative_end) = visible[search_start..].find(&format!("\n{end_marker}")) else {
         if visible[search_start..].chars().count() > MAX_HANDOFF_REPORT_CHARS {
             return Err(format!(
@@ -1403,6 +1565,19 @@ fn extract_handoff_report(
         ));
     }
     Ok(Some(report))
+}
+
+fn reject_duplicate_handoff_start(
+    visible: &str,
+    job_id: &str,
+    handoff_id: &str,
+) -> Result<(), String> {
+    let start_marker =
+        format!("=== TWO_CHAIRS_HANDOFF_READY_V1 job={job_id} handoff={handoff_id} ===");
+    if visible.match_indices(&start_marker).count() > 1 {
+        return Err("Grok emitted more than one matching handoff start marker".to_string());
+    }
+    Ok(())
 }
 
 fn tail_scalars(value: &str, maximum: usize) -> (String, bool) {
@@ -1450,18 +1625,30 @@ fn report_path(directory: &Path) -> PathBuf {
 
 fn commit_handoff(directory: &Path, record: &StoredHandoff) -> Result<(), String> {
     let encoded = handoff_json(record).to_compact_string();
-    if encoded.len() > 512 * 1024 || encoded.contains(['\n', '\r']) {
+    if encoded.len() > MAX_HANDOFF_JOURNAL_LINE_BYTES || encoded.contains(['\n', '\r']) {
         return Err("handoff transition is not one bounded JSON line".to_string());
     }
     let journal = journal_path(directory);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    apply_handoff_share_all(&mut options);
+    let mut file = options
         .open(&journal)
         .map_err(|error| format!("open handoff journal {}: {error}", journal.display()))?;
     clip_incomplete_handoff_journal(&mut file, &journal)?;
+    let projected = file
+        .metadata()
+        .map_err(|error| format!("inspect handoff journal {}: {error}", journal.display()))?
+        .len()
+        .saturating_add(encoded.len() as u64)
+        .saturating_add(1);
+    if projected > MAX_HANDOFF_JOURNAL_BYTES as u64 {
+        return Err(format!(
+            "handoff journal {} exceeds its {} byte bound",
+            journal.display(),
+            MAX_HANDOFF_JOURNAL_BYTES
+        ));
+    }
     file.seek(SeekFrom::End(0))
         .map_err(|error| format!("seek handoff journal {}: {error}", journal.display()))?;
     file.write_all(encoded.as_bytes())
@@ -1508,6 +1695,13 @@ fn clip_incomplete_handoff_journal(file: &mut File, path: &Path) -> Result<(), S
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|error| format!("read handoff journal {}: {error}", path.display()))?;
+    if bytes.len() > MAX_HANDOFF_JOURNAL_BYTES {
+        return Err(format!(
+            "handoff journal {} exceeds its {} byte bound",
+            path.display(),
+            MAX_HANDOFF_JOURNAL_BYTES
+        ));
+    }
     let keep = bytes
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -1522,9 +1716,21 @@ fn clip_incomplete_handoff_journal(file: &mut File, path: &Path) -> Result<(), S
 
 fn load_handoff(directory: &Path) -> Result<StoredHandoff, String> {
     let snapshot = snapshot_path(directory);
+    let latest = load_handoff_readonly(directory)?;
+    let snapshot_matches = fs::read(&snapshot)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| parse_handoff(text.trim()).ok())
+        .is_some_and(|record| record == latest);
+    if !snapshot_matches {
+        publish_handoff_snapshot(directory, &handoff_json(&latest).to_compact_string())?;
+    }
+    Ok(latest)
+}
+
+fn load_handoff_readonly(directory: &Path) -> Result<StoredHandoff, String> {
     let journal = journal_path(directory);
-    let bytes = fs::read(&journal)
-        .map_err(|error| format!("read handoff journal {}: {error}", journal.display()))?;
+    let bytes = read_handoff_shared(&journal, MAX_HANDOFF_JOURNAL_BYTES)?;
     let complete = bytes
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -1534,7 +1740,11 @@ fn load_handoff(directory: &Path) -> Result<StoredHandoff, String> {
         std::str::from_utf8(complete).map_err(|_| "handoff journal is not UTF-8".to_string())?;
     let mut latest: Option<StoredHandoff> = None;
     for line in text.lines() {
-        let record = parse_handoff(line.trim_end_matches('\r'))?;
+        let line = line.trim_end_matches('\r');
+        if line.len() > MAX_HANDOFF_JOURNAL_LINE_BYTES {
+            return Err("handoff journal contains an oversized transition".to_string());
+        }
+        let record = parse_handoff(line)?;
         if let Some(previous) = &latest {
             if record.sequence != previous.sequence.saturating_add(1)
                 || record.job_id != previous.job_id
@@ -1549,17 +1759,45 @@ fn load_handoff(directory: &Path) -> Result<StoredHandoff, String> {
         }
         latest = Some(record);
     }
-    let latest =
-        latest.ok_or_else(|| "handoff journal contains no complete records".to_string())?;
-    let snapshot_matches = fs::read(&snapshot)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| parse_handoff(text.trim()).ok())
-        .is_some_and(|record| record == latest);
-    if !snapshot_matches {
-        publish_handoff_snapshot(directory, &handoff_json(&latest).to_compact_string())?;
+    latest.ok_or_else(|| "handoff journal contains no complete records".to_string())
+}
+
+fn read_handoff_shared(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    apply_handoff_share_all(&mut options);
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("read handoff journal {}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = file
+            .read(&mut chunk)
+            .map_err(|error| format!("read handoff journal {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > limit {
+            return Err(format!(
+                "handoff journal {} exceeds its {} byte bound",
+                path.display(),
+                limit
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..count]);
     }
-    Ok(latest)
+    Ok(bytes)
+}
+
+fn apply_handoff_share_all(options: &mut OpenOptions) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
+    }
+    #[cfg(not(windows))]
+    let _ = options;
 }
 
 fn acknowledge_handoff_record(
@@ -1808,20 +2046,12 @@ fn read_bounded_report(path: &Path) -> Result<String, String> {
     Ok(report)
 }
 
-fn read_handoff_view(
-    root: &Path,
-    job_id: &str,
-    process_lock: &Mutex<()>,
-) -> Result<Option<HandoffView>, String> {
-    let _guard = process_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+fn read_handoff_view(root: &Path, job_id: &str) -> Result<Option<HandoffView>, String> {
     let directory = root.join("jobs").join(job_id);
     if !directory.exists() {
         return Ok(None);
     }
-    let _lock = HandoffFileLock::acquire(&directory)?;
-    let record = load_handoff(&directory)?;
+    let record = load_handoff_readonly(&directory)?;
     let report = record
         .report_fingerprint
         .as_ref()
@@ -2596,13 +2826,27 @@ mod tests {
             execution_ceiling_secs: 21_600,
             acknowledgement_ceiling_secs: 21_600,
             excerpt_chars: 4_096,
-            max_turns: 128,
         }
     }
 
+    #[test]
+    fn acknowledgement_jobs_reject_caller_caps_and_clear_locked_defaults() {
+        assert!(validate_handoff_turn_request(HandoffMode::Required, Some("12")).is_err());
+        assert!(validate_handoff_turn_request(HandoffMode::Required, None).is_ok());
+
+        let mut turns = Some("30".to_string());
+        canonicalize_handoff_turn_limit(HandoffMode::Required, &mut turns);
+        assert_eq!(turns, None);
+
+        let mut probe_turns = Some("30".to_string());
+        canonicalize_handoff_turn_limit(HandoffMode::None, &mut probe_turns);
+        assert_eq!(probe_turns.as_deref(), Some("30"));
+    }
+
     fn test_handoff_session(name: &str) -> HandoffSession {
-        let root = temp(name);
-        let policy = test_handoff_policy(&root);
+        let base = temp(name);
+        let root = base.join("profile-test");
+        let policy = test_handoff_policy(&base);
         HandoffSession::initialize(
             &root,
             "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
@@ -2625,8 +2869,9 @@ mod tests {
 
     #[test]
     fn acknowledgement_jobs_without_context_bind_an_explicit_unavailable_source() {
-        let root = temp("unavailable-source-session");
-        let policy = test_handoff_policy(&root);
+        let base = temp("unavailable-source-session");
+        let root = base.join("profile-test");
+        let policy = test_handoff_policy(&base);
         let session = HandoffSession::initialize(
             &root,
             "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
@@ -2641,6 +2886,48 @@ mod tests {
             session.read().unwrap().source_session_id.as_deref(),
             Some("unavailable")
         );
+    }
+
+    #[test]
+    fn handoff_helpers_receive_the_profile_namespaced_state_root() {
+        let base = temp("profile-state-root");
+        let profile = base.join("profile-test");
+        let policy = test_handoff_policy(&base);
+        let session = HandoffSession::initialize(
+            &profile,
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            Some("codex-session"),
+            Some("grok-session"),
+            &policy,
+            &Mutex::new(()),
+        )
+        .unwrap();
+        let mut invocation = crate::harness::Invocation::new(
+            "grok",
+            vec!["--output-format".to_string(), "plain".to_string()],
+        );
+        session.configure_invocation(&mut invocation).unwrap();
+
+        assert_eq!(
+            invocation.env.get("PARLEY_HANDOFF_STATE_DIR"),
+            Some(&profile.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            invocation.env.get("PARLEY_HANDOFF_JOB_DIR"),
+            Some(&session.directory.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn handoff_contract_keeps_locked_response_requirements_inside_markers() {
+        let session = test_handoff_session("nested-response-contract");
+        let policy = session.config.clone();
+        let mut prompt = String::new();
+        append_handoff_contract(&mut prompt, &session.job_id, &session, &policy);
+
+        assert!(prompt.contains("including the complete TWO_CHAIRS_HANDOFF footer when required"));
+        assert!(prompt.contains("Put that footer before the end marker"));
+        assert!(prompt.contains("emit no visible report text outside the markers"));
     }
 
     fn text_stream_record(text: &str) -> String {
@@ -2737,29 +3024,124 @@ mod tests {
         let start =
             format!("=== TWO_CHAIRS_HANDOFF_READY_V1 job={job_id} handoff={handoff_id} ===");
         let end = format!("=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={handoff_id} ===");
+        assert_eq!(
+            extract_handoff_report(&start, job_id, handoff_id, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            extract_handoff_report(&format!("{start}\r"), job_id, handoff_id, None).unwrap(),
+            None
+        );
+        assert!(
+            extract_handoff_report(&format!("{start}x"), job_id, handoff_id, None)
+                .unwrap_err()
+                .contains("newline terminated")
+        );
         let exact = format!("{start}\nexact report 🌍\n{end}");
         assert_eq!(
-            extract_handoff_report(&format!("commentary\n{exact}\n"), job_id, handoff_id)
+            extract_handoff_report(&format!("commentary\n{exact}\n"), job_id, handoff_id, None,)
                 .unwrap()
                 .as_deref(),
             Some(exact.as_str())
         );
         assert!(
-            extract_handoff_report(&format!("{exact}\n{exact}\n"), job_id, handoff_id)
+            extract_handoff_report(&format!("{exact}\n{exact}\n"), job_id, handoff_id, None,)
                 .unwrap_err()
                 .contains("more than one")
         );
         assert!(extract_handoff_report(
             &format!("prefix{start}\nreport\n{end}"),
             job_id,
-            handoff_id
+            handoff_id,
+            None,
         )
         .unwrap_err()
         .contains("own line"));
         let oversized = format!("{start}\n{}\n{end}", "x".repeat(MAX_HANDOFF_REPORT_CHARS));
-        assert!(extract_handoff_report(&oversized, job_id, handoff_id)
+        assert!(extract_handoff_report(&oversized, job_id, handoff_id, None)
             .unwrap_err()
             .contains("exceeds"));
+        let crlf = format!("{start}\r\nexact report\r\n{end}");
+        assert_eq!(
+            extract_handoff_report(&crlf, job_id, handoff_id, None)
+                .unwrap()
+                .as_deref(),
+            Some(crlf.as_str())
+        );
+    }
+
+    #[test]
+    fn report_start_accepts_a_distinct_visible_message_boundary_only() {
+        let session = test_handoff_session("visible-message-boundary");
+        let report = format!(
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job={} handoff={} ===\nreport\n=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===",
+            session.job_id, session.handoff_id, session.handoff_id
+        );
+        let mut stream = session
+            .stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::Text,
+                    timestamp_ms: 1_000,
+                    tool_name: None,
+                    status: None,
+                    visible_text: Some("pre-tool commentary".to_string()),
+                },
+            )
+            .unwrap();
+        session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::ToolCallUpdate,
+                    timestamp_ms: 1_001,
+                    tool_name: None,
+                    status: Some("completed".to_string()),
+                    visible_text: None,
+                },
+            )
+            .unwrap();
+        session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::Text,
+                    timestamp_ms: 1_002,
+                    tool_name: None,
+                    status: None,
+                    visible_text: Some(report[..1].to_string()),
+                },
+            )
+            .unwrap();
+        session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::Text,
+                    timestamp_ms: 1_003,
+                    tool_name: None,
+                    status: None,
+                    visible_text: Some(report[1..].to_string()),
+                },
+            )
+            .unwrap();
+        assert!(stream.report_persisted);
+        drop(stream);
+        assert_eq!(
+            read_bounded_report(&report_path(&session.directory)).unwrap(),
+            report
+        );
+
+        let embedded = format!("pre-tool commentary{report}");
+        assert!(
+            extract_handoff_report(&embedded, &session.job_id, &session.handoff_id, None,)
+                .unwrap_err()
+                .contains("own line")
+        );
     }
 
     #[test]
@@ -2817,6 +3199,324 @@ mod tests {
             })
             .unwrap();
         assert_eq!(completed, exact);
+    }
+
+    #[test]
+    fn high_frequency_transition_activity_is_coalesced_below_reader_bound() {
+        let session = test_handoff_session("coalesced-transitions");
+        let base = 1_000_000_u128;
+        let mut stream = session
+            .stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for second in 0..=21_600_u128 {
+            let (class, tool_name, status) = match second % 5 {
+                0 => (ActivityClass::Thought, None, None),
+                1 => (ActivityClass::AvailableCommands, None, None),
+                2 => (ActivityClass::Usage, None, None),
+                3 => (
+                    ActivityClass::ToolCall,
+                    Some("read_file".to_string()),
+                    Some("pending".to_string()),
+                ),
+                _ => (
+                    ActivityClass::ToolCallUpdate,
+                    None,
+                    Some("completed".to_string()),
+                ),
+            };
+            session
+                .accept_activity(
+                    &mut stream,
+                    SafeActivity {
+                        class,
+                        timestamp_ms: base + second * 1_000,
+                        tool_name,
+                        status,
+                        visible_text: None,
+                    },
+                )
+                .unwrap();
+        }
+        drop(stream);
+
+        let journal = fs::read(journal_path(&session.directory)).unwrap();
+        assert!(journal.len() < MAX_HANDOFF_JOURNAL_BYTES);
+        assert!(journal.iter().filter(|byte| **byte == b'\n').count() <= 190);
+        let record = load_handoff_readonly(&session.directory).unwrap();
+        assert_eq!(record.phase, "reasoning");
+        assert_eq!(record.last_activity_ms, Some(base + 21_600 * 1_000));
+        assert!(record.activities.len() <= MAX_ACTIVITY_EVENTS);
+    }
+
+    #[test]
+    fn activity_transitions_and_terminal_flush_current_visible_excerpt() {
+        let session = test_handoff_session("activity-transitions");
+        let activities = [
+            SafeActivity {
+                class: ActivityClass::Thought,
+                timestamp_ms: 1_000,
+                tool_name: None,
+                status: None,
+                visible_text: None,
+            },
+            SafeActivity {
+                class: ActivityClass::Thought,
+                timestamp_ms: 1_001,
+                tool_name: None,
+                status: None,
+                visible_text: None,
+            },
+            SafeActivity {
+                class: ActivityClass::ToolCall,
+                timestamp_ms: 1_002,
+                tool_name: Some("read_file".to_string()),
+                status: Some("in_progress".to_string()),
+                visible_text: None,
+            },
+            SafeActivity {
+                class: ActivityClass::ToolCall,
+                timestamp_ms: 1_003,
+                tool_name: Some("read_file".to_string()),
+                status: Some("in_progress".to_string()),
+                visible_text: None,
+            },
+            SafeActivity {
+                class: ActivityClass::ToolCallUpdate,
+                timestamp_ms: 1_004,
+                tool_name: Some("read_file".to_string()),
+                status: Some("completed".to_string()),
+                visible_text: None,
+            },
+            SafeActivity {
+                class: ActivityClass::Text,
+                timestamp_ms: 1_005,
+                tool_name: None,
+                status: None,
+                visible_text: Some("first".to_string()),
+            },
+            SafeActivity {
+                class: ActivityClass::Text,
+                timestamp_ms: 1_006,
+                tool_name: None,
+                status: None,
+                visible_text: Some(" second".to_string()),
+            },
+            SafeActivity {
+                class: ActivityClass::End,
+                timestamp_ms: 1_007,
+                tool_name: None,
+                status: Some("end_turn".to_string()),
+                visible_text: None,
+            },
+        ];
+        let mut stream = session
+            .stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for activity in activities {
+            session.accept_activity(&mut stream, activity).unwrap();
+        }
+        drop(stream);
+
+        let record = load_handoff_readonly(&session.directory).unwrap();
+        assert_eq!(record.excerpt, "first second");
+        assert_eq!(record.phase, "ending");
+        assert_eq!(
+            record
+                .activities
+                .iter()
+                .map(|activity| activity.class.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "thought",
+                "thought",
+                "tool_call",
+                "tool_call_update",
+                "text",
+                "text",
+                "end"
+            ]
+        );
+    }
+
+    #[test]
+    fn periodic_non_text_flush_persists_queued_visible_excerpt() {
+        let session = test_handoff_session("periodic-visible-flush");
+        let mut stream = session
+            .stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for activity in [
+            SafeActivity {
+                class: ActivityClass::Thought,
+                timestamp_ms: 1_000,
+                tool_name: None,
+                status: None,
+                visible_text: None,
+            },
+            SafeActivity {
+                class: ActivityClass::Text,
+                timestamp_ms: 1_001,
+                tool_name: None,
+                status: None,
+                visible_text: Some("first".to_string()),
+            },
+            SafeActivity {
+                class: ActivityClass::Text,
+                timestamp_ms: 1_002,
+                tool_name: None,
+                status: None,
+                visible_text: Some(" second".to_string()),
+            },
+            SafeActivity {
+                class: ActivityClass::Thought,
+                timestamp_ms: 1_001 + ACTIVITY_FLUSH_INTERVAL_MS,
+                tool_name: None,
+                status: None,
+                visible_text: None,
+            },
+        ] {
+            session.accept_activity(&mut stream, activity).unwrap();
+        }
+        assert!(!stream.visible_dirty);
+        drop(stream);
+
+        let record = load_handoff_readonly(&session.directory).unwrap();
+        assert_eq!(record.excerpt, "first second");
+        assert_eq!(record.phase, "reasoning");
+    }
+
+    #[test]
+    fn durable_report_is_not_invalidated_by_followup_visible_text() {
+        let session = test_handoff_session("durable-report-followup");
+        let report = format!(
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job={} handoff={} ===\nreport\n=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===",
+            session.job_id, session.handoff_id, session.handoff_id
+        );
+        let mut stream = session
+            .stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::Text,
+                    timestamp_ms: 1_000,
+                    tool_name: None,
+                    status: None,
+                    visible_text: Some(report.clone()),
+                },
+            )
+            .unwrap();
+        assert!(stream.report_persisted);
+        session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::Text,
+                    timestamp_ms: 1_001,
+                    tool_name: None,
+                    status: None,
+                    visible_text: Some("receipt observed".to_string()),
+                },
+            )
+            .unwrap();
+        drop(stream);
+
+        assert_eq!(
+            read_bounded_report(&report_path(&session.directory)).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn duplicate_report_markers_still_fail_after_first_report_is_durable() {
+        let session = test_handoff_session("duplicate-report");
+        let report = format!(
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job={} handoff={} ===\nreport\n=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===\n",
+            session.job_id, session.handoff_id, session.handoff_id
+        );
+        let mut stream = session
+            .stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::Text,
+                    timestamp_ms: 1_000,
+                    tool_name: None,
+                    status: None,
+                    visible_text: Some(report.clone()),
+                },
+            )
+            .unwrap();
+        assert!(stream.report_persisted);
+        let error = session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::Text,
+                    timestamp_ms: 1_001,
+                    tool_name: None,
+                    status: None,
+                    visible_text: Some(report),
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("more than one"));
+    }
+
+    #[test]
+    fn split_start_marker_waits_for_its_streamed_newline() {
+        let session = test_handoff_session("split-start-marker");
+        let start = format!(
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job={} handoff={} ===",
+            session.job_id, session.handoff_id
+        );
+        let end = format!(
+            "=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===",
+            session.handoff_id
+        );
+        let mut stream = session
+            .stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::Text,
+                    timestamp_ms: 1_000,
+                    tool_name: None,
+                    status: None,
+                    visible_text: Some(start.clone()),
+                },
+            )
+            .unwrap();
+        assert!(!stream.report_persisted);
+        session
+            .accept_activity(
+                &mut stream,
+                SafeActivity {
+                    class: ActivityClass::Text,
+                    timestamp_ms: 1_001,
+                    tool_name: None,
+                    status: None,
+                    visible_text: Some(format!("\nstreamed report\n{end}")),
+                },
+            )
+            .unwrap();
+        assert!(stream.report_persisted);
+        drop(stream);
+
+        assert_eq!(
+            read_bounded_report(&report_path(&session.directory)).unwrap(),
+            format!("{start}\nstreamed report\n{end}")
+        );
     }
 
     #[test]
@@ -2879,6 +3579,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(repaired, newer);
+    }
+
+    #[test]
+    fn readonly_handoff_load_ignores_writer_lock_and_never_repairs_snapshot() {
+        let session = test_handoff_session("readonly-load");
+        let stale = b"{\"stale\":true}\n";
+        fs::write(snapshot_path(&session.directory), stale).unwrap();
+
+        let _writer_lock = HandoffFileLock::acquire(&session.directory).unwrap();
+        let record = load_handoff_readonly(&session.directory).unwrap();
+        assert_eq!(record.job_id, session.job_id);
+        assert_eq!(fs::read(snapshot_path(&session.directory)).unwrap(), stale);
     }
 
     #[test]
