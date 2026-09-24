@@ -145,13 +145,27 @@ impl Supervisor {
                 }
             }
         }
-        for (incident_id, kind) in self.model.pending_incident_sounds(now_ms) {
+        let incident_sounds = self.model.pending_incident_sounds(now_ms);
+        self.play_pending(now_ms, incident_sounds, &mut outcome)?;
+        let alert_sounds = self.model.pending_handoff_alert_sounds(now_ms);
+        self.play_pending(now_ms, alert_sounds, &mut outcome)?;
+        self.persist(now_ms)?;
+        Ok(outcome)
+    }
+
+    fn play_pending(
+        &mut self,
+        now_ms: u64,
+        pending: Vec<(String, SoundKind)>,
+        outcome: &mut TickOutcome,
+    ) -> Result<(), HealthError> {
+        for (sound_id, kind) in pending {
             let mut mark = HealthRecord::new(
                 crate::schema::InboxKind::Acknowledge,
-                format!("sounded-{incident_id}-{now_ms}"),
+                format!("sounded-{sound_id}-{now_ms}"),
                 now_ms,
             );
-            mark.sounded_incident_id = Some(incident_id);
+            mark.sounded_incident_id = Some(sound_id);
             mark.last_sound_ms = Some(now_ms);
             mark.source = Some(crate::schema::Source::Parley);
             journal::append(&self.paths.journal(), &mark)?;
@@ -165,8 +179,7 @@ impl Supervisor {
                 }
             }
         }
-        self.persist(now_ms)?;
-        Ok(outcome)
+        Ok(())
     }
 
     fn apply_live(

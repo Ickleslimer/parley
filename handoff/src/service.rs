@@ -378,9 +378,15 @@ fn wait_body(binding: &Binding, record: &StoredRecord, now_ms: u64) -> WaitRespo
     }
 }
 
+const HEALTH_EVIDENCE_SCHEMA_VERSION: u64 = 3;
+
+fn accepted_health_evidence(version: u64) -> bool {
+    matches!(version, 1 | 2 | HEALTH_EVIDENCE_SCHEMA_VERSION)
+}
+
 fn alert_record(binding: &Binding, incident_id: &str, now_ms: u64) -> Result<Vec<u8>, FailKind> {
     let body = json!({
-        "schema_version": 2,
+        "schema_version": HEALTH_EVIDENCE_SCHEMA_VERSION,
         "inbox_id": incident_id,
         "kind": "peer_alert_requested",
         "as_of_ms": now_ms,
@@ -414,7 +420,10 @@ fn write_alert(
             let existing = fsutil::read_shared(&path, 64 * 1024)?;
             let value: Value =
                 serde_json::from_slice(&existing).map_err(|_| FailKind::Malformed)?;
-            let valid = value.get("schema_version").and_then(Value::as_u64) == Some(2)
+            let valid = value
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                .is_some_and(accepted_health_evidence)
                 && value.get("kind").and_then(Value::as_str) == Some("peer_alert_requested")
                 && value.get("class").and_then(Value::as_str) == Some("handoff_unacknowledged")
                 && value.get("incident_id").and_then(Value::as_str) == Some(incident_id)

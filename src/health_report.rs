@@ -11,6 +11,7 @@ use crate::fsx;
 use crate::json::Json;
 
 static REPORT_COUNTER: AtomicU64 = AtomicU64::new(1);
+const HEALTH_SCHEMA_VERSION: f64 = 3.0;
 
 #[derive(Clone, Debug)]
 pub(crate) struct HealthReporter {
@@ -130,7 +131,10 @@ impl HealthReporter {
 
         let inbox_id = format!("handoff-received-{handoff_id}");
         let mut fields = BTreeMap::new();
-        fields.insert("schema_version".to_string(), Json::Number(2.0));
+        fields.insert(
+            "schema_version".to_string(),
+            Json::Number(HEALTH_SCHEMA_VERSION),
+        );
         fields.insert("inbox_id".to_string(), Json::Str(inbox_id.clone()));
         fields.insert(
             "kind".to_string(),
@@ -179,7 +183,10 @@ impl HealthReporter {
 
         let inbox_id = format!("parley-{kind}-{}", receipt.event_id);
         let mut fields = BTreeMap::new();
-        fields.insert("schema_version".to_string(), Json::Number(2.0));
+        fields.insert(
+            "schema_version".to_string(),
+            Json::Number(HEALTH_SCHEMA_VERSION),
+        );
         fields.insert("inbox_id".to_string(), Json::Str(inbox_id.clone()));
         fields.insert("kind".to_string(), Json::Str(kind.to_string()));
         fields.insert(
@@ -284,7 +291,7 @@ fn write_atomic_named(
     if destination.exists() {
         let existing = fs::read(&destination)
             .map_err(|error| format!("read health inbox {}: {error}", destination.display()))?;
-        return if existing == bytes {
+        return if existing == bytes || preserved_health_receipt(&existing, bytes) {
             Ok(())
         } else {
             Err(format!(
@@ -324,6 +331,49 @@ fn write_atomic_named(
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn preserved_health_receipt(existing: &[u8], intended: &[u8]) -> bool {
+    let (Ok(existing_text), Ok(intended_text)) =
+        (std::str::from_utf8(existing), std::str::from_utf8(intended))
+    else {
+        return false;
+    };
+    let (Ok(existing_json), Ok(intended_json)) =
+        (Json::parse(existing_text), Json::parse(intended_text))
+    else {
+        return false;
+    };
+    let Some(version) = existing_json
+        .get("schema_version")
+        .and_then(Json::as_number)
+    else {
+        return false;
+    };
+    if version != 1.0 && version != 2.0 && version != HEALTH_SCHEMA_VERSION {
+        return false;
+    }
+    [
+        "inbox_id",
+        "kind",
+        "as_of_ms",
+        "source",
+        "class",
+        "incident_id",
+        "session_id",
+        "event_id",
+        "exchange_id",
+    ]
+    .into_iter()
+    .all(|key| same_health_field(&existing_json, &intended_json, key))
+}
+
+fn same_health_field(existing: &Json, intended: &Json, key: &str) -> bool {
+    match (existing.get(key), intended.get(key)) {
+        (Some(left), Some(right)) => left == right,
+        (None, Some(Json::Null)) | (Some(Json::Null), None) | (None, None) => true,
+        _ => false,
+    }
 }
 
 fn timestamp_ms() -> u128 {
@@ -372,7 +422,7 @@ mod tests {
         let json = Json::parse(&text).unwrap();
         assert_eq!(
             json.get("schema_version").and_then(Json::as_number),
-            Some(2.0)
+            Some(HEALTH_SCHEMA_VERSION)
         );
         assert_eq!(
             json.get("class").and_then(Json::as_str),
@@ -420,7 +470,7 @@ mod tests {
         let json = Json::parse(&text).unwrap();
         assert_eq!(
             json.get("schema_version").and_then(Json::as_number),
-            Some(2.0)
+            Some(HEALTH_SCHEMA_VERSION)
         );
         assert_eq!(
             json.get("kind").and_then(Json::as_str),
@@ -435,6 +485,54 @@ mod tests {
         for forbidden in ["prompt", "reply", "command", "environment"] {
             assert!(!text.contains(forbidden));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserves_v2_receipt_bytes_and_rejects_a_conflicting_record() {
+        let root = env::temp_dir().join(format!(
+            "parley-health-v2-receipt-{}-{}",
+            std::process::id(),
+            REPORT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let handoff_id = "11111111-1111-4111-8111-111111111111";
+        let legacy = b"{\"as_of_ms\":1234,\"class\":\"handoff_unacknowledged\",\"event_id\":null,\"exchange_id\":\"22222222-2222-4222-8222-222222222222\",\"inbox_id\":\"handoff-received-11111111-1111-4111-8111-111111111111\",\"incident_id\":\"handoff-11111111-1111-4111-8111-111111111111\",\"kind\":\"handoff_received\",\"schema_version\":2,\"session_id\":\"33333333-3333-4333-8333-333333333333\",\"source\":\"codex\"}\n";
+        let path = root.join(format!("zz-1234-handoff-received-{handoff_id}.json"));
+        fs::write(&path, legacy).unwrap();
+        let reporter = HealthReporter::at(root.clone());
+        reporter
+            .handoff_received(
+                "22222222-2222-4222-8222-222222222222",
+                handoff_id,
+                Some("handoff-11111111-1111-4111-8111-111111111111"),
+                Some("33333333-3333-4333-8333-333333333333"),
+                1234,
+            )
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+
+        let conflict =
+            root.join("zz-1234-handoff-received-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.json");
+        fs::write(
+            &conflict,
+            b"{\"schema_version\":2,\"kind\":\"handoff_received\",\"incident_id\":\"other\"}\n",
+        )
+        .unwrap();
+        let error = reporter
+            .handoff_received(
+                "22222222-2222-4222-8222-222222222222",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                Some("handoff-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                Some("33333333-3333-4333-8333-333333333333"),
+                1234,
+            )
+            .unwrap_err();
+        assert!(error.contains("different content"));
+        assert_eq!(
+            fs::read(&conflict).unwrap(),
+            b"{\"schema_version\":2,\"kind\":\"handoff_received\",\"incident_id\":\"other\"}\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

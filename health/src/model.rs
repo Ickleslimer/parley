@@ -27,9 +27,22 @@ pub struct Incident {
     pub exchange_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffAlert {
+    pub alert_id: String,
+    pub status: IncidentStatus,
+    pub opened_ms: u64,
+    pub as_of_ms: u64,
+    pub recovered_ms: Option<u64>,
+    pub session_id: Option<String>,
+    pub event_id: Option<String>,
+    pub exchange_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HealthModel {
     pub incidents: Vec<Incident>,
+    pub handoff_alerts: Vec<HandoffAlert>,
     pub processed_inbox_ids: HashSet<String>,
     pub muted: bool,
     pub acks: HashMap<String, u64>,
@@ -116,7 +129,7 @@ impl HealthModel {
             .incidents
             .iter()
             .filter(|incident| incident.status == IncidentStatus::Active)
-            .filter(|incident| incident.class.is_audible())
+            .filter(|incident| incident.class.is_incident())
             .map(|incident| (incident.incident_id.clone(), incident.class))
             .collect();
         for (id, class) in ids {
@@ -129,10 +142,30 @@ impl HealthModel {
         plays
     }
 
+    pub fn pending_handoff_alert_sounds(&mut self, now_ms: u64) -> Vec<(String, SoundKind)> {
+        let mut plays = Vec::new();
+        let ids: Vec<String> = self
+            .handoff_alerts
+            .iter()
+            .filter(|alert| alert.status == IncidentStatus::Active)
+            .map(|alert| alert.alert_id.clone())
+            .collect();
+        for id in ids {
+            if let Some(kind) = self.consider_alert_sound(&id, now_ms) {
+                self.sounded_incident_ids.insert(id.clone());
+                self.last_sound_ms = Some(now_ms);
+                plays.push((id, kind));
+            }
+        }
+        plays
+    }
+
     pub fn snapshot(&self, generated_ms: u64) -> QueryDocument {
+        let formal = |incident: &&Incident| incident.class.is_incident();
         let mut active: Vec<IncidentView> = self
             .incidents
             .iter()
+            .filter(formal)
             .filter(|incident| incident.status == IncidentStatus::Active)
             .map(|incident| self.view(incident))
             .collect();
@@ -142,6 +175,7 @@ impl HealthModel {
         let mut recent: Vec<IncidentView> = self
             .incidents
             .iter()
+            .filter(formal)
             .map(|incident| self.view(incident))
             .collect();
         recent.sort_by_key(|incident| Reverse(incident.opened_ms));
@@ -150,6 +184,7 @@ impl HealthModel {
         let unread_count = self
             .incidents
             .iter()
+            .filter(formal)
             .filter(|incident| {
                 incident.status == IncidentStatus::Active
                     && !self.acks.contains_key(&incident.incident_id)
@@ -161,6 +196,7 @@ impl HealthModel {
             self.latest_grok.as_ref().map(|obs| obs.as_of_ms),
             self.incidents
                 .iter()
+                .filter(|incident| incident.class.is_incident())
                 .map(|incident| incident.as_of_ms)
                 .max(),
         ]
@@ -322,14 +358,18 @@ impl HealthModel {
         record.source = Some(Source::Grok);
         record.class = Some(ClosedClass::HandoffUnacknowledged);
         record.incident_id = Some(incident_id.clone());
-        if let Some(existing) = self
+        if self
             .incidents
-            .iter_mut()
-            .find(|incident| incident.incident_id == incident_id)
+            .iter()
+            .any(|incident| incident.incident_id == incident_id)
         {
-            if existing.class != ClosedClass::HandoffUnacknowledged {
-                return ApplyOutcome::default();
-            }
+            return ApplyOutcome::default();
+        }
+        if let Some(existing) = self
+            .handoff_alerts
+            .iter_mut()
+            .find(|alert| alert.alert_id == incident_id)
+        {
             if existing.session_id.is_none() {
                 existing.session_id = record.session_id.clone();
             }
@@ -341,10 +381,8 @@ impl HealthModel {
             }
             return ApplyOutcome::default();
         }
-        let mut incident = Incident {
-            incident_id: incident_id.clone(),
-            class: ClosedClass::HandoffUnacknowledged,
-            source: Source::Grok,
+        let mut alert = HandoffAlert {
+            alert_id: incident_id.clone(),
             status: IncidentStatus::Active,
             opened_ms: now_ms,
             as_of_ms: record.as_of_ms,
@@ -358,19 +396,14 @@ impl HealthModel {
             ..ApplyOutcome::default()
         };
         if self.receipt_covers(&incident_id, record.as_of_ms) {
-            incident.status = IncidentStatus::Recovered;
-            incident.recovered_ms = Some(now_ms);
+            alert.status = IncidentStatus::Recovered;
+            alert.recovered_ms = Some(now_ms);
             record.recovered_incident_id = Some(incident_id);
             outcome.recovered = true;
         } else {
-            outcome.sound = self.consider_sound(
-                &incident.incident_id,
-                ClosedClass::HandoffUnacknowledged,
-                now_ms,
-                false,
-            );
+            outcome.sound = self.consider_alert_sound(&alert.alert_id, now_ms);
         }
-        self.incidents.push(incident);
+        self.handoff_alerts.push(alert);
         outcome
     }
 
@@ -414,21 +447,18 @@ impl HealthModel {
         now_ms: u64,
         record: &mut HealthRecord,
     ) -> bool {
-        let Some(incident) = self
-            .incidents
+        let Some(alert) = self
+            .handoff_alerts
             .iter_mut()
-            .find(|incident| incident.incident_id == incident_id)
+            .find(|alert| alert.alert_id == incident_id)
         else {
             return false;
         };
-        if incident.class != ClosedClass::HandoffUnacknowledged
-            || incident.status != IncidentStatus::Active
-            || receipt_ms < incident.as_of_ms
-        {
+        if alert.status != IncidentStatus::Active || receipt_ms < alert.as_of_ms {
             return false;
         }
-        incident.status = IncidentStatus::Recovered;
-        incident.recovered_ms = Some(now_ms);
+        alert.status = IncidentStatus::Recovered;
+        alert.recovered_ms = Some(now_ms);
         record.recovered_incident_id = Some(incident_id.to_string());
         true
     }
@@ -448,10 +478,10 @@ impl HealthModel {
         record: &mut HealthRecord,
         now_ms: u64,
     ) -> ApplyOutcome {
-        let attach_existing = !matches!(
-            class,
-            ClosedClass::WatchdogKilled | ClosedClass::McpStdoutUndelivered
-        );
+        if !class.is_incident() {
+            return ApplyOutcome::default();
+        }
+        let attach_existing = !matches!(class, ClosedClass::McpStdoutUndelivered);
         if let Some(existing) = self.incidents.iter_mut().find(|incident| {
             attach_existing
                 && incident.status == IncidentStatus::Active
@@ -541,12 +571,7 @@ impl HealthModel {
         for incident in &mut self.incidents {
             if incident.status == IncidentStatus::Active
                 && incident.source == Source::Grok
-                && matches!(
-                    incident.class,
-                    ClosedClass::QuotaExhausted
-                        | ClosedClass::CapacityThrottle
-                        | ClosedClass::TurnError
-                )
+                && incident.class == ClosedClass::QuotaExhausted
                 && as_of_ms > incident.as_of_ms
             {
                 incident.status = IncidentStatus::Recovered;
@@ -594,6 +619,18 @@ impl HealthModel {
             return None;
         }
         if self.sounded_incident_ids.contains(incident_id) {
+            return None;
+        }
+        if let Some(last) = self.last_sound_ms {
+            if now_ms.saturating_sub(last) < SOUND_COOLDOWN_MS {
+                return None;
+            }
+        }
+        Some(SoundKind::Incident)
+    }
+
+    fn consider_alert_sound(&self, alert_id: &str, now_ms: u64) -> Option<SoundKind> {
+        if self.muted || self.sounded_incident_ids.contains(alert_id) {
             return None;
         }
         if let Some(last) = self.last_sound_ms {

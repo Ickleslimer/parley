@@ -35,22 +35,32 @@ query may run; it does not admit `StopFailure` evidence from that repository.
 
 ## Evidence boundaries
 
-Health schema v2 stores sanitized classes, identifiers, timestamps, provider
-usage fields, and transport references only. Readers accept schema v1 and v2
-journals, inbox records, durable state, cached scope, and snapshots, then
-normalize new writes to v2. Any other schema version is rejected. The package
-never stores prompts, replies, credentials, raw environment values, command
-arguments, or raw provider error payloads. Silence is never evidence of
-failure. Viewer acknowledgement suppresses a repeat alert but never means
-recovery.
+Health schema v3 stores sanitized classes, identifiers, timestamps, provider
+usage fields, and transport references only. Readers accept schema v1, v2, and
+v3 journals, inbox records, durable state, cached scope, and snapshots. New
+writes use v3. Existing journal lines stay append-only and are not rewritten.
+Any other schema version is rejected. The package never stores prompts,
+replies, credentials, raw environment values, command arguments, or raw
+provider error payloads. Silence is never evidence of failure.
 
-Only `quota_exhausted`, `mcp_stdout_undelivered`, and explicit
-`handoff_unacknowledged` incidents are audible. A handoff incident is opened
-only by `peer_alert_requested` and keeps the supplied incident id. It is
-recovered only by `handoff_received` for that same id when the receipt time is
-greater than or equal to the alert evidence time. The global acoustic cooldown
-is 60 seconds and each incident can sound once. The user-triggered test chime
-creates no incident and remains available while incident sounds are muted.
+Formal incidents are only `quota_exhausted` and `mcp_stdout_undelivered`.
+Those classes are the only ones projected into incident lists, unread counts,
+and automatic incident chimes. Their recovery rules, one-sound-per-identity
+behavior, mute state, and the global 60-second cooldown are unchanged.
+`usage_sample`, `capacity_throttle`, `turn_error`, and `watchdog_killed`
+remain diagnostics. Live evidence and replay keep them out of incident rows,
+unread state, and sound.
+
+`handoff_unacknowledged` is an explicit handoff alert, not an incident. Only
+`peer_alert_requested` opens it, and the legacy `incident_id` field remains
+the transport identifier. It is recovered only by `handoff_received` for that
+same id when the receipt time is greater than or equal to the alert evidence
+time. It may play the same chime once under mute and the global cooldown, and
+restart replay preserves sounded-identity and receipt evidence without a
+migration chime. It never contributes to incident lists, unread counts, or
+incident acknowledgement. Viewer acknowledgement does not recover it. The
+user-triggered test chime creates no incident and remains available while
+incident and alert chimes are muted.
 
 ## Chime
 

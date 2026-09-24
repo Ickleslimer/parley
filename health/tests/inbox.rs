@@ -65,7 +65,7 @@ fn viewer_control_records_are_explicit() {
 }
 
 #[test]
-fn v1_inbox_is_accepted_and_all_new_writes_are_v2() {
+fn v1_v2_and_v3_inbox_records_are_accepted_and_new_writes_are_v3() {
     let home = common::TempHome::new("inbox-migration");
     let mut legacy = common::codex_sample("legacy-inbox", 1, None);
     legacy.schema_version = 1;
@@ -73,10 +73,19 @@ fn v1_inbox_is_accepted_and_all_new_writes_are_v2() {
     let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(written["schema_version"], SCHEMA_VERSION);
 
-    let mut direct_legacy = common::codex_sample("direct-legacy", 2, None);
-    direct_legacy.schema_version = 1;
-    let direct_path = home.paths.inbox().join("direct-legacy.json");
-    fs::write(&direct_path, serde_json::to_vec(&direct_legacy).unwrap()).unwrap();
-    let parsed = inbox::read_record(&direct_path).unwrap();
-    assert_eq!(parsed.schema_version, 1);
+    for version in [1_u32, 2, 3] {
+        let mut direct =
+            common::codex_sample(&format!("direct-{version}"), u64::from(version), None);
+        direct.schema_version = version;
+        let direct_path = home.paths.inbox().join(format!("direct-{version}.json"));
+        fs::write(&direct_path, serde_json::to_vec(&direct).unwrap()).unwrap();
+        let parsed = inbox::read_record(&direct_path).unwrap();
+        assert_eq!(parsed.schema_version, version);
+    }
+
+    let mut rejected = common::codex_sample("direct-4", 4, None);
+    rejected.schema_version = 4;
+    let rejected_path = home.paths.inbox().join("direct-4.json");
+    fs::write(&rejected_path, serde_json::to_vec(&rejected).unwrap()).unwrap();
+    assert!(inbox::read_record(&rejected_path).is_err());
 }

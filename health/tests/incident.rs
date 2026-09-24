@@ -161,14 +161,19 @@ fn successful_grok_turn_does_not_recover_terminal_transport_incidents() {
 }
 
 #[test]
-fn watchdog_is_silent_and_cooldown_blocks_second_incident_sound() {
+fn diagnostics_are_silent_and_cooldown_blocks_second_incident_sound() {
     let home = common::TempHome::new("cooldown");
     let (mut supervisor, recorder) = with_recorder(&home);
     supervisor.ingest(common::watchdog("wd-1", 1), 1).unwrap();
+    supervisor
+        .ingest(common::grok_stop("cap-1", 1, Some(503), None), 1)
+        .unwrap();
     assert!(recorder.recorded().is_empty());
+    assert!(supervisor.model.incidents.is_empty());
+    assert_eq!(supervisor.model.snapshot(1).unread_count, 0);
     assert_eq!(
-        supervisor.model.incidents[0].class,
-        ClosedClass::WatchdogKilled
+        supervisor.model.latest_grok.as_ref().map(|obs| obs.class),
+        Some(ClosedClass::CapacityThrottle)
     );
 
     supervisor

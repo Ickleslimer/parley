@@ -31,7 +31,7 @@ fn encode(document: QueryDocument, exit_code: i32) -> QueryResult {
             now_ms(),
         ))
         .unwrap_or_else(|_| {
-            r#"{"schema_version":2,"generated_ms":0,"muted":false,"unread_count":0,"active_incidents":[],"recent_incidents":[],"unavailable":{"reason":"malformed"},"stale":true,"diagnostics":{"snapshot_missing":false,"snapshot_malformed":true,"snapshot_locked":false,"journal_incomplete_trailing":false,"malformed_journal_lines":0,"oversized_journal_lines":0,"unsupported_journal_records":0,"quarantined_inbox":0,"malformed_inbox":0,"sound_failures":0,"footer_missing":0}}"#.to_string()
+            r#"{"schema_version":3,"generated_ms":0,"muted":false,"unread_count":0,"active_incidents":[],"recent_incidents":[],"unavailable":{"reason":"malformed"},"stale":true,"diagnostics":{"snapshot_missing":false,"snapshot_malformed":true,"snapshot_locked":false,"journal_incomplete_trailing":false,"malformed_journal_lines":0,"oversized_journal_lines":0,"unsupported_journal_records":0,"quarantined_inbox":0,"malformed_inbox":0,"sound_failures":0,"footer_missing":0}}"#.to_string()
         })
     });
     QueryResult { json, exit_code }

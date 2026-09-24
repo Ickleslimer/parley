@@ -49,7 +49,7 @@ fn rebuilds_after_incomplete_trailing_journal_data() {
 fn skips_malformed_and_unsupported_journal_lines_without_deleting() {
     let home = common::TempHome::new("journal-malformed");
     let body = format!(
-        "{}\nnot-json\n{{\"schema_version\":3,\"inbox_id\":\"x\",\"kind\":\"codex_sample\",\"as_of_ms\":1}}\n",
+        "{}\nnot-json\n{{\"schema_version\":4,\"inbox_id\":\"x\",\"kind\":\"codex_sample\",\"as_of_ms\":1}}\n",
         serde_json::to_string(&common::codex_sample("codex-ok", 11, None)).unwrap()
     );
     fs::write(home.paths.journal(), body).unwrap();
@@ -64,25 +64,30 @@ fn skips_malformed_and_unsupported_journal_lines_without_deleting() {
 }
 
 #[test]
-fn replays_v1_and_v2_but_writes_v2() {
+fn replays_v1_v2_and_v3_but_writes_v3() {
     let home = common::TempHome::new("journal-migration");
     let mut legacy = common::codex_sample("legacy", 1, None);
     legacy.schema_version = 1;
-    let current = common::codex_sample("current", 2, None);
+    let mut v2 = common::codex_sample("v2", 2, None);
+    v2.schema_version = 2;
+    let mut v3 = common::codex_sample("v3", 3, None);
+    v3.schema_version = 3;
     fs::write(
         home.paths.journal(),
         format!(
-            "{}\n{}\n",
+            "{}\n{}\n{}\n",
             serde_json::to_string(&legacy).unwrap(),
-            serde_json::to_string(&current).unwrap()
+            serde_json::to_string(&v2).unwrap(),
+            serde_json::to_string(&v3).unwrap()
         ),
     )
     .unwrap();
 
     let loaded = journal::load(&home.paths.journal()).unwrap();
-    assert_eq!(loaded.records.len(), 2);
+    assert_eq!(loaded.records.len(), 3);
     assert_eq!(loaded.records[0].schema_version, 1);
-    assert_eq!(loaded.records[1].schema_version, SCHEMA_VERSION);
+    assert_eq!(loaded.records[1].schema_version, 2);
+    assert_eq!(loaded.records[2].schema_version, 3);
 
     let mut forced_legacy = common::codex_sample("new", 3, None);
     forced_legacy.schema_version = 1;
@@ -113,7 +118,7 @@ fn restart_replay_does_not_duplicate_incidents() {
 }
 
 #[test]
-fn v1_durable_state_is_loaded_and_rewritten_as_v2() {
+fn v1_durable_state_is_loaded_and_normalized_on_the_next_state_write() {
     let home = common::TempHome::new("state-migration");
     fs::write(
         home.paths.state(),

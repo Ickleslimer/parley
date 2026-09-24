@@ -4,10 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub fn accepted_schema(version: u32) -> bool {
-    matches!(version, 1 | SCHEMA_VERSION)
+    matches!(version, 1 | 2 | SCHEMA_VERSION)
 }
 pub const SOUND_COOLDOWN_MS: u64 = 60_000;
 pub const STALE_AFTER_MS: u64 = 120_000;
@@ -89,14 +89,11 @@ impl ClosedClass {
     }
 
     pub fn is_incident(self) -> bool {
-        !matches!(self, Self::UsageSample)
+        matches!(self, Self::QuotaExhausted | Self::McpStdoutUndelivered)
     }
 
     pub fn is_audible(self) -> bool {
-        matches!(
-            self,
-            Self::QuotaExhausted | Self::McpStdoutUndelivered | Self::HandoffUnacknowledged
-        )
+        self.is_incident()
     }
 }
 

@@ -13,7 +13,7 @@ pub fn write_record(paths: &HealthPaths, record: &HealthRecord) -> Result<PathBu
     let inbox_id = sanitize_id(&record.inbox_id)
         .ok_or_else(|| HealthError::msg("inbox_id missing or invalid"))?;
     if !accepted_schema(record.schema_version) {
-        return Err(HealthError::msg("inbox schema_version must be 1 or 2"));
+        return Err(HealthError::msg("inbox schema_version must be 1, 2, or 3"));
     }
     let mut stored = record.clone();
     stored.schema_version = SCHEMA_VERSION;

@@ -510,7 +510,7 @@ fn alert_is_idempotent_sanitized_and_silent() {
     assert_eq!(files.len(), 1);
     let body = fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
     let record: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(record["schema_version"], 2);
+    assert_eq!(record["schema_version"], 3);
     assert_eq!(record["class"], "handoff_unacknowledged");
     assert_eq!(record["kind"], "peer_alert_requested");
     assert_eq!(record["incident_id"], first["incident_id"]);
@@ -529,6 +529,29 @@ fn alert_is_idempotent_sanitized_and_silent() {
         alert(&binding, &facts, 7_000).unwrap_err(),
         FailKind::Malformed
     );
+}
+
+#[test]
+fn existing_v2_alert_file_is_preserved_without_rewrite() {
+    let world = world();
+    write_rollout(&world, "VISIBLE_CODEX_NOTE");
+    let incident_id = format!("handoff-{HANDOFF}");
+    let mut prior = record("awaiting_ack", Some(9_000_000), None);
+    prior.alert_incident_id = Some(incident_id.clone());
+    write_records(&world, &[prior]);
+    let legacy = format!(
+        "{{\"schema_version\":2,\"inbox_id\":\"{incident_id}\",\"kind\":\"peer_alert_requested\",\"as_of_ms\":1,\"source\":\"grok\",\"class\":\"handoff_unacknowledged\",\"incident_id\":\"{incident_id}\",\"session_id\":\"{TARGET}\",\"exchange_id\":\"{JOB}\"}}"
+    );
+    let path = world.inbox.join(format!("{incident_id}.json"));
+    fs::write(&path, &legacy).unwrap();
+    let binding = bound(&world);
+    let facts = facts(&world, &world.alert_exe, PID, &[]);
+    let response: Value = serde_json::from_str(&alert(&binding, &facts, 5_000).unwrap()).unwrap();
+    assert_eq!(response["created"], false);
+    assert_eq!(response["incident_id"], incident_id);
+    assert_eq!(fs::read_to_string(&path).unwrap(), legacy);
+    let stored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(stored["schema_version"], 2);
 }
 
 #[test]

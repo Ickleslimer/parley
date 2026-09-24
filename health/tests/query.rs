@@ -31,7 +31,7 @@ fn zero_argument_query_reads_snapshot_and_rejects_extra_args() {
         .unwrap();
     assert!(output.status.success());
     let json = parse_json(&String::from_utf8(output.stdout).unwrap());
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], parley_health::SCHEMA_VERSION);
     assert_eq!(json["stale"], false);
     assert!(json["unavailable"].is_null());
     assert!(json.get("peer_alive").is_none());

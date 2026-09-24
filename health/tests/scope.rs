@@ -103,20 +103,22 @@ fn command_analysis_unescapes_powershell_direct_paths() {
 }
 
 #[test]
-fn scope_accepts_v1_normalizes_writes_and_rejects_v3() {
+fn scope_accepts_v1_v2_and_v3_normalizes_writes_and_rejects_v4() {
     let home = common::TempHome::new("scope-migration");
     let mut legacy = ScopeFile::empty();
-    legacy.schema_version = 1;
-    std::fs::write(home.paths.scope(), serde_json::to_vec(&legacy).unwrap()).unwrap();
-    let loaded = ScopeFile::load(&home.paths.scope()).unwrap();
-    assert_eq!(loaded.schema_version, 2);
+    for version in [1, 2, 3] {
+        legacy.schema_version = version;
+        std::fs::write(home.paths.scope(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let loaded = ScopeFile::load(&home.paths.scope()).unwrap();
+        assert_eq!(loaded.schema_version, parley_health::SCHEMA_VERSION);
+    }
 
     legacy.save(&home.paths.scope()).unwrap();
     let written: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home.paths.scope()).unwrap()).unwrap();
-    assert_eq!(written["schema_version"], 2);
+    assert_eq!(written["schema_version"], parley_health::SCHEMA_VERSION);
 
-    legacy.schema_version = 3;
+    legacy.schema_version = 4;
     std::fs::write(home.paths.scope(), serde_json::to_vec(&legacy).unwrap()).unwrap();
     assert!(ScopeFile::load(&home.paths.scope()).is_err());
 }
