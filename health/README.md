@@ -39,7 +39,9 @@ Health schema v3 stores sanitized classes, identifiers, timestamps, provider
 usage fields, and transport references only. Readers accept schema v1, v2, and
 v3 journals, inbox records, durable state, cached scope, and snapshots. New
 writes use v3. Existing journal lines stay append-only and are not rewritten.
-Any other schema version is rejected. The package never stores prompts,
+The replaceable durable-state and snapshot projections normalize to v3 on the
+next supervisor write while preserving mute, acknowledgements, sounded
+identities, and the cooldown timestamp. Any other schema version is rejected. The package never stores prompts,
 replies, credentials, raw environment values, command arguments, or raw
 provider error payloads. Silence is never evidence of failure.
 

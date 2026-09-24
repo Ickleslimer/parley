@@ -38,8 +38,11 @@ acknowledgement controls, event-log handoff selection, or sound.
 ## Migration
 
 - Readers accept health schemas v1, v2, and v3; new writes use v3.
-- Existing journals, state, handoff evidence, and sound history remain
-  append-only and are never rewritten or deleted.
+- Existing journal lines and create-new handoff evidence remain append-only and
+  are never rewritten or deleted.
+- On supervisor startup, `state.json` and `snapshot.json` are atomically
+  replaced with current v3 projections. Durable mute, acknowledgement,
+  sounded-identity, and cooldown evidence is carried forward.
 - Replay projects old `capacity_throttle`, `turn_error`, and `watchdog_killed`
   records as diagnostics only.
 - Replay projects old `handoff_unacknowledged` records through the explicit
