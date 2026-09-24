@@ -189,6 +189,13 @@ export const CLOSED_CLASSES = [
 ] as const;
 export type ClosedClass = (typeof CLOSED_CLASSES)[number];
 
+export const INCIDENT_CLASSES = ["quota_exhausted", "mcp_stdout_undelivered"] as const;
+export type IncidentClass = (typeof INCIDENT_CLASSES)[number];
+
+export function isIncidentClass(value: ClosedClass): value is IncidentClass {
+  return INCIDENT_CLASSES.some((incidentClass) => incidentClass === value);
+}
+
 export const PEER_HEALTH_SOURCES = ["codex", "grok", "parley", "viewer"] as const;
 export type PeerHealthSource = (typeof PEER_HEALTH_SOURCES)[number];
 

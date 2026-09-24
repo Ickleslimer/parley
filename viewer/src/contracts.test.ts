@@ -4,6 +4,8 @@ import {
   CLOSED_CLASSES,
   DEFAULT_PEER_HEALTH_DIAGNOSTICS,
   DEFAULT_SETTINGS,
+  INCIDENT_CLASSES,
+  isIncidentClass,
   PEER_HEALTH_UNAVAILABLE_REASONS,
 } from "./contracts";
 
@@ -30,6 +32,13 @@ describe("peer health contract tokens", () => {
       "mcp_stdout_undelivered",
       "handoff_unacknowledged",
     ]);
+    expect(INCIDENT_CLASSES).toEqual(["quota_exhausted", "mcp_stdout_undelivered"]);
+    expect(isIncidentClass("quota_exhausted")).toBe(true);
+    expect(isIncidentClass("mcp_stdout_undelivered")).toBe(true);
+    expect(isIncidentClass("capacity_throttle")).toBe(false);
+    expect(isIncidentClass("turn_error")).toBe(false);
+    expect(isIncidentClass("watchdog_killed")).toBe(false);
+    expect(isIncidentClass("handoff_unacknowledged")).toBe(false);
     expect(PEER_HEALTH_UNAVAILABLE_REASONS).toEqual([
       "missing",
       "malformed",

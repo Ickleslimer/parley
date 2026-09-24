@@ -138,7 +138,7 @@ export function presentHandoff(handoff: PeerHandoffItem, generatedMs: number): P
       handoff.receiptAtMs == null
         ? "No Codex receipt recorded."
         : `Codex receipt recorded ${formatTimestamp(handoff.receiptAtMs)}; delivery only, not acceptance.`,
-    alert: handoff.alertIncidentId ? `Explicit alert incident ${handoff.alertIncidentId}` : null,
+    alert: handoff.alertIncidentId ? `Explicit handoff alert ${handoff.alertIncidentId}` : null,
     diagnostic: handoff.recordDiagnostic
       ? `Record evidence unavailable (${handoff.recordDiagnostic}).`
       : null,

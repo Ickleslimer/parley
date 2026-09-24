@@ -287,6 +287,31 @@ describe("peer health actions", () => {
     expect(busyView.actions.muteEnabled).toBe(false);
   });
 
+  it("filters legacy silent rows from incident lists and recomputes unread state", () => {
+    const view = presentPeerHealth({
+      snapshot: snapshot({
+        unreadCount: 4,
+        activeIncidents: [
+          incident({ incidentId: "turn", class: "turn_error" }),
+          incident({ incidentId: "watchdog", class: "watchdog_killed" }),
+          incident({ incidentId: "alert", class: "handoff_unacknowledged" }),
+          incident({ incidentId: "quota", class: "quota_exhausted" }),
+        ],
+        recentIncidents: [
+          incident({ incidentId: "capacity", class: "capacity_throttle" }),
+          incident({ incidentId: "stdout", class: "mcp_stdout_undelivered" }),
+        ],
+      }),
+      error: null,
+      loading: false,
+      busy: false,
+      handoffLabel: null,
+    });
+    expect(view.unreadLabel).toBe("1 unacknowledged active incident");
+    expect(view.activeIncidents.map((item) => item.incidentId)).toEqual(["quota"]);
+    expect(view.recentIncidents.map((item) => item.incidentId)).toEqual(["stdout"]);
+  });
+
   it("applies Open Latest Handoff by replacing the event pane only when an event is returned", () => {
     const exact = event();
     const undelivered: HandoffSelection = {

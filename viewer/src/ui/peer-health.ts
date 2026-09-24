@@ -10,13 +10,14 @@ import type {
   PeerIncident,
   PeerIncidentStatus,
 } from "../contracts";
+import { isIncidentClass } from "../contracts";
 
 import { button, el, labelledControl, setText } from "./dom";
 import { formatCount, formatTimestamp } from "./format";
 
 export const PEER_HEALTH_TITLE = "Peer Health";
 export const PEER_HEALTH_CAPTION =
-  "Read-only Codex and Grok evidence for the Two Chairs collaboration. Peer-alive and peer-down are not inferred.";
+  "Read-only Two Chairs evidence. Only quota exhaustion and undelivered MCP replies are incidents; explicit Grok handoff alerts appear under Pending Handoffs, and peer state is not inferred.";
 export const SILENCE_IS_NOT_FAILURE = "Silence is not evidence of failure.";
 export const NO_CODEX_SAMPLE_LABEL =
   "No Codex usage sample. Absence is not a Codex-down signal.";
@@ -175,7 +176,7 @@ export function closedClassLabel(closedClass: ClosedClass): string {
     case "mcp_stdout_undelivered":
       return "mcp_stdout_undelivered \u00b7 MCP stdout undelivered";
     case "handoff_unacknowledged":
-      return "handoff_unacknowledged \u00b7 Handoff awaiting Codex receipt";
+      return "handoff_unacknowledged \u00b7 Explicit handoff alert awaiting Codex receipt";
   }
 }
 
@@ -252,7 +253,7 @@ export function peerHealthActions(args: {
 }
 
 export function canAcknowledgeIncident(incident: PeerIncident, busy: boolean): boolean {
-  return !busy && !incident.acknowledged;
+  return isIncidentClass(incident.class) && !busy && !incident.acknowledged;
 }
 
 export function formatCodexSample(sample: CodexSample | null): string {
@@ -395,12 +396,11 @@ export function presentPeerHealth(state: PeerHealthUiState): PresentedPeerHealth
     : snapshot.stale
       ? "stale"
       : "current";
-  const activeIncidents = snapshot.activeIncidents.map((incident) =>
-    presentPeerIncident(incident, state.busy),
-  );
-  const recentIncidents = snapshot.recentIncidents.map((incident) =>
-    presentPeerIncident(incident, state.busy),
-  );
+  const activeRows = snapshot.activeIncidents.filter((incident) => isIncidentClass(incident.class));
+  const recentRows = snapshot.recentIncidents.filter((incident) => isIncidentClass(incident.class));
+  const activeIncidents = activeRows.map((incident) => presentPeerIncident(incident, state.busy));
+  const recentIncidents = recentRows.map((incident) => presentPeerIncident(incident, state.busy));
+  const unreadCount = activeRows.filter((incident) => !incident.acknowledged).length;
   return {
     title: PEER_HEALTH_TITLE,
     caption: PEER_HEALTH_CAPTION,
@@ -408,7 +408,7 @@ export function presentPeerHealth(state: PeerHealthUiState): PresentedPeerHealth
     availabilityKind,
     silenceNote: silenceNoteForSnapshot(snapshot),
     mutedLabel: snapshot.muted ? CHIME_MUTED_LABEL : CHIME_AUDIBLE_LABEL,
-    unreadLabel: formatCount(snapshot.unreadCount, "unacknowledged active incident"),
+    unreadLabel: formatCount(unreadCount, "unacknowledged active incident"),
     generatedLabel: [
       `Generated ${formatTimestamp(snapshot.generatedMs)}`,
       `As of ${snapshot.asOfMs == null ? "unknown" : formatTimestamp(snapshot.asOfMs)}`,

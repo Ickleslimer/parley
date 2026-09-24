@@ -22,6 +22,13 @@ const QUOTA_CONTEXT_LABEL: &str =
 const NO_HANDOFF_LABEL: &str = "No peer-health handoff is available";
 static CONTROL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+fn is_formal_incident(class: ClosedClass) -> bool {
+    matches!(
+        class,
+        ClosedClass::QuotaExhausted | ClosedClass::McpStdoutUndelivered
+    )
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerHealthSnapshot {
@@ -110,24 +117,32 @@ pub struct HandoffSelection {
 
 impl From<QueryDocument> for PeerHealthSnapshot {
     fn from(document: QueryDocument) -> Self {
+        let active_incidents = document
+            .active_incidents
+            .into_iter()
+            .filter(|incident| is_formal_incident(incident.class))
+            .map(PeerIncident::from)
+            .collect::<Vec<_>>();
+        let recent_incidents = document
+            .recent_incidents
+            .into_iter()
+            .filter(|incident| is_formal_incident(incident.class))
+            .map(PeerIncident::from)
+            .collect::<Vec<_>>();
+        let unread_count = active_incidents
+            .iter()
+            .filter(|incident| incident.status == IncidentStatus::Active && !incident.acknowledged)
+            .count() as u64;
         Self {
             schema_version: document.schema_version,
             generated_ms: document.generated_ms,
             as_of_ms: document.as_of_ms,
             muted: document.muted,
-            unread_count: document.unread_count,
+            unread_count,
             latest_codex_sample: document.latest_codex_sample.map(Into::into),
             latest_grok_observation: document.latest_grok_observation.map(Into::into),
-            active_incidents: document
-                .active_incidents
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-            recent_incidents: document
-                .recent_incidents
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            active_incidents,
+            recent_incidents,
             unavailable: document.unavailable.map(Into::into),
             stale: document.stale,
             diagnostics: document.diagnostics.into(),
@@ -244,8 +259,8 @@ pub fn open_latest_handoff(engine: &EventEngine) -> HandoffSelection {
 }
 
 pub fn tray_state() -> (u64, bool) {
-    let document = read_document(&HealthPaths::from_env());
-    (document.unread_count, document.muted)
+    let snapshot = PeerHealthSnapshot::from(read_document(&HealthPaths::from_env()));
+    (snapshot.unread_count, snapshot.muted)
 }
 
 fn read_document(paths: &HealthPaths) -> QueryDocument {
@@ -516,7 +531,10 @@ mod tests {
             7,
         )))
         .unwrap();
-        assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(
+            value["schemaVersion"],
+            parley_health::schema::SCHEMA_VERSION
+        );
         assert_eq!(value["generatedMs"], 7);
         assert!(value.get("generated_ms").is_none());
         assert_eq!(value["diagnostics"]["snapshotMissing"], true);
@@ -570,14 +588,35 @@ mod tests {
 
         let mut schema = document_with(incident(ClosedClass::HandoffUnacknowledged, 90));
         schema.schema_version = 2;
+        schema.unread_count = 1;
         let value = serde_json::to_value(PeerHealthSnapshot::from(schema)).unwrap();
         assert_eq!(value["schemaVersion"], 2);
-        assert_eq!(
-            value["activeIncidents"][0]["class"],
-            "handoff_unacknowledged"
-        );
+        assert_eq!(value["activeIncidents"].as_array().unwrap().len(), 0);
+        assert_eq!(value["unreadCount"], 0);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_silent_rows_are_not_projected_as_viewer_incidents() {
+        let mut document = document_with(incident(ClosedClass::QuotaExhausted, 100));
+        document.active_incidents.extend([
+            incident(ClosedClass::CapacityThrottle, 99),
+            incident(ClosedClass::TurnError, 98),
+            incident(ClosedClass::WatchdogKilled, 97),
+            incident(ClosedClass::HandoffUnacknowledged, 96),
+        ]);
+        document.recent_incidents = document.active_incidents.clone();
+        document.unread_count = 5;
+
+        let snapshot = PeerHealthSnapshot::from(document);
+        assert_eq!(snapshot.unread_count, 1);
+        assert_eq!(snapshot.active_incidents.len(), 1);
+        assert_eq!(snapshot.recent_incidents.len(), 1);
+        assert_eq!(
+            snapshot.active_incidents[0].class,
+            ClosedClass::QuotaExhausted
+        );
     }
 
     #[test]

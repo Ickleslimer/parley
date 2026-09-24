@@ -94,6 +94,12 @@ describe("peer activity presentation", () => {
     expect(received.receipt).toContain("delivery only, not acceptance");
   });
 
+  it("labels the one-shot escalation as a handoff alert rather than an incident", () => {
+    const presented = presentHandoff(handoff({ alertIncidentId: "handoff-alert-1" }), 2_000);
+    expect(presented.alert).toBe("Explicit handoff alert handoff-alert-1");
+    expect(presented.alert).not.toContain("incident");
+  });
+
   it("exposes explicit missing evidence and never converts silence into failure", () => {
     const view = presentPeerActivity({
       snapshot: snapshot({
