@@ -11,8 +11,15 @@ if (!app) {
 }
 
 const view = new URLSearchParams(window.location.search).get("view");
+const fixture = new URLSearchParams(window.location.search).get("fixture");
+const development =
+  (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV === true;
 
-if (view === "widget") {
+if (development && fixture) {
+  void import("./fixtures/mount").then(({ mountSyntheticFixture }) => {
+    mountSyntheticFixture(app, viewerApi, view === "widget" ? "widget" : "detail", fixture);
+  });
+} else if (view === "widget") {
   document.title = "Parley";
   mountWidget(app, viewerApi);
 } else {
