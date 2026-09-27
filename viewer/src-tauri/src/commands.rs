@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Runtime, State};
+use tauri::{AppHandle, Runtime, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::event_engine::{EventContent, ExchangePage, SearchPage, SessionPage, WidgetSnapshot};
 use crate::lifecycle;
 use crate::peer_activity::{self, PeerActivitySnapshot};
 use crate::peer_health::{self, HandoffSelection, PeerHealthSnapshot};
-use crate::runtime::{AppState, MonitorInfo, ViewerStatus};
+use crate::runtime::{AppState, MonitorInfo, ViewerStatus, WidgetSurfaceBoundsReport};
 use crate::settings::ViewerSettings;
 
 #[tauri::command]
@@ -95,7 +95,50 @@ pub fn save_settings<R: Runtime>(
     if let Err(error) = lifecycle::apply_widget_placement(&app) {
         state.set_runtime_error(error);
     }
+    if let Err(error) = lifecycle::reconcile_interactive_mode(&app) {
+        state.set_runtime_error(error);
+    }
     Ok(saved)
+}
+
+#[tauri::command]
+pub fn report_widget_surface_bounds<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+    report: WidgetSurfaceBoundsReport,
+) -> Result<ViewerStatus, String> {
+    if window.label() != lifecycle::WIDGET_LABEL {
+        return Err("only the desktop underlay may report widget-surface bounds".to_string());
+    }
+    lifecycle::report_widget_surface_bounds(&app, report)?;
+    Ok(state.status())
+}
+
+#[tauri::command]
+pub fn widget_surface_ready<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<ViewerStatus, String> {
+    if window.label() != crate::interactive_surface::SURFACE_LABEL {
+        return Err("only the widget surface may report readiness".to_string());
+    }
+    lifecycle::widget_surface_ready(&app)?;
+    Ok(state.status())
+}
+
+#[tauri::command]
+pub fn retry_interactive_mode<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<ViewerStatus, String> {
+    if window.label() != lifecycle::DETAIL_LABEL {
+        return Err("interactive mode may be retried only from the detail window".to_string());
+    }
+    lifecycle::retry_interactive_mode(&app)?;
+    Ok(state.status())
 }
 
 #[tauri::command]

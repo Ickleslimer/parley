@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Local viewer windows can call only the core IPC bridge.",
-  "windows": ["widget", "detail"],
+  "windows": ["widget", "widget-surface", "detail"],
   "permissions": ["core:default"]
 }
 

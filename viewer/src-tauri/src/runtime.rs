@@ -1,16 +1,24 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::event_engine::{Diagnostics, EngineStatus, EventEngine, SourceState, SourceStatus};
-use crate::settings::{save_settings, validate_source_path, Corner, SettingsFile, ViewerSettings};
+use crate::settings::{
+    save_settings, validate_source_path, Corner, DesktopMode, SettingsFile, ViewerSettings,
+};
 
 const MAX_ATTACH_ATTEMPTS: u8 = 6;
 const ATTACH_RETRY_MS: u64 = 1_000;
 const ATTACH_COOLDOWN_MS: u64 = 15_000;
 const HEALTH_CHECK_MS: u64 = 2_000;
+const SURFACE_CORRECTION_WINDOW_MS: u64 = 10_000;
+const MAX_SURFACE_CORRECTIONS: usize = 3;
+const MIN_SURFACE_WIDTH: f64 = 176.0;
+const MIN_SURFACE_HEIGHT: f64 = 132.0;
+const SURFACE_BOUNDS_EPSILON: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -23,7 +31,6 @@ pub enum UnderlayState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
 pub enum DesktopRuntimeState {
     Passive,
     InteractiveStarting,
@@ -33,7 +40,6 @@ pub enum DesktopRuntimeState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
 pub enum DesktopFallbackReason {
     DevelopmentGateClosed,
     PreferencePassive,
@@ -76,6 +82,55 @@ pub struct MonitorInfo {
     pub primary: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WidgetSurfaceBoundsReport {
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+    pub height: f64,
+    pub viewport_width: f64,
+    pub viewport_height: f64,
+    pub device_pixel_ratio: f64,
+}
+
+impl WidgetSurfaceBoundsReport {
+    pub fn validated(self) -> Result<Self, String> {
+        let values = [
+            self.left,
+            self.top,
+            self.width,
+            self.height,
+            self.viewport_width,
+            self.viewport_height,
+            self.device_pixel_ratio,
+        ];
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("widget-surface bounds must contain only finite values".to_string());
+        }
+        if self.left < 0.0 || self.top < 0.0 {
+            return Err("widget-surface bounds must start inside the widget viewport".to_string());
+        }
+        if self.width < MIN_SURFACE_WIDTH || self.height < MIN_SURFACE_HEIGHT {
+            return Err(
+                "widget-surface bounds are too small for the interaction controls".to_string(),
+            );
+        }
+        if self.viewport_width <= 0.0
+            || self.viewport_height <= 0.0
+            || self.device_pixel_ratio <= 0.0
+        {
+            return Err("widget-surface viewport and scale must be positive".to_string());
+        }
+        if self.left + self.width > self.viewport_width + SURFACE_BOUNDS_EPSILON
+            || self.top + self.height > self.viewport_height + SURFACE_BOUNDS_EPSILON
+        {
+            return Err("widget-surface bounds extend outside the widget viewport".to_string());
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeFlags {
     tray_available: bool,
@@ -83,6 +138,10 @@ struct RuntimeFlags {
     desktop_runtime_state: DesktopRuntimeState,
     desktop_fallback_reason: Option<DesktopFallbackReason>,
     widget_requested: bool,
+    surface_bounds: Option<WidgetSurfaceBoundsReport>,
+    surface_ready: bool,
+    surface_fallback_latched: bool,
+    surface_corrections_ms: VecDeque<u64>,
     exiting: bool,
     last_error: Option<String>,
 }
@@ -95,6 +154,10 @@ impl Default for RuntimeFlags {
             desktop_runtime_state: DesktopRuntimeState::Passive,
             desktop_fallback_reason: None,
             widget_requested: true,
+            surface_bounds: None,
+            surface_ready: false,
+            surface_fallback_latched: false,
+            surface_corrections_ms: VecDeque::new(),
             exiting: false,
             last_error: None,
         }
@@ -106,7 +169,19 @@ pub struct RuntimeSnapshot {
     pub tray_available: bool,
     pub underlay_state: UnderlayState,
     pub widget_requested: bool,
+    pub desktop_runtime_state: DesktopRuntimeState,
+    pub desktop_fallback_reason: Option<DesktopFallbackReason>,
+    pub surface_ready: bool,
+    pub surface_fallback_latched: bool,
     pub exiting: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InteractiveSnapshot {
+    pub bounds: Option<WidgetSurfaceBoundsReport>,
+    pub surface_ready: bool,
+    pub fallback_latched: bool,
+    pub state: DesktopRuntimeState,
 }
 
 #[derive(Debug)]
@@ -149,6 +224,25 @@ impl AppState {
         save_settings(&self.settings_path, &updated)?;
         *self.lock_settings() = updated;
         Ok(next)
+    }
+
+    pub fn initialize_desktop_mode(&self, mode: DesktopMode, gate_open: bool) {
+        let mut runtime = self.lock_runtime();
+        match (mode, gate_open) {
+            (DesktopMode::Passive, _) => {
+                runtime.desktop_runtime_state = DesktopRuntimeState::Passive;
+                runtime.desktop_fallback_reason = Some(DesktopFallbackReason::PreferencePassive);
+            }
+            (DesktopMode::Interactive, false) => {
+                runtime.desktop_runtime_state = DesktopRuntimeState::PassiveFallback;
+                runtime.desktop_fallback_reason =
+                    Some(DesktopFallbackReason::DevelopmentGateClosed);
+            }
+            (DesktopMode::Interactive, true) => {
+                runtime.desktop_runtime_state = DesktopRuntimeState::InteractiveStarting;
+                runtime.desktop_fallback_reason = None;
+            }
+        }
     }
 
     pub fn set_sources(&self, sources: Vec<PathBuf>, persist: bool) -> Result<(), String> {
@@ -263,6 +357,10 @@ impl AppState {
             tray_available: runtime.tray_available,
             underlay_state: runtime.underlay_state,
             widget_requested: runtime.widget_requested,
+            desktop_runtime_state: runtime.desktop_runtime_state,
+            desktop_fallback_reason: runtime.desktop_fallback_reason,
+            surface_ready: runtime.surface_ready,
+            surface_fallback_latched: runtime.surface_fallback_latched,
             exiting: runtime.exiting,
         }
     }
@@ -290,6 +388,109 @@ impl AppState {
 
     pub fn set_runtime_error(&self, error: impl Into<String>) {
         self.lock_runtime().last_error = Some(error.into());
+    }
+
+    pub fn report_surface_bounds(&self, report: WidgetSurfaceBoundsReport) -> Result<(), String> {
+        self.lock_runtime().surface_bounds = Some(report.validated()?);
+        Ok(())
+    }
+
+    pub fn mark_surface_ready(&self) {
+        self.lock_runtime().surface_ready = true;
+    }
+
+    pub fn invalidate_surface_bounds(&self) {
+        self.lock_runtime().surface_bounds = None;
+    }
+
+    pub fn interactive_snapshot(&self) -> InteractiveSnapshot {
+        let runtime = self.lock_runtime();
+        InteractiveSnapshot {
+            bounds: runtime.surface_bounds,
+            surface_ready: runtime.surface_ready,
+            fallback_latched: runtime.surface_fallback_latched,
+            state: runtime.desktop_runtime_state,
+        }
+    }
+
+    pub fn mark_interactive_starting(&self) {
+        let mut runtime = self.lock_runtime();
+        runtime.desktop_runtime_state = DesktopRuntimeState::InteractiveStarting;
+        runtime.desktop_fallback_reason = None;
+    }
+
+    pub fn mark_interactive(&self) {
+        let mut runtime = self.lock_runtime();
+        runtime.desktop_runtime_state = DesktopRuntimeState::Interactive;
+        runtime.desktop_fallback_reason = None;
+        runtime.surface_fallback_latched = false;
+    }
+
+    pub fn mark_surface_destroyed(&self) {
+        let mut runtime = self.lock_runtime();
+        runtime.surface_ready = false;
+    }
+
+    pub fn mark_surface_hidden(&self) {
+        let mut runtime = self.lock_runtime();
+        runtime.desktop_runtime_state = DesktopRuntimeState::Passive;
+        runtime.desktop_fallback_reason = None;
+        runtime.surface_ready = false;
+        runtime.surface_corrections_ms.clear();
+    }
+
+    pub fn fallback_interactive(&self, reason: DesktopFallbackReason, latch: bool) {
+        let mut runtime = self.lock_runtime();
+        runtime.desktop_runtime_state = DesktopRuntimeState::PassiveFallback;
+        runtime.desktop_fallback_reason = Some(reason);
+        runtime.surface_ready = false;
+        runtime.surface_fallback_latched |= latch;
+    }
+
+    pub fn mark_passive_preference(&self) {
+        let mut runtime = self.lock_runtime();
+        runtime.desktop_runtime_state = DesktopRuntimeState::Passive;
+        runtime.desktop_fallback_reason = Some(DesktopFallbackReason::PreferencePassive);
+        runtime.surface_ready = false;
+        runtime.surface_fallback_latched = false;
+        runtime.surface_corrections_ms.clear();
+    }
+
+    pub fn retry_interactive(&self, gate_open: bool) -> Result<(), String> {
+        let mode = self.settings().viewer.desktop_mode;
+        if mode != DesktopMode::Interactive {
+            self.mark_passive_preference();
+            return Err("interactive desktop mode is disabled in settings".to_string());
+        }
+        if !gate_open {
+            self.fallback_interactive(DesktopFallbackReason::DevelopmentGateClosed, false);
+            return Err("interactive desktop mode is behind the development gate".to_string());
+        }
+        let mut runtime = self.lock_runtime();
+        runtime.desktop_runtime_state = DesktopRuntimeState::InteractiveStarting;
+        runtime.desktop_fallback_reason = None;
+        runtime.surface_ready = false;
+        runtime.surface_fallback_latched = false;
+        runtime.surface_corrections_ms.clear();
+        Ok(())
+    }
+
+    pub fn allow_surface_correction(&self, now_ms: u64) -> bool {
+        let mut runtime = self.lock_runtime();
+        while runtime
+            .surface_corrections_ms
+            .front()
+            .is_some_and(|timestamp| {
+                now_ms.saturating_sub(*timestamp) >= SURFACE_CORRECTION_WINDOW_MS
+            })
+        {
+            runtime.surface_corrections_ms.pop_front();
+        }
+        if runtime.surface_corrections_ms.len() >= MAX_SURFACE_CORRECTIONS {
+            return false;
+        }
+        runtime.surface_corrections_ms.push_back(now_ms);
+        true
     }
 
     pub fn mark_exiting(&self) {
@@ -476,27 +677,30 @@ fn clamp_i32(value: i64) -> i32 {
 mod tests {
     use super::*;
 
+    fn runtime_snapshot(tray_available: bool, underlay_state: UnderlayState) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            tray_available,
+            underlay_state,
+            widget_requested: true,
+            desktop_runtime_state: DesktopRuntimeState::Passive,
+            desktop_fallback_reason: None,
+            surface_ready: false,
+            surface_fallback_latched: false,
+            exiting: false,
+        }
+    }
+
     #[test]
     fn tray_failure_prevents_underlay_attachment() {
         let mut retry = UnderlayRetry::default();
-        let runtime = RuntimeSnapshot {
-            tray_available: false,
-            underlay_state: UnderlayState::Detached,
-            widget_requested: true,
-            exiting: false,
-        };
+        let runtime = runtime_snapshot(false, UnderlayState::Detached);
         assert_eq!(retry.next_action(0, runtime), UnderlayAction::None);
     }
 
     #[test]
     fn attachment_attempts_are_bounded_before_cooldown() {
         let mut retry = UnderlayRetry::default();
-        let runtime = RuntimeSnapshot {
-            tray_available: true,
-            underlay_state: UnderlayState::Attaching,
-            widget_requested: true,
-            exiting: false,
-        };
+        let runtime = runtime_snapshot(true, UnderlayState::Attaching);
         let mut now = 0;
         let mut state = UnderlayState::Attaching;
         for attempt in 0..MAX_ATTACH_ATTEMPTS {
@@ -519,13 +723,60 @@ mod tests {
         let mut retry = UnderlayRetry::default();
         assert_eq!(retry.record_attach(10, true), UnderlayState::Attached);
         assert_eq!(retry.record_health(2_010, false), UnderlayState::Attaching);
-        let runtime = RuntimeSnapshot {
-            tray_available: true,
-            underlay_state: UnderlayState::Attaching,
-            widget_requested: true,
-            exiting: false,
-        };
+        let runtime = runtime_snapshot(true, UnderlayState::Attaching);
         assert_eq!(retry.next_action(2_010, runtime), UnderlayAction::Attach);
+    }
+
+    #[test]
+    fn surface_bounds_fail_closed_outside_the_underlay() {
+        let valid = WidgetSurfaceBoundsReport {
+            left: 112.0,
+            top: 20.0,
+            width: 336.0,
+            height: 320.0,
+            viewport_width: 560.0,
+            viewport_height: 360.0,
+            device_pixel_ratio: 1.25,
+        };
+        assert_eq!(valid.validated(), Ok(valid));
+        assert!(WidgetSurfaceBoundsReport {
+            width: 500.0,
+            ..valid
+        }
+        .validated()
+        .is_err());
+        assert!(WidgetSurfaceBoundsReport {
+            device_pixel_ratio: f64::NAN,
+            ..valid
+        }
+        .validated()
+        .is_err());
+    }
+
+    #[test]
+    fn surface_corrections_are_bounded_per_ten_second_window() {
+        let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
+        assert!(state.allow_surface_correction(0));
+        assert!(state.allow_surface_correction(1));
+        assert!(state.allow_surface_correction(2));
+        assert!(!state.allow_surface_correction(3));
+        assert!(state.allow_surface_correction(SURFACE_CORRECTION_WINDOW_MS));
+    }
+
+    #[test]
+    fn runtime_fallback_does_not_rewrite_interactive_preference() {
+        let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
+        state.initialize_desktop_mode(DesktopMode::Interactive, true);
+        state.fallback_interactive(DesktopFallbackReason::SurfaceZOrderInvalid, true);
+
+        assert_eq!(
+            state.runtime_snapshot().desktop_runtime_state,
+            DesktopRuntimeState::PassiveFallback
+        );
+        assert_eq!(
+            state.settings().viewer.desktop_mode,
+            DesktopMode::Interactive
+        );
     }
 
     #[test]

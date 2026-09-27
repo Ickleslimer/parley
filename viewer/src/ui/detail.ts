@@ -15,7 +15,7 @@ import { DEFAULT_SETTINGS } from "../contracts";
 import type { ViewerApi } from "../ipc";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-import { el, setText } from "./dom";
+import { el, labelledControl, setText } from "./dom";
 import { exactEventBody } from "./excerpt";
 import {
   formatCharacterCount,
@@ -125,6 +125,32 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   const sessions = buildSessionRail();
   const timeline = buildTimeline();
   const inspector = buildInspector();
+  const desktopMode = el("select", {
+    attrs: { id: "desktop-mode", "aria-label": "Desktop interaction mode" },
+    children: [
+      el("option", { text: "Interactive conversation", attrs: { value: "interactive" } }),
+      el("option", { text: "Passive scene", attrs: { value: "passive" } }),
+    ],
+  });
+  const retryInteractive = el("button", {
+    className: "studio-action",
+    text: "Retry interactive mode",
+    attrs: { type: "button" },
+  });
+  const desktopRuntime = el("p", {
+    className: "studio-diagnostics",
+    attrs: { "aria-live": "polite" },
+  });
+  inspector.settingsForm.insertBefore(
+    labelledControl("Desktop mode", desktopMode),
+    inspector.saveSettings,
+  );
+  inspector.panels.settings.append(
+    el("div", {
+      className: "studio-settings-runtime",
+      children: [desktopRuntime, retryInteractive],
+    }),
+  );
   const peerActivity = buildPeerActivitySection();
   const peerHealth = buildPeerHealthSection();
   inspector.activityHost.append(peerActivity.section, peerHealth.section);
@@ -257,6 +283,11 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       (path) => void removeSource(path),
     );
     inspector.saveSettings.disabled = state.savingSettings;
+    retryInteractive.disabled =
+      state.savingSettings ||
+      state.settings.desktopMode !== "interactive" ||
+      state.status?.desktopRuntimeState !== "passive-fallback";
+    setText(desktopRuntime, desktopRuntimeLabel(state.status));
     exit.disabled = state.exiting;
     if (!state.settingsDirty) {
       syncSettingsForm();
@@ -390,6 +421,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   const syncSettingsForm = (): void => {
     fillMonitorOptions(inspector.monitor, state.monitors, state.settings.monitorId);
     inspector.corner.value = state.settings.corner;
+    desktopMode.value = state.settings.desktopMode;
     if (document.activeElement !== inspector.offsetX) {
       inspector.offsetX.value = String(state.settings.offsetX);
     }
@@ -948,6 +980,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       paintChrome();
       return;
     }
+    parsed.desktopMode = desktopMode.value === "passive" ? "passive" : "interactive";
     state.savingSettings = true;
     paintChrome();
     void (async () => {
@@ -973,6 +1006,29 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   });
   inspector.settingsForm.addEventListener("input", () => {
     state.settingsDirty = true;
+  });
+
+  retryInteractive.addEventListener("click", () => {
+    retryInteractive.disabled = true;
+    void api
+      .retryInteractiveMode()
+      .then((status) => {
+        if (!alive) {
+          return;
+        }
+        state.status = status;
+        state.loadError = null;
+      })
+      .catch(() => {
+        if (alive) {
+          state.loadError = loadErrorLabel("retry interactive desktop mode");
+        }
+      })
+      .finally(() => {
+        if (alive) {
+          paintChrome();
+        }
+      });
   });
 
   exit.addEventListener("click", () => {
@@ -1171,6 +1227,17 @@ function readSettingsForm(
     width,
     height,
   };
+}
+
+function desktopRuntimeLabel(status: ViewerStatus | null): string {
+  if (!status) {
+    return "Desktop mode status is loading";
+  }
+  const state = status.desktopRuntimeState.replaceAll("-", " ");
+  if (!status.desktopFallbackReason) {
+    return `Desktop mode: ${state}`;
+  }
+  return `Desktop mode: ${state}. Reason: ${status.desktopFallbackReason.replaceAll("-", " ")}`;
 }
 
 function renderEventMeta(dl: HTMLDListElement, event: EventContent): void {

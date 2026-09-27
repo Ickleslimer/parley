@@ -3,6 +3,7 @@ compile_error!("Parley Conversation Viewer is Windows-only");
 
 mod commands;
 pub mod event_engine;
+mod interactive_surface;
 mod launch;
 mod lifecycle;
 mod peer_activity;
@@ -39,6 +40,9 @@ pub fn run() {
             commands::get_peer_activity,
             commands::get_settings,
             commands::save_settings,
+            commands::report_widget_surface_bounds,
+            commands::widget_surface_ready,
+            commands::retry_interactive_mode,
             commands::list_monitors,
             commands::select_event_log,
             commands::set_event_log,

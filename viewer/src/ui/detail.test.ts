@@ -252,7 +252,7 @@ function content(eventKey: string): EventContent {
   };
 }
 
-function createApi() {
+function createApi(statusOverrides: Partial<ViewerStatus> = {}) {
   const calls = {
     acknowledge: [] as string[],
     mute: [] as boolean[],
@@ -265,11 +265,12 @@ function createApi() {
     widgetVisible: [] as boolean[],
     launchAtLogin: [] as boolean[],
     savedSettings: [] as ViewerSettings[],
+    retryInteractive: 0,
   };
   let bytesRead = 100;
   let currentHealth = health(1);
   const api: ViewerApi = {
-    getStatus: async () => status({ bytesRead }),
+    getStatus: async () => status({ ...statusOverrides, bytesRead }),
     getWidgetSnapshot: async () => ({
       sessionKey: null,
       exchangeKey: null,
@@ -303,7 +304,14 @@ function createApi() {
     openWidgetExchange: async () => undefined,
     reportWidgetSurfaceBounds: async () => status(),
     widgetSurfaceReady: async () => status(),
-    retryInteractiveMode: async () => status(),
+    retryInteractiveMode: async () => {
+      calls.retryInteractive += 1;
+      return status({
+        ...statusOverrides,
+        desktopRuntimeState: "interactive",
+        desktopFallbackReason: null,
+      });
+    },
     listSessions: async () => ({ items: sessions(), nextCursor: null, total: 2 }),
     listExchanges: async (sessionKey) => ({
       items: sessionKey === "session:1" ? [exchange({ sessionKey })] : [],
@@ -564,11 +572,13 @@ describe("conversation studio detail", () => {
     const vertical = root.querySelector<HTMLInputElement>("#offset-y");
     const width = root.querySelector<HTMLInputElement>("#width");
     const height = root.querySelector<HTMLInputElement>("#height");
+    const desktopMode = root.querySelector<HTMLSelectElement>("#desktop-mode");
     corner!.value = "top-left";
     horizontal!.value = "30";
     vertical!.value = "32";
     width!.value = "600";
     height!.value = "380";
+    desktopMode!.value = "passive";
     horizontal!.dispatchEvent(new Event("input", { bubbles: true }));
     horizontal!.form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
     await settle();
@@ -578,6 +588,7 @@ describe("conversation studio detail", () => {
       offsetY: 32,
       width: 600,
       height: 380,
+      desktopMode: "passive",
     });
 
     const widgetVisible = root.querySelector<HTMLInputElement>("#widget-visible");
@@ -589,6 +600,32 @@ describe("conversation studio detail", () => {
     await settle();
     expect(harness.calls.widgetVisible).toEqual([false]);
     expect(harness.calls.launchAtLogin).toEqual([true]);
+  });
+
+  it("offers an explicit retry only while interactive mode is in fallback", async () => {
+    vi.useFakeTimers();
+    const harness = createApi({
+      desktopRuntimeState: "passive-fallback",
+      desktopFallbackReason: "surface-z-order-invalid",
+    });
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, harness.api).stop;
+    await settle();
+
+    root.querySelector<HTMLButtonElement>('[data-region="studio-tab-settings"]')?.click();
+    const retry = Array.from(root.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent === "Retry interactive mode",
+    );
+    expect(retry?.disabled).toBe(false);
+    expect(root.textContent).toContain("surface z order invalid");
+
+    retry?.click();
+    await settle();
+
+    expect(harness.calls.retryInteractive).toBe(1);
+    expect(retry?.disabled).toBe(true);
+    expect(root.textContent).toContain("Desktop mode: interactive");
   });
 });
 

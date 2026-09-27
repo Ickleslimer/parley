@@ -21,15 +21,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_POPUP,
 };
 
+use crate::interactive_surface::{self, Readiness};
 use crate::launch::{resolve_initial_sources, LaunchOptions, SourceOrigin};
 use crate::peer_health;
 use crate::runtime::{
-    calculate_placement, AppState, MonitorInfo, UnderlayAction, UnderlayState, WorkArea,
+    calculate_placement, AppState, DesktopFallbackReason, DesktopRuntimeState, MonitorInfo,
+    UnderlayAction, UnderlayState, WidgetSurfaceBoundsReport, WorkArea,
 };
-use crate::settings::{load_settings, reconcile_autostart, AutostartReconcile, SettingsFile};
+use crate::settings::{
+    load_settings, reconcile_autostart, AutostartReconcile, DesktopMode, SettingsFile,
+};
 
-const WIDGET_LABEL: &str = "widget";
-const DETAIL_LABEL: &str = "detail";
+pub(crate) const WIDGET_LABEL: &str = "widget";
+pub(crate) const DETAIL_LABEL: &str = "detail";
 const TRAY_ID: &str = "parley-viewer-tray";
 const MENU_OPEN: &str = "open-transcript";
 const MENU_SELECT: &str = "select-log";
@@ -68,8 +72,16 @@ pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         autostart_result.as_ref().ok().copied(),
     );
 
+    let desktop_mode = settings.viewer.desktop_mode;
     app.manage(AppState::new(settings_path, settings));
     let state = app.state::<AppState>();
+    state.initialize_desktop_mode(desktop_mode, interactive_gate_open());
+    if desktop_mode == DesktopMode::Interactive && interactive_gate_open() {
+        if let Err(error) = interactive_surface::ensure_band_helper() {
+            state.fallback_interactive(DesktopFallbackReason::SurfaceCreateFailed, true);
+            state.set_runtime_error(error);
+        }
+    }
     if let Some(error) = settings_error.or(launch_error) {
         state.set_runtime_error(error);
     }
@@ -244,7 +256,30 @@ pub fn apply_widget_placement<R: Runtime>(app: &AppHandle<R>) -> Result<(), Stri
         },
     );
     let window = widget_window(app)?;
-    if desktop_parent_is_valid(&window) {
+    let attached = desktop_parent_is_valid(&window);
+    let current = interactive_surface::physical_window_rect(&window).ok();
+    let size_changed = current
+        .map(|rect| {
+            rect.width != i32::try_from(placement.width).unwrap_or(i32::MAX)
+                || rect.height != i32::try_from(placement.height).unwrap_or(i32::MAX)
+        })
+        .unwrap_or(true);
+    let position_changed = current
+        .map(|rect| rect.x != placement.x || rect.y != placement.y)
+        .unwrap_or(true);
+    if attached
+        && (size_changed || position_changed)
+        && settings.desktop_mode == DesktopMode::Interactive
+        && state.runtime_snapshot().desktop_runtime_state == DesktopRuntimeState::Interactive
+    {
+        interactive_surface::hide_surface(app)?;
+        state.mark_interactive_starting();
+        if size_changed {
+            state.invalidate_surface_bounds();
+            interactive_surface::reset_surface_handshake_deadline();
+        }
+    }
+    if attached {
         set_attached_placement(&window, placement)
     } else {
         window
@@ -264,6 +299,76 @@ pub fn request_widget<R: Runtime>(app: &AppHandle<R>, visible: bool) -> Result<(
         detach_widget(app)?;
     }
     Ok(())
+}
+
+pub fn report_widget_surface_bounds<R: Runtime>(
+    app: &AppHandle<R>,
+    report: WidgetSurfaceBoundsReport,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if let Err(error) = state.report_surface_bounds(report) {
+        fallback_interactive(
+            app,
+            DesktopFallbackReason::SurfaceBoundsInvalid,
+            error.clone(),
+            true,
+        );
+        return Err(error);
+    }
+    if state.settings().viewer.desktop_mode == DesktopMode::Interactive {
+        state.mark_interactive_starting();
+        drive_interactive(app, interactive_surface::monotonic_ms());
+    }
+    Ok(())
+}
+
+pub fn widget_surface_ready<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state.mark_surface_ready();
+    drive_interactive(app, interactive_surface::monotonic_ms());
+    if state.runtime_snapshot().desktop_runtime_state == DesktopRuntimeState::PassiveFallback {
+        Err("interactive desktop surface entered passive fallback".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn retry_interactive_mode<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state.retry_interactive(interactive_gate_open())?;
+    if let Err(error) = interactive_surface::ensure_band_helper() {
+        state.fallback_interactive(DesktopFallbackReason::SurfaceCreateFailed, true);
+        state.set_runtime_error(error.clone());
+        return Err(error);
+    }
+    if state.runtime_snapshot().underlay_state == UnderlayState::Attached {
+        drive_interactive(app, interactive_surface::monotonic_ms());
+    }
+    Ok(())
+}
+
+pub fn reconcile_interactive_mode<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    match state.settings().viewer.desktop_mode {
+        DesktopMode::Passive => {
+            let result = interactive_surface::destroy_surface(app);
+            state.mark_surface_destroyed();
+            state.mark_passive_preference();
+            result
+        }
+        DesktopMode::Interactive => {
+            state.retry_interactive(interactive_gate_open())?;
+            if let Err(error) = interactive_surface::ensure_band_helper() {
+                state.fallback_interactive(DesktopFallbackReason::SurfaceCreateFailed, true);
+                state.set_runtime_error(error.clone());
+                return Err(error);
+            }
+            if state.runtime_snapshot().underlay_state == UnderlayState::Attached {
+                drive_interactive(app, interactive_surface::monotonic_ms());
+            }
+            Ok(())
+        }
+    }
 }
 
 pub fn set_launch_at_login<R: Runtime>(
@@ -324,10 +429,20 @@ pub fn exit_app<R: Runtime>(app: &AppHandle<R>) {
     if let Err(error) = detach_widget(app) {
         state.set_runtime_error(error);
     }
+    if let Err(error) = interactive_surface::destroy_band_helper() {
+        state.set_runtime_error(error);
+    }
     app.exit(0);
 }
 
 pub fn detach_widget<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if let Err(error) = interactive_surface::destroy_surface(app) {
+        state.fallback_interactive(DesktopFallbackReason::SurfaceDestroyFailed, true);
+        state.set_runtime_error(error.clone());
+        return Err(error);
+    }
+    state.mark_surface_hidden();
     let window = widget_window(app)?;
     window
         .hide()
@@ -338,7 +453,7 @@ pub fn detach_widget<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             .map_err(|error| format!("failed to detach desktop underlay: {error}"))?;
     }
     detach_shell_parent(&window)?;
-    app.state::<AppState>().record_detached();
+    state.record_detached();
     Ok(())
 }
 
@@ -524,12 +639,11 @@ fn initialize_autostart<R: Runtime>(app: &AppHandle<R>) {
 
 fn spawn_supervisor(app: AppHandle) {
     thread::spawn(move || {
-        let started = Instant::now();
         let mut last_peer_health_poll = None;
         while !app.state::<AppState>().should_stop() {
             let state = app.state::<AppState>();
             state.engine.poll();
-            let elapsed = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let elapsed = interactive_surface::monotonic_ms();
             match state.next_underlay_action(elapsed) {
                 UnderlayAction::Attach => attach_widget(&app, elapsed),
                 UnderlayAction::HealthCheck => check_widget_health(&app, elapsed),
@@ -614,8 +728,16 @@ fn attach_widget<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
         Ok(())
     })();
     match result {
-        Ok(()) => state.record_attach_result(now_ms, true),
+        Ok(()) => {
+            state.record_attach_result(now_ms, true);
+            drive_interactive(app, now_ms);
+        }
         Err(error) => {
+            if let Err(surface_error) = interactive_surface::destroy_surface(app) {
+                state.set_runtime_error(surface_error);
+            }
+            state.mark_surface_destroyed();
+            state.fallback_interactive(DesktopFallbackReason::UnderlayUnavailable, false);
             if let Ok(window) = widget_window(app) {
                 let _ = window.hide();
             }
@@ -634,6 +756,13 @@ fn check_widget_health<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
         .map(|window| desktop_parent_is_valid(&window))
         .unwrap_or(false);
     if !healthy {
+        if let Err(error) = interactive_surface::destroy_surface(app) {
+            state.set_runtime_error(error);
+            state.fallback_interactive(DesktopFallbackReason::SurfaceDestroyFailed, true);
+        } else {
+            state.mark_surface_destroyed();
+            state.fallback_interactive(DesktopFallbackReason::ExplorerLost, false);
+        }
         if let Ok(window) = widget_window(app) {
             let _ = window.hide();
             if window.is_desktop_underlay() {
@@ -642,8 +771,152 @@ fn check_widget_health<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
             let _ = detach_shell_parent(&window);
         }
         state.set_runtime_error("desktop underlay was lost; scheduling reattachment");
+    } else {
+        drive_interactive(app, now_ms);
     }
     state.record_health_result(now_ms, healthy);
+}
+
+fn drive_interactive<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
+    let state = app.state::<AppState>();
+    let runtime = state.runtime_snapshot();
+    if runtime.exiting || !runtime.widget_requested {
+        return;
+    }
+    if state.settings().viewer.desktop_mode == DesktopMode::Passive {
+        if let Err(error) = interactive_surface::destroy_surface(app) {
+            state.set_runtime_error(error);
+        }
+        state.mark_surface_destroyed();
+        state.mark_passive_preference();
+        return;
+    }
+    if !interactive_gate_open() {
+        if let Err(error) = interactive_surface::destroy_surface(app) {
+            state.set_runtime_error(error);
+        }
+        state.mark_surface_destroyed();
+        state.fallback_interactive(DesktopFallbackReason::DevelopmentGateClosed, false);
+        return;
+    }
+    if runtime.underlay_state != UnderlayState::Attached {
+        return;
+    }
+
+    let interactive = state.interactive_snapshot();
+    if interactive.fallback_latched {
+        return;
+    }
+    let surface = match interactive_surface::ensure_surface(app) {
+        Ok(surface) => surface,
+        Err(error) => {
+            fallback_interactive(app, DesktopFallbackReason::SurfaceCreateFailed, error, true);
+            return;
+        }
+    };
+    if interactive.state != DesktopRuntimeState::Interactive {
+        state.mark_interactive_starting();
+    }
+
+    let interactive = state.interactive_snapshot();
+    if !interactive.surface_ready {
+        if interactive_surface::surface_readiness(false) == Readiness::TimedOut {
+            fallback_interactive(
+                app,
+                DesktopFallbackReason::SurfaceDocumentNotReady,
+                "widget-surface document did not report readiness".to_string(),
+                true,
+            );
+        }
+        return;
+    }
+    let Some(bounds) = interactive.bounds else {
+        if interactive_surface::surface_readiness(false) == Readiness::TimedOut {
+            fallback_interactive(
+                app,
+                DesktopFallbackReason::SurfaceBoundsInvalid,
+                "desktop underlay did not report conversation-column bounds".to_string(),
+                true,
+            );
+        }
+        return;
+    };
+    let underlay = match widget_window(app) {
+        Ok(window) => window,
+        Err(error) => {
+            fallback_interactive(
+                app,
+                DesktopFallbackReason::UnderlayUnavailable,
+                error,
+                false,
+            );
+            return;
+        }
+    };
+    let rect = match interactive_surface::derive_surface_rect(&underlay, bounds) {
+        Ok(rect) => rect,
+        Err(error) => {
+            fallback_interactive(
+                app,
+                DesktopFallbackReason::SurfaceGeometryMismatch,
+                error,
+                true,
+            );
+            return;
+        }
+    };
+
+    if interactive.state == DesktopRuntimeState::Interactive {
+        if interactive_surface::verify_surface(app, rect).is_ok() {
+            return;
+        }
+        if !state.allow_surface_correction(now_ms) {
+            fallback_interactive(
+                app,
+                DesktopFallbackReason::SurfaceRestackLimit,
+                "widget surface exceeded the bounded restack limit".to_string(),
+                true,
+            );
+            return;
+        }
+    }
+
+    match interactive_surface::position_and_restack(app, &surface, rect) {
+        Ok(()) => state.mark_interactive(),
+        Err(error) => {
+            let reason = classify_surface_failure(&error);
+            fallback_interactive(app, reason, error, true);
+        }
+    }
+}
+
+fn classify_surface_failure(error: &str) -> DesktopFallbackReason {
+    if error.contains("style") {
+        DesktopFallbackReason::SurfaceStyleInvalid
+    } else if error.contains("parent") || error.contains("owner") {
+        DesktopFallbackReason::SurfaceOwnerInvalid
+    } else if error.contains("geometry") || error.contains("viewport") {
+        DesktopFallbackReason::SurfaceGeometryMismatch
+    } else {
+        DesktopFallbackReason::SurfaceZOrderInvalid
+    }
+}
+
+fn fallback_interactive<R: Runtime>(
+    app: &AppHandle<R>,
+    reason: DesktopFallbackReason,
+    error: String,
+    latch: bool,
+) {
+    let state = app.state::<AppState>();
+    if let Err(destroy_error) = interactive_surface::destroy_surface(app) {
+        state.fallback_interactive(DesktopFallbackReason::SurfaceDestroyFailed, true);
+        state.set_runtime_error(format!("{error}; {destroy_error}"));
+        return;
+    }
+    state.mark_surface_destroyed();
+    state.fallback_interactive(reason, latch);
+    state.set_runtime_error(error);
 }
 
 fn desktop_parent_is_valid<R: Runtime>(window: &WebviewWindow<R>) -> bool {
@@ -1010,6 +1283,10 @@ fn env_flag(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn interactive_gate_open() -> bool {
+    env_flag("PARLEY_VIEWER_INTERACTIVE_DESKTOP")
 }
 
 #[cfg(test)]
