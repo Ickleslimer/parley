@@ -1,0 +1,46 @@
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  src: url("../assets/fonts/AtkinsonHyperlegibleNext-Regular.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  src: url("../assets/fonts/AtkinsonHyperlegibleNext-Medium.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 500 700;
+  font-display: swap;
+}
+
+:root {
+  color: #241c16;
+  background: #2c2428;
+  font-family: "Atkinson Hyperlegible Next", "Atkinson Hyperlegible", "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --ground: #2c2428;
+  --paper: #f3e6d0;
+  --paper-raised: #fff3df;
+  --paper-dim: #dfceb4;
+  --ink: #241c16;
+  --ink-muted: #5c5146;
+  --codex: #5c8ab8;
+  --grok: #d08a7c;
+  --codex-mark: #234e86;
+  --grok-mark: #8e4038;
+  --line: #8a7865;
+  --line-soft: #b9a68e;
+  --focus-on-paper: #234e86;
+  --focus-on-ground: #f3e6d0;
+  --warning-paper: #f0c983;
+  --warning-ink: #4c3100;
+  --danger-paper: #e6aaa1;
+  --danger-ink: #521c17;
+  --shadow-short: 0 2px 0 rgb(36 28 22 / 28%);
+  --radius-paper: 8px;
+  --target-min: 44px;
+  --studio-compact: 900px;
+  --exact-font: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+}
