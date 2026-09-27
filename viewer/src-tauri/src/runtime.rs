@@ -418,6 +418,9 @@ impl AppState {
 
     pub fn mark_interactive_starting(&self) {
         let mut runtime = self.lock_runtime();
+        if runtime.surface_fallback_latched {
+            return;
+        }
         runtime.desktop_runtime_state = DesktopRuntimeState::InteractiveStarting;
         runtime.desktop_fallback_reason = None;
     }
@@ -780,6 +783,35 @@ mod tests {
             state.settings().viewer.desktop_mode,
             DesktopMode::Interactive
         );
+    }
+
+    #[test]
+    fn latched_fallback_survives_bounds_refresh_until_explicit_retry() {
+        let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
+        state.initialize_desktop_mode(DesktopMode::Interactive, true);
+        state.fallback_interactive(DesktopFallbackReason::SurfaceZOrderInvalid, true);
+
+        state.mark_interactive_starting();
+
+        let fallback = state.runtime_snapshot();
+        assert_eq!(
+            fallback.desktop_runtime_state,
+            DesktopRuntimeState::PassiveFallback
+        );
+        assert_eq!(
+            fallback.desktop_fallback_reason,
+            Some(DesktopFallbackReason::SurfaceZOrderInvalid)
+        );
+        assert!(state.interactive_snapshot().fallback_latched);
+
+        state.retry_interactive(true).expect("explicit retry");
+        let retry = state.runtime_snapshot();
+        assert_eq!(
+            retry.desktop_runtime_state,
+            DesktopRuntimeState::InteractiveStarting
+        );
+        assert_eq!(retry.desktop_fallback_reason, None);
+        assert!(!state.interactive_snapshot().fallback_latched);
     }
 
     #[test]

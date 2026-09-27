@@ -26,10 +26,31 @@ const GEOMETRY_TOLERANCE_PX: i32 = 1;
 
 static ORIGINAL_SURFACE_PROC: AtomicIsize = AtomicIsize::new(0);
 static CONTROLLED_SURFACE_POSITION: AtomicBool = AtomicBool::new(false);
+static SURFACE_POSITION_LOCK: Mutex<()> = Mutex::new(());
 static LAST_MOUSEACTIVATE_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 static BAND_HELPER_HWND: AtomicIsize = AtomicIsize::new(0);
 static SURFACE_CREATED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static PROCESS_STARTED: OnceLock<Instant> = OnceLock::new();
+
+struct ControlledSurfacePositionGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ControlledSurfacePositionGuard {
+    fn enter() -> Self {
+        let lock = SURFACE_POSITION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        CONTROLLED_SURFACE_POSITION.store(true, Ordering::Release);
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for ControlledSurfacePositionGuard {
+    fn drop(&mut self) {
+        CONTROLLED_SURFACE_POSITION.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceRect {
@@ -290,19 +311,20 @@ pub fn position_and_restack<R: Runtime>(
         ));
     }
 
-    CONTROLLED_SURFACE_POSITION.store(true, Ordering::Release);
-    let surface_positioned = unsafe {
-        SetWindowPos(
-            surface_hwnd,
-            helper_hwnd,
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
+    let surface_positioned = {
+        let _controlled_position = ControlledSurfacePositionGuard::enter();
+        unsafe {
+            SetWindowPos(
+                surface_hwnd,
+                helper_hwnd,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        }
     };
-    CONTROLLED_SURFACE_POSITION.store(false, Ordering::Release);
     if surface_positioned == 0 {
         return Err(format!(
             "failed to position widget surface: {}",
@@ -686,6 +708,18 @@ mod tests {
             extended & (WS_EX_APPWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT),
             0
         );
+    }
+
+    #[test]
+    fn controlled_position_guard_holds_the_lock_and_resets_state() {
+        assert!(!CONTROLLED_SURFACE_POSITION.load(Ordering::Acquire));
+        {
+            let _guard = ControlledSurfacePositionGuard::enter();
+            assert!(CONTROLLED_SURFACE_POSITION.load(Ordering::Acquire));
+            assert!(SURFACE_POSITION_LOCK.try_lock().is_err());
+        }
+        assert!(!CONTROLLED_SURFACE_POSITION.load(Ordering::Acquire));
+        assert!(SURFACE_POSITION_LOCK.try_lock().is_ok());
     }
 
     #[test]
