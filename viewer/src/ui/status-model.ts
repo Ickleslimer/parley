@@ -1,5 +1,7 @@
 import type { ViewerStatus, WidgetSnapshot } from "../contracts";
 
+import { attributeExchange, liveRevision } from "./attribution";
+import type { WidgetSceneModel } from "./attribution";
 import { presentWidgetSnapshot, type PresentedExchange } from "./excerpt";
 import { formatSourceLine, idleWidgetLabel } from "./format";
 import { degradedBanner } from "./labels";
@@ -32,5 +34,23 @@ export function widgetModel(args: {
     idleLabel,
     loadError: args.loadError,
     ...presented,
+  };
+}
+
+export function widgetSceneModel(args: {
+  status: ViewerStatus | null;
+  snapshot: WidgetSnapshot | null;
+  loadError: string | null;
+  utc?: boolean;
+}): WidgetSceneModel {
+  const model = widgetModel(args);
+  const bubbles = attributeExchange(model);
+  return {
+    banner: model.banner,
+    liveRevision: liveRevision(bubbles),
+    bubbles,
+    idleLabel: model.idleLabel,
+    loadError: model.loadError,
+    sourceLabel: model.sourceLabel,
   };
 }
