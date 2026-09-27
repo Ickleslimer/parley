@@ -3,6 +3,7 @@ import "./styles.css";
 import { viewerApi } from "./ipc";
 import { mountDetail } from "./ui/detail";
 import { mountWidget } from "./ui/widget";
+import { mountWidgetSurface } from "./ui/widget-surface";
 
 const app = document.querySelector<HTMLElement>("#app");
 
@@ -15,10 +16,16 @@ const fixture = new URLSearchParams(window.location.search).get("fixture");
 const development =
   (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV === true;
 
+const surface =
+  view === "widget" ? "widget" : view === "widget-surface" ? "widget-surface" : "detail";
+
 if (development && fixture) {
   void import("./fixtures/mount").then(({ mountSyntheticFixture }) => {
-    mountSyntheticFixture(app, viewerApi, view === "widget" ? "widget" : "detail", fixture);
+    mountSyntheticFixture(app, viewerApi, surface, fixture);
   });
+} else if (view === "widget-surface") {
+  document.title = "Parley";
+  mountWidgetSurface(app, viewerApi);
 } else if (view === "widget") {
   document.title = "Parley";
   mountWidget(app, viewerApi);

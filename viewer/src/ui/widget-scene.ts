@@ -3,8 +3,90 @@ import type { BubbleModel, WidgetSceneModel } from "./attribution";
 import { el, setText } from "./dom";
 import { LANDMARKS } from "./landmarks";
 
+export interface PaperColumnOptions {
+  liveId: string;
+  columnId?: string;
+  liveOwner?: boolean;
+  figures?: { codex: HTMLImageElement; grok: HTMLImageElement };
+}
+
+export interface PaperColumnHandle {
+  column: HTMLDivElement;
+  live: HTMLDivElement;
+  paint(model: WidgetSceneModel): void;
+  setCovered(covered: boolean): void;
+  setLiveOwner(owner: boolean): void;
+}
+
 export interface WidgetSceneHandle {
   paint(model: WidgetSceneModel): void;
+  setCovered(covered: boolean): void;
+}
+
+export function createPaperColumn(options: PaperColumnOptions): PaperColumnHandle {
+  const banner = el("p", { className: "widget-banner" });
+  banner.hidden = true;
+  const loadError = el("p", { className: "widget-load-error" });
+  loadError.hidden = true;
+  const idle = el("p", { className: "widget-idle" });
+  const messages = el("div", { className: "widget-messages" });
+  const live = el("div", {
+    id: options.liveId,
+    className: "widget-live",
+    children: [banner, loadError, idle, messages],
+  });
+  const source = el("p", { className: "widget-source" });
+  const column = el("div", {
+    className: "widget-column",
+    ...(options.columnId ? { id: options.columnId } : {}),
+    children: [live, source],
+  });
+  let paintedRevision: string | null = null;
+
+  const setLiveOwner = (owner: boolean): void => {
+    if (owner) {
+      live.setAttribute("role", "status");
+      live.setAttribute("aria-live", "polite");
+      live.setAttribute("aria-atomic", "true");
+      return;
+    }
+    live.setAttribute("aria-live", "off");
+    live.removeAttribute("role");
+    live.removeAttribute("aria-atomic");
+  };
+
+  const setCovered = (covered: boolean): void => {
+    if (covered) {
+      column.setAttribute("aria-hidden", "true");
+      setLiveOwner(false);
+      return;
+    }
+    column.removeAttribute("aria-hidden");
+    setLiveOwner(true);
+  };
+
+  setLiveOwner(options.liveOwner !== false);
+
+  return {
+    column,
+    live,
+    setCovered,
+    setLiveOwner,
+    paint(model) {
+      setText(source, model.sourceLabel);
+      const revision = visibleRevision(model);
+      if (revision === paintedRevision) {
+        return;
+      }
+      paintedRevision = revision;
+      paintNotice(banner, model.banner);
+      paintNotice(loadError, model.loadError);
+      const showIdle = Boolean(model.idleLabel) && model.bubbles.length === 0 && !model.loadError;
+      idle.hidden = !showIdle;
+      setText(idle, showIdle && model.idleLabel ? model.idleLabel : "");
+      syncBubbles(messages, model.bubbles, options.figures);
+    },
+  };
 }
 
 export function createWidgetScene(root: HTMLElement): WidgetSceneHandle {
@@ -16,39 +98,23 @@ export function createWidgetScene(root: HTMLElement): WidgetSceneHandle {
 
   const plate = decorativeImage("widget-plate", ILLUSTRATIONS.plate.path);
   const codex = decorativeImage(
-    `widget-figure widget-figure-codex`,
+    "widget-figure widget-figure-codex",
     ILLUSTRATIONS.codex.path,
     LANDMARKS.widgetCodex,
   );
   const grok = decorativeImage(
-    `widget-figure widget-figure-grok`,
+    "widget-figure widget-figure-grok",
     ILLUSTRATIONS.grok.path,
     LANDMARKS.widgetGrok,
   );
-  const banner = el("p", { className: "widget-banner" });
-  banner.hidden = true;
-  const loadError = el("p", { className: "widget-load-error" });
-  loadError.hidden = true;
-  const idle = el("p", { className: "widget-idle" });
-  const messages = el("div", { className: "widget-messages" });
-  const live = el("div", {
-    id: LANDMARKS.widgetLive,
-    className: "widget-live",
-    attrs: {
-      role: "status",
-      "aria-live": "polite",
-      "aria-atomic": "true",
-    },
-    children: [banner, loadError, idle, messages],
-  });
-  const source = el("p", { className: "widget-source" });
-  const column = el("div", {
-    className: "widget-column",
-    children: [live, source],
+  const paper = createPaperColumn({
+    liveId: LANDMARKS.widgetLive,
+    columnId: LANDMARKS.widgetColumn,
+    figures: { codex, grok },
   });
   const bench = el("div", {
     className: "widget-bench",
-    children: [codex, column, grok],
+    children: [codex, paper.column, grok],
   });
   const scene = el("section", {
     id: LANDMARKS.widgetScene,
@@ -59,15 +125,22 @@ export function createWidgetScene(root: HTMLElement): WidgetSceneHandle {
 
   return {
     paint(model) {
-      paintNotice(banner, model.banner);
-      setText(source, model.sourceLabel);
-      paintNotice(loadError, model.loadError);
-      const showIdle = Boolean(model.idleLabel) && model.bubbles.length === 0 && !model.loadError;
-      idle.hidden = !showIdle;
-      setText(idle, showIdle && model.idleLabel ? model.idleLabel : "");
-      syncBubbles(messages, model.bubbles, codex, grok);
+      paper.paint(model);
+    },
+    setCovered(covered) {
+      paper.setCovered(covered);
     },
   };
+}
+
+function visibleRevision(model: WidgetSceneModel): string {
+  return [
+    model.liveRevision,
+    model.bubbles.map((bubble) => `${bubble.displayName}\u001f${bubble.tail}`).join("\u001e"),
+    model.banner ?? "",
+    model.idleLabel ?? "",
+    model.loadError ?? "",
+  ].join("\u001d");
 }
 
 function decorativeImage(className: string, src: string, id?: string): HTMLImageElement {
@@ -101,8 +174,7 @@ function paintNotice(node: HTMLElement, text: string | null): void {
 function syncBubbles(
   container: HTMLElement,
   bubbles: BubbleModel[],
-  codex: HTMLImageElement,
-  grok: HTMLImageElement,
+  figures?: { codex: HTMLImageElement; grok: HTMLImageElement },
 ): void {
   container.dataset.bubbleCount = String(bubbles.length);
   const previous = new Map<string, HTMLElement>();
@@ -140,11 +212,11 @@ function syncBubbles(
   if (!unchanged) {
     container.replaceChildren(...ordered);
   }
-  if (reactCodex) {
-    poke(codex);
+  if (reactCodex && figures) {
+    poke(figures.codex);
   }
-  if (reactGrok) {
-    poke(grok);
+  if (reactGrok && figures) {
+    poke(figures.grok);
   }
 }
 

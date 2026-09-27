@@ -1,4 +1,4 @@
-export type FixtureSurface = "widget" | "detail";
+export type FixtureSurface = "widget" | "widget-surface" | "detail";
 
 export type FixtureScenario =
   | "short-exchange"
@@ -11,7 +11,12 @@ export type FixtureScenario =
   | "missing-image"
   | "search-results"
   | "empty"
-  | "source-error";
+  | "source-error"
+  | "live"
+  | "historical"
+  | "missing-selection"
+  | "ambiguous"
+  | "passive-fallback";
 
 export type FixtureInspectorTab = "event" | "activity" | "sources" | "settings";
 

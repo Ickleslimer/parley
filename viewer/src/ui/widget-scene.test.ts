@@ -5,13 +5,18 @@ import { resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { MessagePreview, ViewerStatus, WidgetSnapshot } from "../contracts";
+import type {
+  MessagePreview,
+  ViewerStatus,
+  WidgetSnapshot,
+  WidgetSurfaceBoundsReport,
+} from "../contracts";
 import type { ViewerApi } from "../ipc";
 
 import { LANDMARKS } from "./landmarks";
 import { EXTRACTED_TASK_LABEL, PARLEY_ERROR_LABEL, PENDING_LABEL } from "./labels";
 import { widgetSceneModel } from "./status-model";
-import { mountWidget } from "./widget";
+import { mountWidget, validatedSurfaceBounds } from "./widget";
 import { createWidgetScene } from "./widget-scene";
 
 const HOSTILE = "<img src=x onerror=alert(1)><script>alert(1)</script>";
@@ -108,6 +113,7 @@ describe("widget scene", () => {
     const codex = root.querySelector(`#${LANDMARKS.widgetCodex}`);
     const grok = root.querySelector(`#${LANDMARKS.widgetGrok}`);
     expect(scene).not.toBeNull();
+    expect(root.querySelector(`#${LANDMARKS.widgetColumn}`)).not.toBeNull();
     expect(live?.getAttribute("aria-live")).toBe("polite");
     expect(live?.getAttribute("role")).toBe("status");
     expect(live?.contains(codex)).toBe(false);
@@ -369,6 +375,11 @@ describe("widget scene contract", () => {
     expect(compact?.[1]).toMatch(/display:\s*none/);
     expect(compact?.[1]).not.toMatch(/font-size/);
     expect(css).toMatch(/prefers-reduced-motion:\s*reduce[\s\S]*animation:\s*none/);
+    expect(css).toMatch(
+      /\.widget-surface-button\s*\{[^}]*min-width:\s*var\(--target-min\);[^}]*min-height:\s*var\(--target-min\)/,
+    );
+    expect(css).toMatch(/\.widget-surface-shell[\s\S]*user-select:\s*none/);
+    expect(css).not.toMatch(/topmost|click-through|infinite/i);
   });
 
   it("keeps ink and dark marks above the text and boundary contrast floors", () => {
@@ -392,6 +403,172 @@ describe("widget scene contract", () => {
     expect(contrast("#8a7865", "#f3e6d0")).toBeGreaterThanOrEqual(3);
   });
 });
+
+describe("underlay interactive handshake", () => {
+  it("keeps the passive live region unless the desktop runtime is interactive", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const current = status();
+    const handle = mountWidget(root, {
+      getStatus: async () => current,
+      getWidgetSnapshot: async () => snapshot(),
+      reportWidgetSurfaceBounds: async () => current,
+    } as unknown as ViewerApi);
+    await vi.waitFor(() => {
+      expect(root.querySelector(".widget-excerpt")?.textContent).toBe("Ship the engine");
+    });
+    const column = root.querySelector<HTMLElement>(`#${LANDMARKS.widgetColumn}`);
+    const live = root.querySelector<HTMLElement>(`#${LANDMARKS.widgetLive}`);
+    const codex = root.querySelector(`#${LANDMARKS.widgetCodex}`);
+    expect(column?.getAttribute("aria-hidden")).toBe("true");
+    expect(column?.contains(codex)).toBe(false);
+    expect(live?.getAttribute("aria-live")).toBe("off");
+    expect(live?.getAttribute("role")).toBeNull();
+    expect(root.querySelectorAll('[aria-live="polite"]')).toHaveLength(0);
+    expect(root.querySelector("button")).toBeNull();
+
+    current.desktopRuntimeState = "passive-fallback";
+    current.desktopFallbackReason = "surface-z-order-invalid";
+    await vi.waitFor(() => {
+      expect(live?.getAttribute("aria-live")).toBe("polite");
+    });
+    expect(column?.hasAttribute("aria-hidden")).toBe(false);
+    expect(live?.getAttribute("role")).toBe("status");
+    expect(root.querySelectorAll('[aria-live="polite"]')).toHaveLength(1);
+    expect(root.querySelector(".widget-excerpt")?.textContent).toBe("Ship the engine");
+    handle.stop();
+  });
+
+  it("does not cover the column while interactive startup is still unfinished", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const current = status({ desktopRuntimeState: "interactive-starting" });
+    const handle = mountWidget(root, {
+      getStatus: async () => current,
+      getWidgetSnapshot: async () => snapshot(),
+      reportWidgetSurfaceBounds: async () => current,
+    } as unknown as ViewerApi);
+    await vi.waitFor(() => {
+      expect(root.querySelector(`#${LANDMARKS.widgetLive}`)?.getAttribute("aria-live")).toBe("polite");
+    });
+    expect(root.querySelector(`#${LANDMARKS.widgetColumn}`)?.hasAttribute("aria-hidden")).toBe(false);
+    handle.stop();
+  });
+
+  it("reports quantized in-viewport bounds only when the geometry changes", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    setViewport(560, 360, 2);
+    const box = { left: 10.2, top: 4.4, width: 100.2, height: 50.2 };
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      if (this.id !== LANDMARKS.widgetColumn) {
+        return new DOMRect();
+      }
+      return new DOMRect(box.left, box.top, box.width, box.height);
+    });
+    const current = status({ desktopRuntimeState: "passive" });
+    const reportWidgetSurfaceBounds = vi.fn(async (_report: WidgetSurfaceBoundsReport) => current);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const handle = mountWidget(root, {
+      getStatus: async () => current,
+      getWidgetSnapshot: async () => snapshot(),
+      reportWidgetSurfaceBounds,
+    } as unknown as ViewerApi);
+    await vi.waitFor(() => {
+      expect(reportWidgetSurfaceBounds).toHaveBeenCalledTimes(1);
+    });
+    expect(reportWidgetSurfaceBounds.mock.calls[0]?.[0]).toEqual({
+      left: 10,
+      top: 4.5,
+      width: 100,
+      height: 50,
+      viewportWidth: 560,
+      viewportHeight: 360,
+      devicePixelRatio: 2,
+    });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(reportWidgetSurfaceBounds).toHaveBeenCalledTimes(1);
+    box.width = 120.2;
+    window.dispatchEvent(new Event("resize"));
+    expect(reportWidgetSurfaceBounds).toHaveBeenCalledTimes(2);
+    expect(reportWidgetSurfaceBounds.mock.calls[1]?.[0]).toMatchObject({ width: 120 });
+    handle.stop();
+  });
+
+  it("withholds invalid geometry and stops retrying one signature after three failures", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    setViewport(560, 360, 1);
+    const box = { left: 0, top: 0, width: 0, height: 0 };
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      if (this.id !== LANDMARKS.widgetColumn) {
+        return new DOMRect();
+      }
+      return new DOMRect(box.left, box.top, box.width, box.height);
+    });
+    const current = status();
+    const reportWidgetSurfaceBounds = vi.fn(async () => {
+      throw new Error("rejected");
+    });
+    const root = document.createElement("div");
+    document.body.append(root);
+    const handle = mountWidget(root, {
+      getStatus: async () => current,
+      getWidgetSnapshot: async () => snapshot(),
+      reportWidgetSurfaceBounds,
+    } as unknown as ViewerApi);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(reportWidgetSurfaceBounds).not.toHaveBeenCalled();
+
+    box.width = 200;
+    box.height = 120;
+    window.dispatchEvent(new Event("resize"));
+    await Promise.resolve();
+    window.dispatchEvent(new Event("resize"));
+    await vi.advanceTimersByTimeAsync(1_000);
+    await Promise.resolve();
+    expect(reportWidgetSurfaceBounds.mock.calls.length).toBe(3);
+    const stalled = reportWidgetSurfaceBounds.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(reportWidgetSurfaceBounds.mock.calls.length).toBe(stalled);
+    box.width = 220;
+    window.dispatchEvent(new Event("resize"));
+    expect(reportWidgetSurfaceBounds.mock.calls.length).toBe(stalled + 1);
+    handle.stop();
+  });
+});
+
+describe("validated surface bounds", () => {
+  it("quantizes to physical pixels and rejects geometry outside the viewport", () => {
+    expect(validatedSurfaceBounds({ left: 10.2, top: 4.4, width: 100.2, height: 50.2 }, 560, 360, 2)).toEqual(
+      {
+        left: 10,
+        top: 4.5,
+        width: 100,
+        height: 50,
+        viewportWidth: 560,
+        viewportHeight: 360,
+        devicePixelRatio: 2,
+      },
+    );
+    expect(validatedSurfaceBounds({ left: 500, top: 0, width: 100, height: 40 }, 560, 360, 1)).toBeNull();
+    expect(validatedSurfaceBounds({ left: -2, top: 0, width: 40, height: 40 }, 560, 360, 1)).toBeNull();
+    expect(validatedSurfaceBounds({ left: 0, top: 0, width: 0, height: 40 }, 560, 360, 1)).toBeNull();
+    expect(validatedSurfaceBounds({ left: 0, top: 0, width: 40, height: 40 }, 560, 360, 0)).toBeNull();
+    expect(
+      validatedSurfaceBounds({ left: Number.NaN, top: 0, width: 40, height: 40 }, 560, 360, 1),
+    ).toBeNull();
+  });
+});
+
+function setViewport(width: number, height: number, ratio: number): void {
+  Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+  Object.defineProperty(window, "innerHeight", { configurable: true, value: height });
+  Object.defineProperty(window, "devicePixelRatio", { configurable: true, value: ratio });
+}
 
 function contrast(foreground: string, background: string): number {
   const light = (hex: string): number => {

@@ -9,6 +9,7 @@ import {
   type SearchHit,
   type ViewerSettings,
   type ViewerStatus,
+  type WidgetBrowserSnapshot,
   type WidgetSnapshot,
 } from "../contracts";
 import type { ViewerApi } from "../ipc";
@@ -45,7 +46,8 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
     eventKey: "event:request",
     eventId: "synthetic-request",
     eventType: "request",
-    speaker: scenario === "reversed-route" ? "grok" : scenario === "unknown-agent" ? "nova" : "codex",
+    speaker:
+      scenario === "reversed-route" ? "grok" : scenario === "unknown-agent" ? "nova" : "codex",
     recipient: scenario === "reversed-route" ? "codex" : "grok",
     timestampMs: NOW,
     excerpt:
@@ -86,8 +88,20 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
     completion,
     pendingLabel: completion || scenario === "idle" ? null : PENDING_LABEL,
   };
+  const populatedWidget: WidgetSnapshot = {
+    sessionKey: SESSION_KEY,
+    exchangeKey: EXCHANGE_KEY,
+    sessionId: SESSION_ID,
+    exchangeId: EXCHANGE_ID,
+    request,
+    completion,
+    pendingLabel: completion ? null : PENDING_LABEL,
+  };
   const widget: WidgetSnapshot =
-    scenario === "idle"
+    scenario === "idle" ||
+    scenario === "empty" ||
+    scenario === "missing-selection" ||
+    scenario === "ambiguous"
       ? {
           sessionKey: null,
           exchangeKey: null,
@@ -97,15 +111,7 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
           completion: null,
           pendingLabel: null,
         }
-      : {
-          sessionKey: SESSION_KEY,
-          exchangeKey: EXCHANGE_KEY,
-          sessionId: SESSION_ID,
-          exchangeId: EXCHANGE_ID,
-          request,
-          completion,
-          pendingLabel: completion ? null : PENDING_LABEL,
-        };
+      : populatedWidget;
   const sourceError = scenario === "source-error";
   const empty = scenario === "empty";
   const status: ViewerStatus = {
@@ -117,8 +123,8 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
     lastEventTimestampMs: empty ? null : exchange.timestampMs,
     trayAvailable: true,
     underlayState: "attached",
-    desktopRuntimeState: "interactive",
-    desktopFallbackReason: null,
+    desktopRuntimeState: scenario === "passive-fallback" ? "passive-fallback" : "interactive",
+    desktopFallbackReason: scenario === "passive-fallback" ? "surface-z-order-invalid" : null,
     widgetVisible: true,
     diagnostics: {
       ...EMPTY_DIAGNOSTICS,
@@ -185,16 +191,7 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
   const api: ViewerApi = {
     getStatus: async () => mutableStatus,
     getWidgetSnapshot: async () => widget,
-    getWidgetBrowser: async () => ({
-      followLive: true,
-      selectionState: widget.exchangeKey ? "selected" : "empty",
-      position: 0,
-      total: widget.exchangeKey ? 1 : 0,
-      hasOlder: false,
-      hasNewer: false,
-      newerCount: 0,
-      widget,
-    }),
+    getWidgetBrowser: async () => browserFor(scenario, widget),
     widgetBrowseOlder: async () => api.getWidgetBrowser(),
     widgetBrowseNewer: async () => api.getWidgetBrowser(),
     widgetBrowseLive: async () => api.getWidgetBrowser(),
@@ -262,6 +259,56 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
     exit: async () => undefined,
   };
   return { api, status, widget, exchanges, events };
+}
+
+function browserFor(scenario: FixtureScenario, widget: WidgetSnapshot): WidgetBrowserSnapshot {
+  if (scenario === "historical") {
+    return {
+      followLive: false,
+      selectionState: "selected",
+      position: 2,
+      total: 5,
+      hasOlder: true,
+      hasNewer: true,
+      newerCount: 2,
+      widget,
+    };
+  }
+  if (scenario === "missing-selection") {
+    return {
+      followLive: false,
+      selectionState: "missing",
+      position: 1,
+      total: 4,
+      hasOlder: true,
+      hasNewer: true,
+      newerCount: 1,
+      widget,
+    };
+  }
+  if (scenario === "ambiguous") {
+    return {
+      followLive: false,
+      selectionState: "ambiguous",
+      position: 1,
+      total: 4,
+      hasOlder: true,
+      hasNewer: false,
+      newerCount: 0,
+      widget,
+    };
+  }
+  const selected = widget.exchangeKey != null;
+  return {
+    followLive: true,
+    selectionState: selected ? "selected" : "empty",
+    position: 0,
+    total: selected ? 1 : 0,
+    hasOlder: false,
+    hasNewer: false,
+    newerCount: 0,
+    widget,
+  };
 }
 
 function preview(overrides: Partial<MessagePreview>): MessagePreview {

@@ -2,6 +2,7 @@ import type { ViewerApi } from "../ipc";
 import { mountDetail } from "../ui/detail";
 import { LANDMARKS } from "../ui/landmarks";
 import { mountWidget } from "../ui/widget";
+import { mountWidgetSurface } from "../ui/widget-surface";
 import {
   type FixtureInspectorTab,
   type FixtureScenario,
@@ -21,6 +22,11 @@ const SCENARIOS = new Set<FixtureScenario>([
   "search-results",
   "empty",
   "source-error",
+  "live",
+  "historical",
+  "missing-selection",
+  "ambiguous",
+  "passive-fallback",
 ]);
 
 const TAB_LANDMARKS: Record<FixtureInspectorTab, string> = {
@@ -56,6 +62,8 @@ export function mountSyntheticFixture(
   document.body.append(label);
   if (surface === "widget") {
     mountWidget(root, fixture.api);
+  } else if (surface === "widget-surface") {
+    mountWidgetSurface(root, fixture.api);
   } else {
     mountDetail(root, fixture.api);
     void prepareDetailFixture(root, scenario, params.get("tab"));
