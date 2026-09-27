@@ -117,6 +117,8 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
     lastEventTimestampMs: empty ? null : exchange.timestampMs,
     trayAvailable: true,
     underlayState: "attached",
+    desktopRuntimeState: "interactive",
+    desktopFallbackReason: null,
     widgetVisible: true,
     diagnostics: {
       ...EMPTY_DIAGNOSTICS,
@@ -183,6 +185,23 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
   const api: ViewerApi = {
     getStatus: async () => mutableStatus,
     getWidgetSnapshot: async () => widget,
+    getWidgetBrowser: async () => ({
+      followLive: true,
+      selectionState: widget.exchangeKey ? "selected" : "empty",
+      position: 0,
+      total: widget.exchangeKey ? 1 : 0,
+      hasOlder: false,
+      hasNewer: false,
+      newerCount: 0,
+      widget,
+    }),
+    widgetBrowseOlder: async () => api.getWidgetBrowser(),
+    widgetBrowseNewer: async () => api.getWidgetBrowser(),
+    widgetBrowseLive: async () => api.getWidgetBrowser(),
+    openWidgetExchange: async () => undefined,
+    reportWidgetSurfaceBounds: async () => mutableStatus,
+    widgetSurfaceReady: async () => mutableStatus,
+    retryInteractiveMode: async () => mutableStatus,
     listSessions: async () => ({
       items: exchanges.length
         ? [

@@ -1,6 +1,26 @@
 export type SourceState = "none" | "missing" | "watching" | "degraded";
 export type UnderlayState = "detached" | "attaching" | "attached" | "degraded";
 export type Corner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
+export type DesktopMode = "interactive" | "passive";
+export type DesktopRuntimeState =
+  | "passive"
+  | "interactive-starting"
+  | "interactive"
+  | "passive-fallback";
+export type DesktopFallbackReason =
+  | "development-gate-closed"
+  | "preference-passive"
+  | "underlay-unavailable"
+  | "surface-create-failed"
+  | "surface-document-not-ready"
+  | "surface-bounds-invalid"
+  | "surface-style-invalid"
+  | "surface-owner-invalid"
+  | "surface-geometry-mismatch"
+  | "surface-z-order-invalid"
+  | "surface-restack-limit"
+  | "explorer-lost"
+  | "surface-destroy-failed";
 
 export interface Diagnostics {
   malformedLines: number;
@@ -34,6 +54,8 @@ export interface ViewerStatus {
   lastEventTimestampMs: number | null;
   trayAvailable: boolean;
   underlayState: UnderlayState;
+  desktopRuntimeState: DesktopRuntimeState;
+  desktopFallbackReason: DesktopFallbackReason | null;
   widgetVisible: boolean;
   diagnostics: Diagnostics;
   sources: SourceStatus[];
@@ -148,6 +170,29 @@ export interface WidgetSnapshot {
   pendingLabel: string | null;
 }
 
+export type WidgetSelectionState = "selected" | "empty" | "missing" | "ambiguous";
+
+export interface WidgetBrowserSnapshot {
+  followLive: boolean;
+  selectionState: WidgetSelectionState;
+  position: number;
+  total: number;
+  hasOlder: boolean;
+  hasNewer: boolean;
+  newerCount: number;
+  widget: WidgetSnapshot;
+}
+
+export interface WidgetSurfaceBoundsReport {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  devicePixelRatio: number;
+}
+
 export interface MonitorInfo {
   id: string;
   name: string;
@@ -164,6 +209,7 @@ export interface ViewerSettings {
   width: number;
   height: number;
   launchAtLogin: boolean;
+  desktopMode: DesktopMode;
 }
 
 export const DEFAULT_SETTINGS: ViewerSettings = {
@@ -176,6 +222,7 @@ export const DEFAULT_SETTINGS: ViewerSettings = {
   width: 560,
   height: 360,
   launchAtLogin: false,
+  desktopMode: "interactive",
 };
 
 export const CLOSED_CLASSES = [

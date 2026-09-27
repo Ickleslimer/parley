@@ -21,6 +21,35 @@ pub enum UnderlayState {
     Degraded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
+pub enum DesktopRuntimeState {
+    Passive,
+    InteractiveStarting,
+    Interactive,
+    PassiveFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
+pub enum DesktopFallbackReason {
+    DevelopmentGateClosed,
+    PreferencePassive,
+    UnderlayUnavailable,
+    SurfaceCreateFailed,
+    SurfaceDocumentNotReady,
+    SurfaceBoundsInvalid,
+    SurfaceStyleInvalid,
+    SurfaceOwnerInvalid,
+    SurfaceGeometryMismatch,
+    SurfaceZOrderInvalid,
+    SurfaceRestackLimit,
+    ExplorerLost,
+    SurfaceDestroyFailed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewerStatus {
@@ -32,6 +61,8 @@ pub struct ViewerStatus {
     pub last_event_timestamp_ms: Option<u64>,
     pub tray_available: bool,
     pub underlay_state: UnderlayState,
+    pub desktop_runtime_state: DesktopRuntimeState,
+    pub desktop_fallback_reason: Option<DesktopFallbackReason>,
     pub widget_visible: bool,
     pub diagnostics: Diagnostics,
     pub sources: Vec<SourceStatus>,
@@ -49,6 +80,8 @@ pub struct MonitorInfo {
 struct RuntimeFlags {
     tray_available: bool,
     underlay_state: UnderlayState,
+    desktop_runtime_state: DesktopRuntimeState,
+    desktop_fallback_reason: Option<DesktopFallbackReason>,
     widget_requested: bool,
     exiting: bool,
     last_error: Option<String>,
@@ -59,6 +92,8 @@ impl Default for RuntimeFlags {
         Self {
             tray_available: false,
             underlay_state: UnderlayState::Detached,
+            desktop_runtime_state: DesktopRuntimeState::Passive,
+            desktop_fallback_reason: None,
             widget_requested: true,
             exiting: false,
             last_error: None,
@@ -213,6 +248,8 @@ impl AppState {
             last_event_timestamp_ms,
             tray_available: runtime.tray_available,
             underlay_state: runtime.underlay_state,
+            desktop_runtime_state: runtime.desktop_runtime_state,
+            desktop_fallback_reason: runtime.desktop_fallback_reason,
             widget_visible: runtime.widget_requested
                 && runtime.underlay_state == UnderlayState::Attached,
             diagnostics,

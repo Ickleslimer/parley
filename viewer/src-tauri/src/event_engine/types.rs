@@ -228,6 +228,28 @@ pub struct WidgetSnapshot {
     pub pending_label: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WidgetSelectionState {
+    Selected,
+    Empty,
+    Missing,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WidgetBrowserSnapshot {
+    pub follow_live: bool,
+    pub selection_state: WidgetSelectionState,
+    pub position: u64,
+    pub total: u64,
+    pub has_older: bool,
+    pub has_newer: bool,
+    pub newer_count: u64,
+    pub widget: WidgetSnapshot,
+}
+
 impl WidgetSnapshot {
     pub(crate) fn empty() -> Self {
         Self {

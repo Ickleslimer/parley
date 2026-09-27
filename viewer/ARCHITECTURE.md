@@ -49,11 +49,26 @@ Widget excerpts are bounded to 420 Unicode scalar values and never model-generat
 - `%LOCALAPPDATA%\Parley\jobs`, `%LOCALAPPDATA%\Parley\lanes`, and `%LOCALAPPDATA%\Parley\handoffs` also survive uninstall and upgrade as task evidence.
 - Once `autostartInitialized` is true, saved `launchAtLogin` stays authoritative: startup restores or clears the viewer Run entry to match it, including after uninstall removed the registration. First interactive detail launch still enables autostart when `autostartInitialized` is false.
 
+### Interactive desktop composition
+
+- `widget` remains the complete `WorkerW`/`Progman` underlay and the fail-closed passive fallback.
+- `widget-surface` is a dynamic parentless top-level WebView containing only the paper conversation column. Rust owns its creation, styles, placement, z-order, readiness, destruction, and retry policy.
+- The surface is `WS_POPUP` with `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`; `WS_EX_APPWINDOW`, `WS_EX_TOPMOST`, and click-through styles are forbidden. It is never reparented and never becomes topmost.
+- The underlay reports the column rectangle in CSS pixels together with viewport size and device-pixel ratio. Rust accepts reports only from `widget`, validates finite in-viewport geometry, converts to physical coordinates, and requires alignment within one physical pixel.
+- The surface reports document readiness only from `widget-surface`. Activation requires a healthy underlay, verified styles and null ownership, valid geometry, and a passing desktop-band z-order check.
+- Runtime state is one of `passive`, `interactive-starting`, `interactive`, or `passive-fallback`. Fallback reasons are a closed enum. Runtime fallback never rewrites the saved `desktopMode` preference.
+- The surface and underlay change visibility atomically. Explorer loss destroys the surface before the underlay enters its existing bounded reattachment path.
+- Browser selection is process-local Rust state. Global order is timestamp descending, configured-source order, then opaque exchange key. Historical identity recovery uses source identity plus raw session, exchange, and event identifiers and fails closed on missing or ambiguous matches.
+- While the surface is active, the covered underlay conversation subtree is hidden from accessibility APIs and its live region is disabled. The surface owns the sole polite live region.
+- Settings schema v2 adds `desktopMode: interactive | passive`; missing values migrate to `interactive` without changing placement, dimensions, sources, monitor, autostart, or any explicit corner choice.
+
 ## Frontend IPC
 
 `src/ipc.ts` is the complete frontend authority boundary. Detail and widget views use only its `ViewerApi`; implementation files must not invoke arbitrary Tauri commands.
 
 - `getStatus` and `getWidgetSnapshot` drive bounded live refresh across all sources.
+- `getWidgetBrowser`, `widgetBrowseOlder`, `widgetBrowseNewer`, and `widgetBrowseLive` expose the bounded process-local global browser. `openWidgetExchange` opens the selected exchange in detail.
+- `reportWidgetSurfaceBounds` accepts only validated underlay geometry; `widgetSurfaceReady` accepts readiness only from the surface; `retryInteractiveMode` explicitly clears only the runtime fallback latch.
 - `listSessions`, `listExchanges`, `search`, and `getEventContent` use opaque keys for paging, search, and exact retrieval.
 - `getSettings`, `saveSettings`, and `listMonitors` drive source ordering and geometry settings.
 - `getPeerActivity` returns the newest bounded handoff records, sanitized activity metadata, visible-output excerpts, and exact reports only after their stored fingerprints verify.

@@ -18,7 +18,8 @@ const DEFAULT_WIDTH: f64 = 560.0;
 const DEFAULT_HEIGHT: f64 = 360.0;
 const LEGACY_DEFAULT_WIDTH: f64 = 440.0;
 const LEGACY_DEFAULT_HEIGHT: f64 = 260.0;
-const CURRENT_SETTINGS_VERSION: u32 = 1;
+const LEGACY_SIZE_MIGRATION_VERSION: u32 = 1;
+const CURRENT_SETTINGS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -27,6 +28,14 @@ pub enum Corner {
     TopRight,
     BottomLeft,
     BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DesktopMode {
+    #[default]
+    Interactive,
+    Passive,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,6 +51,7 @@ pub struct ViewerSettings {
     pub width: f64,
     pub height: f64,
     pub launch_at_login: bool,
+    pub desktop_mode: DesktopMode,
 }
 
 impl Default for ViewerSettings {
@@ -56,6 +66,7 @@ impl Default for ViewerSettings {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             launch_at_login: false,
+            desktop_mode: DesktopMode::Interactive,
         }
     }
 }
@@ -147,15 +158,14 @@ impl Default for SettingsFile {
 
 impl SettingsFile {
     pub fn sanitized(mut self) -> Self {
-        if self.settings_version < CURRENT_SETTINGS_VERSION {
-            if self.viewer.width == LEGACY_DEFAULT_WIDTH
-                && self.viewer.height == LEGACY_DEFAULT_HEIGHT
-            {
-                self.viewer.width = DEFAULT_WIDTH;
-                self.viewer.height = DEFAULT_HEIGHT;
-            }
-            self.settings_version = CURRENT_SETTINGS_VERSION;
+        if self.settings_version < LEGACY_SIZE_MIGRATION_VERSION
+            && self.viewer.width == LEGACY_DEFAULT_WIDTH
+            && self.viewer.height == LEGACY_DEFAULT_HEIGHT
+        {
+            self.viewer.width = DEFAULT_WIDTH;
+            self.viewer.height = DEFAULT_HEIGHT;
         }
+        self.settings_version = CURRENT_SETTINGS_VERSION;
         self.viewer = self.viewer.sanitized();
         self
     }
@@ -315,6 +325,8 @@ mod tests {
         assert_eq!(settings.viewer.offset_y, 24.0);
         assert_eq!(settings.viewer.width, DEFAULT_WIDTH);
         assert_eq!(settings.viewer.height, DEFAULT_HEIGHT);
+        assert_eq!(settings.viewer.desktop_mode, DesktopMode::Interactive);
+        assert_eq!(settings.settings_version, CURRENT_SETTINGS_VERSION);
     }
 
     #[test]
@@ -335,6 +347,7 @@ mod tests {
 
         assert_eq!(settings.settings_version, CURRENT_SETTINGS_VERSION);
         assert_eq!(settings.viewer.corner, Corner::BottomRight);
+        assert_eq!(settings.viewer.desktop_mode, DesktopMode::Interactive);
     }
 
     #[test]
@@ -419,6 +432,32 @@ mod tests {
 
         assert_eq!(settings.viewer.width, LEGACY_DEFAULT_WIDTH);
         assert_eq!(settings.viewer.height, LEGACY_DEFAULT_HEIGHT);
+    }
+
+    #[test]
+    fn schema_v1_adds_interactive_mode_without_reinterpreting_geometry() {
+        let settings = serde_json::from_str::<SettingsFile>(
+            r#"{
+                "settingsVersion": 1,
+                "corner": "bottom-left",
+                "offsetX": 31.0,
+                "offsetY": 29.0,
+                "width": 440.0,
+                "height": 260.0,
+                "launchAtLogin": true
+            }"#,
+        )
+        .expect("schema v1 settings should parse")
+        .sanitized();
+
+        assert_eq!(settings.settings_version, CURRENT_SETTINGS_VERSION);
+        assert_eq!(settings.viewer.desktop_mode, DesktopMode::Interactive);
+        assert_eq!(settings.viewer.corner, Corner::BottomLeft);
+        assert_eq!(settings.viewer.offset_x, 31.0);
+        assert_eq!(settings.viewer.offset_y, 29.0);
+        assert_eq!(settings.viewer.width, LEGACY_DEFAULT_WIDTH);
+        assert_eq!(settings.viewer.height, LEGACY_DEFAULT_HEIGHT);
+        assert!(settings.viewer.launch_at_login);
     }
 
     #[test]

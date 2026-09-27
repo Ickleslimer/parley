@@ -11,12 +11,22 @@ import type {
   SessionPage,
   ViewerSettings,
   ViewerStatus,
+  WidgetBrowserSnapshot,
   WidgetSnapshot,
+  WidgetSurfaceBoundsReport,
 } from "./contracts";
 
 export interface ViewerApi {
   getStatus(): Promise<ViewerStatus>;
   getWidgetSnapshot(): Promise<WidgetSnapshot>;
+  getWidgetBrowser(): Promise<WidgetBrowserSnapshot>;
+  widgetBrowseOlder(): Promise<WidgetBrowserSnapshot>;
+  widgetBrowseNewer(): Promise<WidgetBrowserSnapshot>;
+  widgetBrowseLive(): Promise<WidgetBrowserSnapshot>;
+  openWidgetExchange(): Promise<void>;
+  reportWidgetSurfaceBounds(report: WidgetSurfaceBoundsReport): Promise<ViewerStatus>;
+  widgetSurfaceReady(): Promise<ViewerStatus>;
+  retryInteractiveMode(): Promise<ViewerStatus>;
   listSessions(cursor: number | null, limit: number): Promise<SessionPage>;
   listExchanges(sessionKey: string, cursor: number | null, limit: number): Promise<ExchangePage>;
   search(query: string, cursor: number | null, limit: number): Promise<SearchPage>;
@@ -44,6 +54,15 @@ export interface ViewerApi {
 export const viewerApi: ViewerApi = {
   getStatus: () => invoke<ViewerStatus>("get_viewer_status"),
   getWidgetSnapshot: () => invoke<WidgetSnapshot>("get_widget_snapshot"),
+  getWidgetBrowser: () => invoke<WidgetBrowserSnapshot>("get_widget_browser"),
+  widgetBrowseOlder: () => invoke<WidgetBrowserSnapshot>("widget_browse_older"),
+  widgetBrowseNewer: () => invoke<WidgetBrowserSnapshot>("widget_browse_newer"),
+  widgetBrowseLive: () => invoke<WidgetBrowserSnapshot>("widget_browse_live"),
+  openWidgetExchange: () => invoke<void>("open_widget_exchange"),
+  reportWidgetSurfaceBounds: (report) =>
+    invoke<ViewerStatus>("report_widget_surface_bounds", { report }),
+  widgetSurfaceReady: () => invoke<ViewerStatus>("widget_surface_ready"),
+  retryInteractiveMode: () => invoke<ViewerStatus>("retry_interactive_mode"),
   listSessions: (cursor, limit) =>
     invoke<SessionPage>("list_sessions", { cursor, limit }),
   listExchanges: (sessionKey, cursor, limit) =>

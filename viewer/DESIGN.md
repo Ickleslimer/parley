@@ -40,12 +40,16 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 
 - Codex remains visually fixed on the left and Grok on the right.
 - The newest exchange occupies one central chronological message column.
+- The full illustrated scene remains a passive desktop underlay. Interactive mode overlays only the paper conversation column with a visually identical, taskbar-free mouse surface.
+- The interactive column offers Older, Newer, Live, and Open transcript. These controls remain visually part of the paper workbench rather than becoming a toolbar or dashboard.
+- Live is the calm default. Historical browsing must remain visibly distinct without adding badges, gamification, or ambient animation.
 - Bubble direction follows the normalized speaker, never request or completion role.
 - Unknown speakers use named center slips with no robot tail.
 - Parley errors are execution records and never robot speech.
 - Pending text attaches only to a known target. Unknown targets remain centered.
 - Artwork stays outside the polite live region.
 - At 320 by 180, hide figures before shrinking text. Keep the message column readable.
+- The interactive surface owns its rectangle and assumes it is placed over empty desktop space. It never moves, reserves, or inspects desktop icons.
 
 ### Conversation studio
 

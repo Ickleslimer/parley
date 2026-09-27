@@ -22,6 +22,8 @@ const status = (overrides: Partial<ViewerStatus> = {}): ViewerStatus => ({
   lastEventTimestampMs: null,
   trayAvailable: true,
   underlayState: "attached",
+  desktopRuntimeState: "interactive",
+  desktopFallbackReason: null,
   widgetVisible: false,
   diagnostics: {
     malformedLines: 0,

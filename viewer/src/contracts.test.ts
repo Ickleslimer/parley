@@ -17,6 +17,7 @@ describe("default widget settings", () => {
       offsetY: 24,
       width: 560,
       height: 360,
+      desktopMode: "interactive",
     });
   });
 });
