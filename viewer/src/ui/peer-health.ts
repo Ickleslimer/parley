@@ -36,7 +36,7 @@ export const ACKNOWLEDGE_LABEL = "Acknowledge";
 export const MUTE_CONTROL_LABEL = "Mute peer-health chime";
 export const TEST_CHIME_LABEL = "Test chime";
 export const TEST_CHIME_REQUESTED_LABEL = "Test chime requested";
-export const OPEN_LATEST_HANDOFF_LABEL = "Open Latest Handoff";
+export const OPEN_LATEST_HANDOFF_LABEL = "Open latest handoff";
 export const CHIME_MUTED_LABEL = "Peer-health chime is muted";
 export const CHIME_AUDIBLE_LABEL = "Peer-health chime is audible";
 

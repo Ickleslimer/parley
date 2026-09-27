@@ -21,7 +21,7 @@ export const ILLUSTRATIONS = {
     path: new URL("../assets/illustrations/codex-robot.webp", import.meta.url).href,
     mediaType: "image/webp",
     byteLength: 59_010,
-    sha256: "0333bdde09628fa41a57edb2b68ba1dddb74d5f6d18844c4ebbbba3d6e9453095",
+    sha256: "0333bdde09628fa41a57edb2b68ba1dddb74d5f6d18844c4ebbba3d6e9453095",
   },
   grok: {
     role: "grok",

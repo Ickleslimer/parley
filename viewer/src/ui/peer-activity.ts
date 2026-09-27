@@ -8,7 +8,7 @@ import type {
 import { el, setText } from "./dom";
 import { formatCount, formatTimestamp } from "./format";
 
-export const PEER_ACTIVITY_TITLE = "Pending Handoffs and Peer Activity";
+export const PEER_ACTIVITY_TITLE = "Pending handoffs and peer activity";
 export const PEER_ACTIVITY_CAPTION =
   "Read-only handoff evidence. Activity is not a failure verdict, silence grants no authority, and receipt confirms delivery only.";
 export const NO_HANDOFFS_LABEL = "No handoff evidence is available.";

@@ -12,7 +12,7 @@ const captureScript = readFileSync(
 
 describe("synthetic capture contract", () => {
   it("covers every frozen surface, state, viewport, tab, and text scale", () => {
-    expect(REQUIRED_FIXTURES).toHaveLength(15);
+    expect(REQUIRED_FIXTURES).toHaveLength(16);
     for (const fixture of REQUIRED_FIXTURES) {
       const query = [
         `view=${fixture.surface}`,

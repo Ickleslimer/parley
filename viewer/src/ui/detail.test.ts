@@ -25,6 +25,7 @@ import {
 import type { ViewerApi } from "../ipc";
 
 import { mountDetail } from "./detail";
+import { OPEN_LATEST_HANDOFF_LABEL } from "./peer-health";
 
 const HOSTILE = "<img src=x onerror=alert(1)>";
 
@@ -494,7 +495,9 @@ describe("conversation studio detail", () => {
     await settle();
     expect(harness.calls.chime).toBe(1);
 
-    root.querySelector<HTMLButtonElement>('button[aria-label="Open Latest Handoff"]')?.click();
+    root
+      .querySelector<HTMLButtonElement>(`button[aria-label="${OPEN_LATEST_HANDOFF_LABEL}"]`)
+      ?.click();
     await settle();
     expect(harness.calls.open).toBe(1);
     expect(eventTab?.getAttribute("aria-selected")).toBe("true");

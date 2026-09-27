@@ -40,5 +40,6 @@ export const REQUIRED_FIXTURES: readonly FixtureRequest[] = [
   { surface: "detail", scenario: "search-results", width: 1120, height: 760, textScale: 1, reducedMotion: false, inspectorTab: "sources" },
   { surface: "detail", scenario: "empty", width: 1120, height: 760, textScale: 1, reducedMotion: false, inspectorTab: "settings" },
   { surface: "detail", scenario: "source-error", width: 840, height: 560, textScale: 1, reducedMotion: false, inspectorTab: "event" },
-  { surface: "detail", scenario: "maximum-exchange", width: 1120, height: 760, textScale: 2, reducedMotion: true, inspectorTab: "event" },
+  { surface: "detail", scenario: "maximum-exchange", width: 1120, height: 760, textScale: 1, reducedMotion: true, inspectorTab: "event" },
+  { surface: "detail", scenario: "maximum-exchange", width: 1120, height: 760, textScale: 2, reducedMotion: false, inspectorTab: "event" },
 ] as const;

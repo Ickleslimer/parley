@@ -51,7 +51,8 @@ $fixtures = @(
     @{ File = "detail-sources-search-1120x760.png"; Query = "view=detail&fixture=search-results&tab=sources"; Width = 1120; Height = 760 },
     @{ File = "detail-settings-empty-1120x760.png"; Query = "view=detail&fixture=empty&tab=settings"; Width = 1120; Height = 760 },
     @{ File = "detail-error-840x560.png"; Query = "view=detail&fixture=source-error&tab=event"; Width = 840; Height = 560 },
-    @{ File = "detail-reduced-motion-1120x760.png"; Query = "view=detail&fixture=maximum-exchange&tab=event&text-scale=2"; Width = 1120; Height = 760; ReducedMotion = $true }
+    @{ File = "detail-reduced-motion-1120x760.png"; Query = "view=detail&fixture=maximum-exchange&tab=event"; Width = 1120; Height = 760; ReducedMotion = $true },
+    @{ File = "detail-text-scale-200-1120x760.png"; Query = "view=detail&fixture=maximum-exchange&tab=event&text-scale=2"; Width = 1120; Height = 760 }
 )
 
 try {
