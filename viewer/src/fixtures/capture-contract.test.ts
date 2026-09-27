@@ -12,13 +12,15 @@ const captureScript = readFileSync(
 
 describe("synthetic capture contract", () => {
   it("covers every frozen surface, state, viewport, tab, and text scale", () => {
-    expect(REQUIRED_FIXTURES).toHaveLength(16);
+    expect(REQUIRED_FIXTURES).toHaveLength(25);
     for (const fixture of REQUIRED_FIXTURES) {
       const query = [
         `view=${fixture.surface}`,
         `fixture=${fixture.scenario}`,
         fixture.inspectorTab ? `tab=${fixture.inspectorTab}` : null,
         fixture.textScale === 2 ? "text-scale=2" : null,
+        fixture.surface === "widget-surface" ? `fixture-width=${fixture.width}` : null,
+        fixture.surface === "widget-surface" ? `fixture-height=${fixture.height}` : null,
       ]
         .filter((part): part is string => part !== null)
         .join("&");

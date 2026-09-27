@@ -28,6 +28,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_viewer_status,
             commands::get_widget_snapshot,
+            commands::get_widget_browser,
+            commands::widget_browse_older,
+            commands::widget_browse_newer,
+            commands::widget_browse_live,
+            commands::open_widget_exchange,
             commands::list_sessions,
             commands::list_exchanges,
             commands::search_events,

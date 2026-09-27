@@ -301,6 +301,10 @@
   box-shadow: none;
 }
 
+.widget-surface-frame > .widget-column > .widget-source {
+  display: none;
+}
+
 .widget-surface-shell.is-historical .widget-column {
   border-top: 4px solid var(--line);
 }
@@ -312,18 +316,20 @@
 }
 
 .widget-surface-controls {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.35rem;
-  padding: 0.4rem 0.55rem 0.55rem;
+  padding: 0.25rem 0.55rem;
 }
 
 .widget-surface-button {
-  flex: 1 0 auto;
-  min-width: var(--target-min);
+  min-width: 0;
   min-height: var(--target-min);
   padding: 0.35rem 0.6rem;
-  white-space: nowrap;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .widget-surface-button.is-latched {

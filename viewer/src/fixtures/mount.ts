@@ -47,6 +47,12 @@ export function mountSyntheticFixture(
     : "short-exchange";
   const params = new URLSearchParams(window.location.search);
   const fixture = createSyntheticFixture(scenario);
+  const fixtureWidth = positiveFixtureDimension(params.get("fixture-width"));
+  const fixtureHeight = positiveFixtureDimension(params.get("fixture-height"));
+  if (fixtureWidth && fixtureHeight) {
+    root.style.width = `${fixtureWidth}px`;
+    root.style.height = `${fixtureHeight}px`;
+  }
   document.title = `Synthetic ${surface} fixture`;
   document.documentElement.dataset.syntheticFixture = scenario;
   document.documentElement.classList.toggle("fixture-missing-images", scenario === "missing-image");
@@ -75,6 +81,14 @@ export function mountSyntheticFixture(
       }
     });
   }
+}
+
+function positiveFixtureDimension(value: string | null): number | null {
+  if (!value || !/^\d+$/.test(value)) {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return parsed >= 1 && parsed <= 4_096 ? parsed : null;
 }
 
 async function prepareDetailFixture(

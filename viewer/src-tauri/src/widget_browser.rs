@@ -1,16 +1,26 @@
 use std::sync::{Mutex, MutexGuard};
 
+use serde::Serialize;
+
 use crate::event_engine::{
     EventEngine, WidgetBrowserSnapshot, WidgetExchange, WidgetSelectionState, WidgetSnapshot,
 };
 
+#[derive(Debug)]
 pub struct WidgetBrowser {
     inner: Mutex<BrowserState>,
 }
 
+#[derive(Debug)]
 struct BrowserState {
     follow_live: bool,
     anchor: Option<ExchangeAnchor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WidgetOpenSelection {
+    pub event_key: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +92,35 @@ impl WidgetBrowser {
         state.follow_live = true;
         let exchanges = engine.widget_exchanges();
         project(&mut state, &exchanges)
+    }
+
+    pub fn displayed_event(&self, engine: &EventEngine) -> Result<WidgetOpenSelection, String> {
+        let state = self.lock();
+        let exchanges = engine.widget_exchanges();
+        let resolved = if state.anchor.is_some() {
+            resolve(false, state.anchor.as_ref(), &exchanges)
+        } else {
+            resolve(state.follow_live, None, &exchanges)
+        };
+        let index = match resolved {
+            Resolved::Selected(index) => index,
+            Resolved::Empty => return Err("no widget exchange is available to open".to_string()),
+            Resolved::Missing => {
+                return Err("the displayed widget exchange is no longer available".to_string())
+            }
+            Resolved::Ambiguous => {
+                return Err("the displayed widget exchange is ambiguous".to_string())
+            }
+        };
+        let exchange = &exchanges[index].summary;
+        let event = exchange
+            .completion
+            .as_ref()
+            .or(exchange.request.as_ref())
+            .ok_or_else(|| "the displayed widget exchange contains no event".to_string())?;
+        Ok(WidgetOpenSelection {
+            event_key: event.event_key.clone(),
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, BrowserState> {
@@ -600,6 +639,39 @@ mod tests {
         );
         assert!(snapshot.widget.pending_label.is_none());
         assert_ne!(snapshot.widget.exchange_id.as_deref(), Some("ex-later"));
+    }
+
+    #[test]
+    fn open_uses_the_last_rendered_anchor_until_the_next_snapshot() {
+        let log = TempLog::new("open-rendered");
+        let engine = load(
+            &log,
+            &[
+                request("req-old", "ex-old", "older task", 10),
+                response("res-old", "ex-old", "older reply", 11),
+            ],
+        );
+        let browser = WidgetBrowser::new();
+        let rendered = browser.snapshot(&engine);
+        assert_eq!(rendered.widget.exchange_id.as_deref(), Some("ex-old"));
+        assert_eq!(
+            browser.displayed_event(&engine).unwrap().event_key,
+            rendered.widget.completion.as_ref().unwrap().event_key
+        );
+
+        log.append_line(&request("req-new", "ex-new", "newest task", 20));
+        assert!(engine.poll());
+        assert_eq!(
+            browser.displayed_event(&engine).unwrap().event_key,
+            rendered.widget.completion.as_ref().unwrap().event_key
+        );
+
+        let refreshed = browser.snapshot(&engine);
+        assert_eq!(refreshed.widget.exchange_id.as_deref(), Some("ex-new"));
+        assert_eq!(
+            browser.displayed_event(&engine).unwrap().event_key,
+            refreshed.widget.request.as_ref().unwrap().event_key
+        );
     }
 
     #[test]

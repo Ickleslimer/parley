@@ -73,6 +73,16 @@ export function mountWidget(root: HTMLElement, api: ViewerApi): { stop: () => vo
   let pendingSignature: string | null = null;
   let failedSignature: string | null = null;
   let failureCount = 0;
+  let reportEpoch = 0;
+  let previousDesktopRuntimeState: ViewerStatus["desktopRuntimeState"] | null = null;
+
+  const resetBoundsRetry = (): void => {
+    reportEpoch += 1;
+    acceptedSignature = null;
+    pendingSignature = null;
+    failedSignature = null;
+    failureCount = 0;
+  };
 
   const reportBounds = (): void => {
     if (!alive) {
@@ -102,9 +112,10 @@ export function mountWidget(root: HTMLElement, api: ViewerApi): { stop: () => vo
       failureCount = 0;
     }
     pendingSignature = signature;
+    const epoch = reportEpoch;
     void api.reportWidgetSurfaceBounds(report).then(
       () => {
-        if (!alive || pendingSignature !== signature) {
+        if (!alive || epoch !== reportEpoch || pendingSignature !== signature) {
           return;
         }
         acceptedSignature = signature;
@@ -113,7 +124,7 @@ export function mountWidget(root: HTMLElement, api: ViewerApi): { stop: () => vo
         failureCount = 0;
       },
       () => {
-        if (!alive || pendingSignature !== signature) {
+        if (!alive || epoch !== reportEpoch || pendingSignature !== signature) {
           return;
         }
         pendingSignature = null;
@@ -138,6 +149,13 @@ export function mountWidget(root: HTMLElement, api: ViewerApi): { stop: () => vo
       if (!alive) {
         return;
       }
+      if (
+        previousDesktopRuntimeState === "passive-fallback" &&
+        nextStatus.desktopRuntimeState === "interactive-starting"
+      ) {
+        resetBoundsRetry();
+      }
+      previousDesktopRuntimeState = nextStatus.desktopRuntimeState;
       status = nextStatus;
       snapshot = nextSnapshot;
       error = null;
@@ -157,10 +175,20 @@ export function mountWidget(root: HTMLElement, api: ViewerApi): { stop: () => vo
   paint();
   poller.start();
   window.addEventListener("resize", onResize);
+  const observedColumn = root.querySelector<HTMLElement>(`#${LANDMARKS.widgetColumn}`);
+  const resizeObserver =
+    observedColumn && typeof ResizeObserver === "function"
+      ? new ResizeObserver(() => reportBounds())
+      : null;
+  if (observedColumn) {
+    resizeObserver?.observe(observedColumn);
+  }
 
   const stop = (): void => {
     alive = false;
+    reportEpoch += 1;
     poller.stop();
+    resizeObserver?.disconnect();
     window.removeEventListener("resize", onResize);
     window.removeEventListener("pagehide", stop);
   };

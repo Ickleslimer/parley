@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Runtime, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Runtime, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::event_engine::{EventContent, ExchangePage, SearchPage, SessionPage, WidgetSnapshot};
+use crate::event_engine::{
+    EventContent, ExchangePage, SearchPage, SessionPage, WidgetBrowserSnapshot, WidgetSnapshot,
+};
+use crate::interactive_surface;
 use crate::lifecycle;
 use crate::peer_activity::{self, PeerActivitySnapshot};
 use crate::peer_health::{self, HandoffSelection, PeerHealthSnapshot};
@@ -18,6 +21,65 @@ pub fn get_viewer_status(state: State<'_, AppState>) -> ViewerStatus {
 #[tauri::command]
 pub fn get_widget_snapshot(state: State<'_, AppState>) -> WidgetSnapshot {
     state.engine.widget_snapshot()
+}
+
+#[tauri::command]
+pub fn get_widget_browser<R: Runtime>(
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<WidgetBrowserSnapshot, String> {
+    require_widget_surface(&window)?;
+    Ok(state.widget_browser.snapshot(&state.engine))
+}
+
+#[tauri::command]
+pub fn widget_browse_older<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<WidgetBrowserSnapshot, String> {
+    require_widget_surface(&window)?;
+    let snapshot = state.widget_browser.older(&state.engine);
+    record_surface_focus(&app, &state, "older", false);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn widget_browse_newer<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<WidgetBrowserSnapshot, String> {
+    require_widget_surface(&window)?;
+    let snapshot = state.widget_browser.newer(&state.engine);
+    record_surface_focus(&app, &state, "newer", false);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn widget_browse_live<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<WidgetBrowserSnapshot, String> {
+    require_widget_surface(&window)?;
+    let snapshot = state.widget_browser.live(&state.engine);
+    record_surface_focus(&app, &state, "live", false);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn open_widget_exchange<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    require_widget_surface(&window)?;
+    let selection = state.widget_browser.displayed_event(&state.engine)?;
+    lifecycle::show_detail(&app)?;
+    record_surface_focus(&app, &state, "open-transcript", true);
+    app.emit_to(lifecycle::DETAIL_LABEL, "widget-open-exchange", selection)
+        .map_err(|error| format!("failed to select the widget exchange in detail: {error}"))
 }
 
 #[tauri::command]
@@ -227,4 +289,24 @@ pub fn show_detail<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 #[tauri::command]
 pub fn exit_app<R: Runtime>(app: AppHandle<R>) {
     lifecycle::exit_app(&app);
+}
+
+fn require_widget_surface<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String> {
+    if window.label() == interactive_surface::SURFACE_LABEL {
+        Ok(())
+    } else {
+        Err("only the widget surface may browse desktop exchanges".to_string())
+    }
+}
+
+fn record_surface_focus<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &State<'_, AppState>,
+    action: &str,
+    intentional_focus: bool,
+) {
+    if let Err(error) = interactive_surface::record_focus_diagnostic(app, action, intentional_focus)
+    {
+        state.set_runtime_error(error);
+    }
 }

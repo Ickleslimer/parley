@@ -6,6 +6,23 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const tauriEvents = vi.hoisted(() => {
+  const handlers = new Map<string, (event: { payload: unknown }) => void>();
+  return {
+    handlers,
+    listen: vi.fn(
+      async (name: string, handler: (event: { payload: unknown }) => void): Promise<() => void> => {
+        handlers.set(name, handler);
+        return () => {
+          handlers.delete(name);
+        };
+      },
+    ),
+  };
+});
+
+vi.mock("@tauri-apps/api/event", () => ({ listen: tauriEvents.listen }));
+
 import {
   DEFAULT_PEER_HEALTH_DIAGNOSTICS,
   DEFAULT_SETTINGS,
@@ -232,13 +249,14 @@ function sessions(): SessionSummary[] {
 }
 
 function content(eventKey: string): EventContent {
+  const secondSession = eventKey.includes("session-2");
   return {
     eventKey,
-    exchangeKey: "exchange:1",
-    sessionKey: "session:1",
+    exchangeKey: secondSession ? "exchange:2" : "exchange:1",
+    sessionKey: secondSession ? "session:2" : "session:1",
     eventId: eventKey,
-    exchangeId: "exchange-1",
-    sessionId: "alpha",
+    exchangeId: secondSession ? "exchange-2" : "exchange-1",
+    sessionId: secondSession ? "beta" : "alpha",
     sourcePath: "synthetic://events.jsonl",
     eventType: eventKey.includes("completion") ? "response" : "request",
     speaker: eventKey.includes("completion") ? "grok" : "codex",
@@ -247,7 +265,11 @@ function content(eventKey: string): EventContent {
     status: "ok",
     durationMs: 12,
     error: null,
-    content: eventKey.includes("completion") ? "Exact completion body" : `Exact request ${HOSTILE}`,
+    content: eventKey.includes("completion")
+      ? secondSession
+        ? "Exact second-session completion body"
+        : "Exact completion body"
+      : `Exact request ${HOSTILE}`,
     context: null,
   };
 }
@@ -314,9 +336,34 @@ function createApi(statusOverrides: Partial<ViewerStatus> = {}) {
     },
     listSessions: async () => ({ items: sessions(), nextCursor: null, total: 2 }),
     listExchanges: async (sessionKey) => ({
-      items: sessionKey === "session:1" ? [exchange({ sessionKey })] : [],
+      items:
+        sessionKey === "session:1"
+          ? [exchange({ sessionKey })]
+          : sessionKey === "session:2"
+            ? [
+                exchange({
+                  exchangeKey: "exchange:2",
+                  sessionKey,
+                  exchangeId: "exchange-2",
+                  sessionId: "beta",
+                  request: preview({
+                    eventKey: "event:session-2-request",
+                    eventId: "session-2-request",
+                    excerpt: "Second-session request",
+                  }),
+                  completion: preview({
+                    eventKey: "event:session-2-completion",
+                    eventId: "session-2-completion",
+                    eventType: "response",
+                    speaker: "grok",
+                    recipient: "codex",
+                    excerpt: "Second-session completion",
+                  }),
+                }),
+              ]
+            : [],
       nextCursor: null,
-      total: sessionKey === "session:1" ? 1 : 0,
+      total: sessionKey === "session:1" || sessionKey === "session:2" ? 1 : 0,
     }),
     search: async () => ({
       items: [
@@ -425,8 +472,46 @@ describe("conversation studio detail", () => {
   afterEach(() => {
     stop?.();
     stop = null;
+    tauriEvents.handlers.clear();
+    tauriEvents.listen.mockClear();
+    Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
     document.body.replaceChildren();
     vi.useRealTimers();
+  });
+
+  it("opens the exact widget event in the Event inspector and adopts its exchange", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    const harness = createApi();
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, harness.api).stop;
+    await settle();
+    await Promise.resolve();
+
+    const handler = tauriEvents.handlers.get("widget-open-exchange");
+    expect(handler).toBeDefined();
+    handler?.({ payload: { eventKey: "event:session-2-completion" } });
+    await settle();
+    await Promise.resolve();
+
+    expect(harness.calls.content.at(-1)).toBe("event:session-2-completion");
+    expect(
+      root.querySelector('[data-session-key="session:2"]')?.getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(
+      root
+        .querySelector('[data-event-key="event:session-2-completion"]')
+        ?.getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(root.querySelector('[data-region="studio-tab-event"]')?.getAttribute("aria-selected"))
+      .toBe("true");
+    expect(root.querySelector(".event-body")?.textContent).toContain(
+      "Exact second-session completion body",
+    );
   });
 
   it("keeps hostile session text escaped and moves the session rail by keyboard", async () => {

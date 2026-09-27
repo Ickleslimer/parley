@@ -9,6 +9,7 @@ use crate::event_engine::{Diagnostics, EngineStatus, EventEngine, SourceState, S
 use crate::settings::{
     save_settings, validate_source_path, Corner, DesktopMode, SettingsFile, ViewerSettings,
 };
+use crate::widget_browser::WidgetBrowser;
 
 const MAX_ATTACH_ATTEMPTS: u8 = 6;
 const ATTACH_RETRY_MS: u64 = 1_000;
@@ -187,6 +188,7 @@ pub struct InteractiveSnapshot {
 #[derive(Debug)]
 pub struct AppState {
     pub engine: EventEngine,
+    pub widget_browser: WidgetBrowser,
     settings: Mutex<SettingsFile>,
     settings_path: PathBuf,
     runtime: Mutex<RuntimeFlags>,
@@ -198,6 +200,7 @@ impl AppState {
     pub fn new(settings_path: PathBuf, settings: SettingsFile) -> Self {
         Self {
             engine: EventEngine::new(),
+            widget_browser: WidgetBrowser::new(),
             settings: Mutex::new(settings),
             settings_path,
             runtime: Mutex::new(RuntimeFlags::default()),

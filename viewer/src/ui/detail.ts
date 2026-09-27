@@ -704,7 +704,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     }
   };
 
-  const loadEvent = async (eventKey: string): Promise<void> => {
+  const loadEvent = async (eventKey: string): Promise<EventContent | null> => {
     state.selectedEventKey = eventKey;
     state.eventLoading = true;
     state.eventError = null;
@@ -714,20 +714,43 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     try {
       const content = await api.getEventContent(eventKey);
       if (!alive || state.selectedEventKey !== eventKey) {
-        return;
+        return null;
       }
       state.event = content;
       state.eventLoading = false;
       state.eventError = content ? null : "Event content is unavailable";
+      paintEvent();
+      return content;
     } catch {
       if (!alive || state.selectedEventKey !== eventKey) {
-        return;
+        return null;
       }
       state.event = null;
       state.eventLoading = false;
       state.eventError = loadErrorLabel("load event content");
     }
     paintEvent();
+    return null;
+  };
+
+  const openWidgetEvent = async (eventKey: string): Promise<void> => {
+    const content = await loadEvent(eventKey);
+    if (!alive || !content || state.selectedEventKey !== eventKey) {
+      return;
+    }
+    const needsExchangeLoad =
+      !isSearchActive(state.search.query) &&
+      (state.selectedSessionKey !== content.sessionKey ||
+        !state.exchanges.some((item) => item.exchangeKey === content.exchangeKey));
+    state.selectedSessionKey = content.sessionKey;
+    state.selectedExchangeKey = content.exchangeKey;
+    if (needsExchangeLoad) {
+      state.exchangePaging = resetPaging();
+      await loadExchanges();
+    }
+    if (alive && state.selectedEventKey === eventKey) {
+      paint();
+    }
   };
 
   const selectSession = async (sessionKey: string): Promise<void> => {
@@ -1109,12 +1132,24 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   });
 
   let unlistenHandoff: UnlistenFn | null = null;
+  let unlistenWidgetOpen: UnlistenFn | null = null;
   if ("__TAURI_INTERNALS__" in window) {
     void listen("peer-health-open-handoff", () => {
       void openLatestHandoff();
     }).then((unlisten) => {
       if (alive) {
         unlistenHandoff = unlisten;
+      } else {
+        unlisten();
+      }
+    });
+    void listen<{ eventKey: string }>("widget-open-exchange", (event) => {
+      if (typeof event.payload.eventKey === "string" && event.payload.eventKey.length > 0) {
+        void openWidgetEvent(event.payload.eventKey);
+      }
+    }).then((unlisten) => {
+      if (alive) {
+        unlistenWidgetOpen = unlisten;
       } else {
         unlisten();
       }
@@ -1173,6 +1208,8 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     alive = false;
     unlistenHandoff?.();
     unlistenHandoff = null;
+    unlistenWidgetOpen?.();
+    unlistenWidgetOpen = null;
     poller.stop();
     healthPoller.stop();
     activityPoller.stop();

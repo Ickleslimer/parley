@@ -798,7 +798,7 @@ fn compare_newest_first(left: (u64, usize, &str), right: (u64, usize, &str)) -> 
         .0
         .cmp(&left.0)
         .then_with(|| left.1.cmp(&right.1))
-        .then_with(|| left.2.cmp(&right.2))
+        .then_with(|| left.2.cmp(right.2))
 }
 
 fn empty_exchange_page() -> ExchangePage {

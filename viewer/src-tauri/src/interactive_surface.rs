@@ -14,7 +14,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, GWL_EXSTYLE,
     GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WINDOWPOS,
-    WM_MOUSEACTIVATE, WM_WINDOWPOSCHANGING, WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW,
+    WM_MOUSEACTIVATE, WM_WINDOWPOSCHANGING, WNDPROC, WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -571,7 +571,13 @@ unsafe extern "system" fn surface_window_proc(
     if original == 0 {
         DefWindowProcW(window, message, wparam, lparam)
     } else {
-        CallWindowProcW(mem::transmute(original), window, message, wparam, lparam)
+        CallWindowProcW(
+            mem::transmute::<isize, WNDPROC>(original),
+            window,
+            message,
+            wparam,
+            lparam,
+        )
     }
 }
 

@@ -103,6 +103,7 @@ afterEach(() => {
   document.body.replaceChildren();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("widget scene", () => {
@@ -376,7 +377,15 @@ describe("widget scene contract", () => {
     expect(compact?.[1]).not.toMatch(/font-size/);
     expect(css).toMatch(/prefers-reduced-motion:\s*reduce[\s\S]*animation:\s*none/);
     expect(css).toMatch(
-      /\.widget-surface-button\s*\{[^}]*min-width:\s*var\(--target-min\);[^}]*min-height:\s*var\(--target-min\)/,
+      /\.widget-surface-button\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*var\(--target-min\)/,
+    );
+    expect(css).toMatch(
+      /\.widget-surface-controls\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/,
+    );
+    expect((176 - 2 * 8.8 - 5.6) / 2).toBeGreaterThanOrEqual(44);
+    expect(css).toMatch(/\.widget-surface-button\s*\{[^}]*white-space:\s*normal/);
+    expect(css).toMatch(
+      /\.widget-surface-frame\s*>\s*\.widget-column\s*>\s*\.widget-source\s*\{[^}]*display:\s*none/,
     );
     expect(css).toMatch(/\.widget-surface-shell[\s\S]*user-select:\s*none/);
     expect(css).not.toMatch(/topmost|click-through|infinite/i);
@@ -494,6 +503,90 @@ describe("underlay interactive handshake", () => {
     window.dispatchEvent(new Event("resize"));
     expect(reportWidgetSurfaceBounds).toHaveBeenCalledTimes(2);
     expect(reportWidgetSurfaceBounds.mock.calls[1]?.[0]).toMatchObject({ width: 120 });
+    handle.stop();
+  });
+
+  it("reports column layout changes observed without a window resize", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    setViewport(560, 360, 1);
+    const box = { left: 20, top: 8, width: 200, height: 140 };
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    const disconnect = vi.fn();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          resizeCallbacks.push(callback);
+        }
+
+        observe(): void {}
+        unobserve(): void {}
+        disconnect = disconnect;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this.id === LANDMARKS.widgetColumn
+        ? new DOMRect(box.left, box.top, box.width, box.height)
+        : new DOMRect();
+    });
+    const current = status({ desktopRuntimeState: "passive" });
+    const reportWidgetSurfaceBounds = vi.fn(
+      async (_report: WidgetSurfaceBoundsReport) => current,
+    );
+    const root = document.createElement("div");
+    document.body.append(root);
+    const handle = mountWidget(root, {
+      getStatus: async () => current,
+      getWidgetSnapshot: async () => snapshot(),
+      reportWidgetSurfaceBounds,
+    } as unknown as ViewerApi);
+    await vi.waitFor(() => expect(reportWidgetSurfaceBounds).toHaveBeenCalledTimes(1));
+
+    box.width = 240;
+    expect(resizeCallbacks).toHaveLength(1);
+    resizeCallbacks[0]?.([], {} as ResizeObserver);
+    await Promise.resolve();
+    expect(reportWidgetSurfaceBounds).toHaveBeenCalledTimes(2);
+    expect(reportWidgetSurfaceBounds.mock.calls[1]?.[0]).toMatchObject({ width: 240 });
+
+    handle.stop();
+    expect(disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries unchanged geometry after an explicit fallback recovery", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    setViewport(560, 360, 1);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this.id === LANDMARKS.widgetColumn
+        ? new DOMRect(20, 8, 200, 140)
+        : new DOMRect();
+    });
+    const current = status({
+      desktopRuntimeState: "passive-fallback",
+      desktopFallbackReason: "surface-z-order-invalid",
+    });
+    const reportWidgetSurfaceBounds = vi.fn(async (_report: WidgetSurfaceBoundsReport) => {
+      throw new Error("rejected");
+    });
+    const root = document.createElement("div");
+    document.body.append(root);
+    const handle = mountWidget(root, {
+      getStatus: async () => current,
+      getWidgetSnapshot: async () => snapshot(),
+      reportWidgetSurfaceBounds,
+    } as unknown as ViewerApi);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(reportWidgetSurfaceBounds).toHaveBeenCalledTimes(3);
+
+    current.desktopRuntimeState = "interactive-starting";
+    current.desktopFallbackReason = null;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(reportWidgetSurfaceBounds).toHaveBeenCalledTimes(4);
+    expect(reportWidgetSurfaceBounds.mock.calls[3]?.[0]).toMatchObject({ width: 200, height: 140 });
     handle.stop();
   });
 
