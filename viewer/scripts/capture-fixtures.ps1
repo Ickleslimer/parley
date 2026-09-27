@@ -13,8 +13,8 @@ if (-not $edge) {
     throw "Microsoft Edge was not found"
 }
 $node = (Get-Command node.exe -ErrorAction Stop).Source
-$vite = Join-Path $viewerRoot "node_modules\vite\bin\vite.js"
-if (-not (Test-Path -LiteralPath $vite)) {
+$serverScript = Join-Path $viewerRoot "scripts\fixture-server.mjs"
+if (-not (Test-Path -LiteralPath (Join-Path $viewerRoot "node_modules\vite"))) {
     throw "Run npm ci before capturing fixtures"
 }
 $output = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
@@ -23,10 +23,13 @@ $output = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
     Join-Path $viewerRoot $OutputDirectory
 }
 New-Item -ItemType Directory -Path $output -Force | Out-Null
+$resolvedOutput = [System.IO.Path]::GetFullPath($output)
+$edgeProfile = Join-Path $resolvedOutput "edge-profile"
+New-Item -ItemType Directory -Path $edgeProfile -Force | Out-Null
 $serverOut = Join-Path $output "vite.stdout.log"
 $serverErr = Join-Path $output "vite.stderr.log"
 $server = Start-Process -FilePath $node `
-    -ArgumentList @($vite, "--host", "127.0.0.1", "--port", "1420", "--strictPort") `
+    -ArgumentList @($serverScript) `
     -WorkingDirectory $viewerRoot `
     -WindowStyle Hidden `
     -RedirectStandardOutput $serverOut `
@@ -75,8 +78,14 @@ try {
         $arguments = @(
             "--headless=new",
             "--disable-gpu",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-extensions",
             "--hide-scrollbars",
+            "--no-first-run",
+            "--no-proxy-server",
             "--run-all-compositor-stages-before-draw",
+            "--user-data-dir=$edgeProfile",
             "--virtual-time-budget=3000",
             "--window-size=$($fixture.Width),$($fixture.Height)",
             "--screenshot=$path"
@@ -97,7 +106,18 @@ try {
     $manifest | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $output "manifest.json") -Encoding utf8
 } finally {
     if (-not $server.HasExited) {
-        Stop-Process -Id $server.Id -Force
-        $server.WaitForExit()
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:1420/__fixture_shutdown" -TimeoutSec 2 | Out-Null
+        } catch {
+        }
+        if (-not $server.WaitForExit(5000)) {
+            Stop-Process -Id $server.Id -Force
+            $server.WaitForExit()
+        }
+    }
+    $resolvedProfile = [System.IO.Path]::GetFullPath($edgeProfile)
+    if ($resolvedProfile.StartsWith($resolvedOutput + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $resolvedProfile)) {
+        Remove-Item -LiteralPath $resolvedProfile -Recurse -Force
     }
 }
