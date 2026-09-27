@@ -1238,7 +1238,7 @@ function renderSourceList(
     });
     remove.disabled = busy;
     remove.addEventListener("click", () => onRemove(source.path));
-    const alias = source.aliasOf ? " \u00b7 duplicate alias ignored" : "";
+    const alias = source.aliasOf ? "; duplicate alias ignored" : "";
     const item = el("li", {
       className: "studio-source-record",
       attrs: { "data-source-path": source.path },
@@ -1246,7 +1246,7 @@ function renderSourceList(
         el("p", { className: "studio-source-path", text: source.path }),
         el("p", {
           className: "studio-session-meta",
-          text: `${formatSourceState(source.sourceState)} \u00b7 ${source.sessionCount} sessions \u00b7 ${source.exchangeCount} exchanges${alias}`,
+          text: `${formatSourceState(source.sourceState)}. ${source.sessionCount} sessions; ${source.exchangeCount} exchanges${alias}`,
         }),
         el("p", { className: "studio-diagnostics", text: formatDiagnostics(source.diagnostics) }),
         remove,

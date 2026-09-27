@@ -93,13 +93,13 @@ export function formatDiagnostics(diagnostics: Diagnostics): string {
   if (diagnostics.lastError) {
     parts.push(`last error: ${diagnostics.lastError}`);
   }
-  return parts.join(" \u00b7 ");
+  return parts.join("; ");
 }
 
 export function formatSourceLine(status: ViewerStatus): string {
   const base = formatSourceState(status.sourceState);
-  const sources = ` \u00b7 ${formatCount(status.sources.length, "source")}`;
-  const counts = ` \u00b7 ${formatCount(status.sessionCount, "session")} \u00b7 ${formatCount(status.exchangeCount, "exchange")}`;
+  const sources = `. ${formatCount(status.sources.length, "source")}`;
+  const counts = `; ${formatCount(status.sessionCount, "session")}; ${formatCount(status.exchangeCount, "exchange")}`;
   return `${base}${sources}${counts}`;
 }
 
@@ -107,7 +107,7 @@ export function formatRuntimeHealth(status: ViewerStatus): string {
   const tray = status.trayAvailable ? "Tray available" : "Tray unavailable";
   const underlay = `Underlay ${formatUnderlayState(status.underlayState)}`;
   const widget = status.widgetVisible ? "Widget visible" : "Widget hidden";
-  return `${tray} \u00b7 ${underlay} \u00b7 ${widget}`;
+  return `${tray}. ${underlay}; ${widget}`;
 }
 
 export function idleWidgetLabel(state: SourceState | null): string {

@@ -164,19 +164,19 @@ export function silenceNoteForSnapshot(snapshot: PeerHealthSnapshot): string | n
 export function closedClassLabel(closedClass: ClosedClass): string {
   switch (closedClass) {
     case "usage_sample":
-      return "usage_sample \u00b7 Usage sample";
+      return "usage_sample: Usage sample";
     case "quota_exhausted":
-      return "quota_exhausted \u00b7 Quota exhausted";
+      return "quota_exhausted: Quota exhausted";
     case "capacity_throttle":
-      return "capacity_throttle \u00b7 Capacity throttle";
+      return "capacity_throttle: Capacity throttle";
     case "turn_error":
-      return "turn_error \u00b7 Turn error";
+      return "turn_error: Turn error";
     case "watchdog_killed":
-      return "watchdog_killed \u00b7 Watchdog killed";
+      return "watchdog_killed: Watchdog killed";
     case "mcp_stdout_undelivered":
-      return "mcp_stdout_undelivered \u00b7 MCP stdout undelivered";
+      return "mcp_stdout_undelivered: MCP stdout undelivered";
     case "handoff_unacknowledged":
-      return "handoff_unacknowledged \u00b7 Explicit handoff alert awaiting Codex receipt";
+      return "handoff_unacknowledged: Explicit handoff alert awaiting Codex receipt";
   }
 }
 
@@ -221,7 +221,7 @@ export function presentedHandoffLabel(
   if (semantics && !parts.includes(semantics)) {
     parts.push(semantics);
   }
-  return parts.join(" \u00b7 ");
+  return parts.join("; ");
 }
 
 export function applyOpenHandoff(
@@ -274,7 +274,7 @@ export function formatCodexSample(sample: CodexSample | null): string {
     parts.push(`rate limit ${sample.rateLimitReachedType}`);
   }
   parts.push(`as of ${formatTimestamp(sample.asOfMs)}`);
-  return parts.join(" \u00b7 ");
+  return parts.join("; ");
 }
 
 export function formatGrokObservation(observation: GrokObservation | null): string {
@@ -293,7 +293,7 @@ export function formatGrokObservation(observation: GrokObservation | null): stri
     parts.push(`code ${observation.providerCode}`);
   }
   parts.push(`as of ${formatTimestamp(observation.asOfMs)}`);
-  return parts.join(" \u00b7 ");
+  return parts.join("; ");
 }
 
 export function formatPeerHealthDiagnostics(diagnostics: PeerHealthDiagnostics): string {
@@ -325,7 +325,7 @@ export function formatPeerHealthDiagnostics(diagnostics: PeerHealthDiagnostics):
       `last Codex sample failure ${formatTimestamp(diagnostics.lastCodexSampleFailureMs)}`,
     );
   }
-  return parts.join(" \u00b7 ");
+  return parts.join("; ");
 }
 
 export function presentPeerIncident(incident: PeerIncident, busy: boolean): PresentedPeerIncident {
@@ -344,10 +344,10 @@ export function presentPeerIncident(incident: PeerIncident, busy: boolean): Pres
     ...ids,
   ]
     .filter((part): part is string => part != null)
-    .join(" \u00b7 ");
+    .join("; ");
   return {
     incidentId: incident.incidentId,
-    title: `${incident.class} \u00b7 ${incident.source} \u00b7 ${incident.status}`,
+    title: `${incident.class}: ${incident.source}; ${incident.status}`,
     meta,
     class: incident.class,
     source: incident.source,
@@ -413,7 +413,7 @@ export function presentPeerHealth(state: PeerHealthUiState): PresentedPeerHealth
       `Generated ${formatTimestamp(snapshot.generatedMs)}`,
       `As of ${snapshot.asOfMs == null ? "unknown" : formatTimestamp(snapshot.asOfMs)}`,
       `schema ${Math.trunc(snapshot.schemaVersion)}`,
-    ].join(" \u00b7 "),
+    ].join("; "),
     codexLabel: formatCodexSample(snapshot.latestCodexSample),
     grokLabel: formatGrokObservation(snapshot.latestGrokObservation),
     diagnosticsLabel: formatPeerHealthDiagnostics(snapshot.diagnostics),
@@ -669,5 +669,5 @@ function noticeLabel(handoffLabel: string | null, chimeStatus: string | null | u
   const parts = [emptyToNull(handoffLabel), emptyToNull(chimeStatus)].filter(
     (part): part is string => part != null,
   );
-  return parts.length === 0 ? null : parts.join(" \u00b7 ");
+  return parts.length === 0 ? null : parts.join("; ");
 }

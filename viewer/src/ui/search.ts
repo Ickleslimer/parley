@@ -76,7 +76,7 @@ export function searchPhaseLabel(phase: SearchPhase, total: number): string {
 export function searchSummary(state: SearchViewState): string {
   const phase = searchPhase(state);
   if (phase === "ready") {
-    return `${searchPhaseLabel(phase, state.total)} \u00b7 ${pageRangeLabel(state.paging)}`;
+    return `${searchPhaseLabel(phase, state.total)}; ${pageRangeLabel(state.paging)}`;
   }
   return searchPhaseLabel(phase, state.total);
 }

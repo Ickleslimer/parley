@@ -81,12 +81,12 @@ export function presentPeerActivity(state: PeerActivityUiState): PresentedPeerAc
   const availability = snapshot.unavailable
     ? `Handoff evidence unavailable (${snapshot.unavailable}).`
     : `Handoff evidence loaded from ${source}.`;
-  const truncation = snapshot.truncated ? " \u00b7 newest bounded page" : "";
+  const truncation = snapshot.truncated ? "; newest bounded page" : "";
   return {
     title: PEER_ACTIVITY_TITLE,
     caption: PEER_ACTIVITY_CAPTION,
     availability,
-    summary: `${formatCount(snapshot.shownCount, "shown handoff")} of ${formatCount(snapshot.totalCount, "recorded handoff")} \u00b7 assessment ${snapshot.assessment} \u00b7 generated ${formatTimestamp(snapshot.generatedMs)}${truncation}`,
+    summary: `${formatCount(snapshot.shownCount, "shown handoff")} of ${formatCount(snapshot.totalCount, "recorded handoff")}; assessment ${snapshot.assessment}; generated ${formatTimestamp(snapshot.generatedMs)}${truncation}`,
     diagnostics: formatActivityDiagnostics(snapshot.diagnostics),
     error: state.error,
     empty: snapshot.handoffs.length === 0 ? NO_HANDOFFS_LABEL : null,
@@ -123,8 +123,8 @@ export function presentHandoff(handoff: PeerHandoffItem, generatedMs: number): P
       handoff.targetSessionId ? `target session ${handoff.targetSessionId}` : null,
     ]
       .filter((value): value is string => value != null)
-      .join(" \u00b7 "),
-    lifecycle: `state ${state} \u00b7 phase ${phase} \u00b7 process ${process}`,
+      .join("; "),
+    lifecycle: `state ${state}; phase ${phase}; process ${process}`,
     timestamps: [
       handoff.createdAtMs == null ? null : `created ${formatTimestamp(handoff.createdAtMs)}`,
       handoff.updatedAtMs == null ? null : `updated ${formatTimestamp(handoff.updatedAtMs)}`,
@@ -132,7 +132,7 @@ export function presentHandoff(handoff: PeerHandoffItem, generatedMs: number): P
       handoff.deadlineMs == null ? null : `receipt deadline ${formatTimestamp(handoff.deadlineMs)}`,
     ]
       .filter((value): value is string => value != null)
-      .join(" \u00b7 "),
+      .join("; "),
     freshness: freshnessLabel(generatedMs, handoff.lastActivityMs),
     receipt:
       handoff.receiptAtMs == null
@@ -160,7 +160,7 @@ export function freshnessLabel(generatedMs: number, lastActivityMs: number | nul
     return "No activity timestamp recorded; no peer state is inferred.";
   }
   const age = Math.max(0, Math.trunc(generatedMs - lastActivityMs));
-  return `Last sanitized activity ${formatTimestamp(lastActivityMs)} \u00b7 ${age} ms before this snapshot.`;
+  return `Last sanitized activity ${formatTimestamp(lastActivityMs)}; ${age} ms before this snapshot.`;
 }
 
 export function formatActivityDiagnostics(diagnostics: PeerActivityDiagnostics): string {
@@ -183,16 +183,16 @@ export function formatActivityDiagnostics(diagnostics: PeerActivityDiagnostics):
     `missing reports ${count(diagnostics.reportMissing)}`,
     `locked reports ${count(diagnostics.reportLocked)}`,
     `malformed reports ${count(diagnostics.reportMalformed)}`,
-  ].join(" \u00b7 ");
+  ].join("; ");
 }
 
 function presentActivityEvent(activity: PeerActivityEvent): PresentedActivityEvent {
   const details = [activity.toolName ? `tool ${activity.toolName}` : null, activity.status]
     .filter((value): value is string => value != null)
-    .join(" \u00b7 ");
+    .join("; ");
   return {
     label: activity.class,
-    meta: `${formatTimestamp(activity.timestampMs)}${details ? ` \u00b7 ${details}` : ""}`,
+    meta: `${formatTimestamp(activity.timestampMs)}${details ? `; ${details}` : ""}`,
   };
 }
 

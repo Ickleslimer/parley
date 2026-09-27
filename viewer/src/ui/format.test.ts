@@ -84,7 +84,7 @@ describe("formatting", () => {
     expect(formatDuration(null)).toBe("No duration");
     expect(formatDuration(9)).toBe("9 ms");
     expect(formatDiagnostics(diagnostics({ malformedLines: 2, lastError: "disk" }))).toBe(
-      "malformed 2 \u00b7 oversized 0 \u00b7 unsupported 0 \u00b7 duplicates 0 \u00b7 I/O 0 \u00b7 aliases 0 \u00b7 last error: disk",
+      "malformed 2; oversized 0; unsupported 0; duplicates 0; I/O 0; aliases 0; last error: disk",
     );
   });
 
@@ -93,12 +93,12 @@ describe("formatting", () => {
     expect(formatSourceLine(watching)).toContain("1 source");
     expect(formatSourceLine(watching)).toContain("2 sessions");
     expect(formatRuntimeHealth(watching)).toBe(
-      "Tray available \u00b7 Underlay attached \u00b7 Widget visible",
+      "Tray available. Underlay attached; Widget visible",
     );
     expect(
       formatRuntimeHealth(
         status({ trayAvailable: false, underlayState: "degraded", widgetVisible: false }),
       ),
-    ).toBe("Tray unavailable \u00b7 Underlay degraded \u00b7 Widget hidden");
+    ).toBe("Tray unavailable. Underlay degraded; Widget hidden");
   });
 });

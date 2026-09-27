@@ -389,7 +389,7 @@ describe("peer health actions", () => {
       error: null,
       loading: false,
       busy: false,
-      handoffLabel: "Latest preceding Grok reply \u00b7 " + QUOTA_HANDOFF_LABEL,
+      handoffLabel: "Latest preceding Grok reply; " + QUOTA_HANDOFF_LABEL,
     });
     expect(view.activeIncidents[0]?.handoffHint).toBe(QUOTA_HANDOFF_LABEL);
     expect(view.recentIncidents[0]?.handoffHint).toBe(EXACT_PRESERVED_RESPONSE_LABEL);

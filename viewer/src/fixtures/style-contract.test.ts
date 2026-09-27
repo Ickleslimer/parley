@@ -7,9 +7,14 @@ const stylesDirectory = fileURLToPath(new URL("../styles", import.meta.url));
 const illustrationDirectory = fileURLToPath(
   new URL("../assets/illustrations", import.meta.url),
 );
+const uiDirectory = fileURLToPath(new URL("../ui", import.meta.url));
 const styles = readdirSync(stylesDirectory)
   .filter((name) => name.endsWith(".css"))
   .map((name) => readFileSync(`${stylesDirectory}/${name}`, "utf8"))
+  .join("\n");
+const productionUi = readdirSync(uiDirectory)
+  .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts"))
+  .map((name) => readFileSync(`${uiDirectory}/${name}`, "utf8"))
   .join("\n");
 
 describe("Two Chairs style contract", () => {
@@ -33,6 +38,12 @@ describe("Two Chairs style contract", () => {
     expect(styles).not.toMatch(/animation(?:-iteration-count)?\s*:[^;]*(?:infinite|Infinity)/i);
     expect(styles).not.toMatch(/text-transform\s*:\s*uppercase/i);
     expect(styles).toContain("@media (prefers-reduced-motion: reduce)");
+  });
+
+  it("keeps literal production labels in sentence case", () => {
+    expect(productionUi).not.toMatch(
+      /(?:text|placeholder|"aria-label"):\s*"(?=[^"]{3,}")[A-Z][A-Z0-9 /_-]*"/,
+    );
   });
 
   it("keeps the shipped illustration payload below 650 KiB", () => {
