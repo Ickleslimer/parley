@@ -50,7 +50,7 @@ impl Default for ViewerSettings {
             selected_log: None,
             selected_logs: Vec::new(),
             monitor_id: None,
-            corner: Corner::BottomRight,
+            corner: Corner::TopRight,
             offset_x: 24.0,
             offset_y: 24.0,
             width: DEFAULT_WIDTH,
@@ -303,6 +303,38 @@ mod tests {
         assert_eq!(settings.offset_y, 24.0);
         assert_eq!(settings.width, MIN_WIDTH);
         assert_eq!(settings.height, MAX_DIMENSION);
+    }
+
+    #[test]
+    fn missing_settings_use_the_top_right_fresh_install_default() {
+        let path = temp_settings_path();
+        let settings = load_settings(&path).expect("missing settings should use defaults");
+
+        assert_eq!(settings.viewer.corner, Corner::TopRight);
+        assert_eq!(settings.viewer.offset_x, 24.0);
+        assert_eq!(settings.viewer.offset_y, 24.0);
+        assert_eq!(settings.viewer.width, DEFAULT_WIDTH);
+        assert_eq!(settings.viewer.height, DEFAULT_HEIGHT);
+    }
+
+    #[test]
+    fn preserves_an_explicit_bottom_right_choice() {
+        let settings = serde_json::from_str::<SettingsFile>(
+            r#"{
+                "settingsVersion": 1,
+                "corner": "bottom-right",
+                "offsetX": 24.0,
+                "offsetY": 24.0,
+                "width": 560.0,
+                "height": 360.0,
+                "launchAtLogin": false
+            }"#,
+        )
+        .expect("explicit settings should parse")
+        .sanitized();
+
+        assert_eq!(settings.settings_version, CURRENT_SETTINGS_VERSION);
+        assert_eq!(settings.viewer.corner, Corner::BottomRight);
     }
 
     #[test]

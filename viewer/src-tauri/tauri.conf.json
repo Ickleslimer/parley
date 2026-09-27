@@ -30,7 +30,7 @@
         "alwaysOnTop": false,
         "skipTaskbar": true,
         "visible": false,
-        "backgroundColor": "#11141c"
+        "backgroundColor": "#2c2428"
       },
       {
         "label": "detail",
@@ -46,7 +46,7 @@
         "resizable": true,
         "alwaysOnTop": false,
         "visible": false,
-        "backgroundColor": "#11141c"
+        "backgroundColor": "#2c2428"
       }
     ]
   },

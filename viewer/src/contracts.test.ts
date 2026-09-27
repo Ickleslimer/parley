@@ -10,9 +10,9 @@ import {
 } from "./contracts";
 
 describe("default widget settings", () => {
-  it("uses the accepted bottom-right geometry", () => {
+  it("uses the accepted top-right fresh-install geometry", () => {
     expect(DEFAULT_SETTINGS).toMatchObject({
-      corner: "bottom-right",
+      corner: "top-right",
       offsetX: 24,
       offsetY: 24,
       width: 560,

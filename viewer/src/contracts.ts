@@ -170,7 +170,7 @@ export const DEFAULT_SETTINGS: ViewerSettings = {
   selectedLog: null,
   selectedLogs: [],
   monitorId: null,
-  corner: "bottom-right",
+  corner: "top-right",
   offsetX: 24,
   offsetY: 24,
   width: 560,
