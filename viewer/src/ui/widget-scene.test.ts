@@ -249,7 +249,8 @@ describe("widget scene", () => {
       expect(root.querySelector(".widget-excerpt")?.textContent).toBe("Ship the engine");
     });
     const excerpt = root.querySelector(".widget-excerpt");
-    const messages = root.querySelector(".widget-messages");
+    const messages = root.querySelector<HTMLElement>(".widget-messages");
+    expect(messages?.dataset.bubbleCount).toBe("2");
     currentStatus.sessionCount = 3;
     await vi.advanceTimersByTimeAsync(500);
     await vi.waitFor(() => {

@@ -58,7 +58,7 @@ export function mountSyntheticFixture(
     mountWidget(root, fixture.api);
   } else {
     mountDetail(root, fixture.api);
-    queueMicrotask(() => activateInspectorTab(params.get("tab")));
+    void prepareDetailFixture(root, scenario, params.get("tab"));
   }
   if (scenario === "missing-image") {
     queueMicrotask(() => {
@@ -67,6 +67,43 @@ export function mountSyntheticFixture(
       }
     });
   }
+}
+
+async function prepareDetailFixture(
+  root: HTMLElement,
+  scenario: FixtureScenario,
+  tab: string | null,
+): Promise<void> {
+  if (scenario !== "empty" && scenario !== "source-error") {
+    const session = await waitForElement<HTMLElement>(root, "[data-session-key]");
+    session?.click();
+    if (scenario === "search-results") {
+      const input = await waitForElement<HTMLInputElement>(root, 'input[type="search"]');
+      if (input) {
+        input.value = "synthetic evidence";
+        input.form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+        await waitForElement(root, '[role="option"][data-event-key]');
+      }
+    } else {
+      const message = await waitForElement<HTMLButtonElement>(root, ".studio-message");
+      message?.click();
+    }
+  }
+  activateInspectorTab(tab);
+}
+
+async function waitForElement<T extends Element>(
+  root: ParentNode,
+  selector: string,
+): Promise<T | null> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const element = root.querySelector<T>(selector);
+    if (element) {
+      return element;
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 25));
+  }
+  return null;
 }
 
 function activateInspectorTab(value: string | null): void {

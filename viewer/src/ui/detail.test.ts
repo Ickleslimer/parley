@@ -257,6 +257,11 @@ function createApi() {
     open: 0,
     exit: 0,
     content: [] as string[],
+    selectLog: 0,
+    removeLog: [] as string[],
+    widgetVisible: [] as boolean[],
+    launchAtLogin: [] as boolean[],
+    savedSettings: [] as ViewerSettings[],
   };
   let bytesRead = 100;
   let currentHealth = health(1);
@@ -317,15 +322,30 @@ function createApi() {
     },
     getPeerActivity: async () => activity(),
     getSettings: async () => ({ ...DEFAULT_SETTINGS }),
-    saveSettings: async (settings) => settings,
+    saveSettings: async (settings) => {
+      calls.savedSettings.push(settings);
+      return settings;
+    },
     listMonitors: async () => [{ id: "monitor-1", name: "Main", primary: true }],
-    selectEventLog: async () => status(),
+    selectEventLog: async () => {
+      calls.selectLog += 1;
+      return status();
+    },
     setEventLog: async () => status(),
     setEventLogs: async () => status(),
     addEventLog: async () => status(),
-    removeEventLog: async () => status(),
-    setWidgetVisible: async () => status(),
-    setLaunchAtLogin: async (enabled) => ({ ...DEFAULT_SETTINGS, launchAtLogin: enabled }) satisfies ViewerSettings,
+    removeEventLog: async (path) => {
+      calls.removeLog.push(path);
+      return status();
+    },
+    setWidgetVisible: async (visible) => {
+      calls.widgetVisible.push(visible);
+      return status({ widgetVisible: visible });
+    },
+    setLaunchAtLogin: async (enabled) => {
+      calls.launchAtLogin.push(enabled);
+      return { ...DEFAULT_SETTINGS, launchAtLogin: enabled } satisfies ViewerSettings;
+    },
     showDetail: async () => undefined,
     exit: async () => {
       calls.exit += 1;
@@ -488,6 +508,58 @@ describe("conversation studio detail", () => {
     await settle();
     expect(harness.calls.exit).toBe(1);
   });
+
+  it("keeps source, placement, visibility, and autostart controls connected", async () => {
+    vi.useFakeTimers();
+    const harness = createApi();
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, harness.api).stop;
+    await settle();
+
+    root.querySelector<HTMLButtonElement>('[data-region="studio-tab-sources"]')?.click();
+    const sourcePanel = root.querySelector<HTMLElement>('[role="tabpanel"]:not([hidden])');
+    sourcePanel?.querySelector<HTMLButtonElement>(".studio-action")?.click();
+    await settle();
+    expect(harness.calls.selectLog).toBe(1);
+
+    root.querySelector<HTMLButtonElement>('[data-region="studio-tab-sources"]')?.click();
+    root.querySelector<HTMLButtonElement>(".studio-source-remove")?.click();
+    await settle();
+    expect(harness.calls.removeLog).toEqual(["synthetic://events.jsonl"]);
+
+    root.querySelector<HTMLButtonElement>('[data-region="studio-tab-settings"]')?.click();
+    const corner = root.querySelector<HTMLSelectElement>("#corner");
+    const horizontal = root.querySelector<HTMLInputElement>("#offset-x");
+    const vertical = root.querySelector<HTMLInputElement>("#offset-y");
+    const width = root.querySelector<HTMLInputElement>("#width");
+    const height = root.querySelector<HTMLInputElement>("#height");
+    corner!.value = "top-left";
+    horizontal!.value = "30";
+    vertical!.value = "32";
+    width!.value = "600";
+    height!.value = "380";
+    horizontal!.dispatchEvent(new Event("input", { bubbles: true }));
+    horizontal!.form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await settle();
+    expect(harness.calls.savedSettings.at(-1)).toMatchObject({
+      corner: "top-left",
+      offsetX: 30,
+      offsetY: 32,
+      width: 600,
+      height: 380,
+    });
+
+    const widgetVisible = root.querySelector<HTMLInputElement>("#widget-visible");
+    widgetVisible!.checked = false;
+    widgetVisible!.dispatchEvent(new Event("change", { bubbles: true }));
+    const launchAtLogin = root.querySelector<HTMLInputElement>("#launch-at-login");
+    launchAtLogin!.checked = true;
+    launchAtLogin!.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    expect(harness.calls.widgetVisible).toEqual([false]);
+    expect(harness.calls.launchAtLogin).toEqual([true]);
+  });
 });
 
 describe("studio presentation contract", () => {
@@ -506,7 +578,7 @@ describe("studio presentation contract", () => {
     expect(css).toContain("outline: 3px solid var(--focus-on-paper)");
     expect(css).toContain("min-height: var(--target-min)");
     expect(css).toContain("font-family: var(--exact-font)");
-    expect(css).toContain("@media (max-width: 900px)");
+    expect(css).toContain("@container (max-width: 53em)");
     expect(css).toContain("grid-column: 1 / -1");
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
     expect(css).not.toMatch(/infinite/i);

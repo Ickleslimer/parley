@@ -104,6 +104,7 @@ function syncBubbles(
   codex: HTMLImageElement,
   grok: HTMLImageElement,
 ): void {
+  container.dataset.bubbleCount = String(bubbles.length);
   const previous = new Map<string, HTMLElement>();
   for (const child of Array.from(container.children)) {
     if (child instanceof HTMLElement && child.dataset.bubbleKey) {

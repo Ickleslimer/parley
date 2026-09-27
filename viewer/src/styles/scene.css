@@ -98,6 +98,11 @@
   min-height: 0;
 }
 
+.widget-messages[data-bubble-count="2"] .widget-excerpt {
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
 .widget-banner,
 .widget-load-error,
 .widget-idle,
@@ -171,6 +176,7 @@
 }
 
 .widget-slip {
+  flex-shrink: 0;
   border-radius: var(--radius-paper);
   background: var(--paper-raised);
   color: var(--ink);
@@ -242,8 +248,26 @@
   }
 
   .widget-excerpt {
-    -webkit-line-clamp: 3;
-    line-clamp: 3;
+    -webkit-line-clamp: 1;
+    line-clamp: 1;
+  }
+
+  .widget-heading,
+  .widget-time,
+  .widget-extracted {
+    display: none;
+  }
+
+  .widget-live {
+    padding: 0.35rem 0.4rem 0.2rem;
+  }
+
+  .widget-messages {
+    gap: 0.25rem;
+  }
+
+  .widget-slip {
+    padding: 0.25rem 0.4rem;
   }
 }
 
