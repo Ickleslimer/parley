@@ -262,6 +262,24 @@ impl WidgetSnapshot {
             pending_label: None,
         }
     }
+
+    pub(crate) fn from_exchange(summary: &ExchangeSummary) -> Self {
+        Self {
+            session_key: Some(summary.session_key.clone()),
+            exchange_key: Some(summary.exchange_key.clone()),
+            session_id: Some(summary.session_id.clone()),
+            exchange_id: Some(summary.exchange_id.clone()),
+            request: summary.request.clone(),
+            completion: summary.completion.clone(),
+            pending_label: summary.pending_label.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidgetExchange {
+    pub source_identity: String,
+    pub summary: ExchangeSummary,
 }
 
 pub(crate) fn clamp_page_limit(limit: usize) -> usize {

@@ -200,6 +200,13 @@ impl Store {
             .collect()
     }
 
+    pub(crate) fn all_exchanges(&self, keys: KeyContext<'_>) -> Vec<ExchangeSummary> {
+        self.exchanges
+            .values()
+            .map(|exchange| self.exchange_summary(exchange, keys))
+            .collect()
+    }
+
     pub(crate) fn all_search_hits(&self, query: &str, keys: KeyContext<'_>) -> Vec<SearchHit> {
         let query = query.trim();
         if query.is_empty() {

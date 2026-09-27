@@ -9,6 +9,7 @@ mod peer_activity;
 mod peer_health;
 mod runtime;
 mod settings;
+mod widget_browser;
 
 pub fn run() {
     tauri::Builder::default()

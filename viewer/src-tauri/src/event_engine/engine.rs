@@ -11,7 +11,8 @@ use super::source::{
 use super::store::{page, Store};
 use super::types::{
     Diagnostics, EngineStatus, EventContent, ExchangePage, ExchangeSummary, IdMatch, SearchHit,
-    SearchPage, SessionPage, SessionSummary, SourceState, SourceStatus, WidgetSnapshot,
+    SearchPage, SessionPage, SessionSummary, SourceState, SourceStatus, WidgetExchange,
+    WidgetSnapshot,
 };
 
 #[derive(Debug)]
@@ -180,6 +181,10 @@ impl EventEngine {
 
     pub fn widget_snapshot(&self) -> WidgetSnapshot {
         self.lock().widget_snapshot()
+    }
+
+    pub fn widget_exchanges(&self) -> Vec<WidgetExchange> {
+        self.lock().widget_exchanges()
     }
 }
 
@@ -661,24 +666,33 @@ impl Inner {
             }
         }
         ranked.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.2.cmp(&right.2))
+            compare_newest_first((left.0, left.1, &left.2), (right.0, right.1, &right.2))
         });
         let Some(summary) = ranked.into_iter().next().map(|item| item.3) else {
             return WidgetSnapshot::empty();
         };
-        WidgetSnapshot {
-            session_key: Some(summary.session_key),
-            exchange_key: Some(summary.exchange_key),
-            session_id: Some(summary.session_id),
-            exchange_id: Some(summary.exchange_id),
-            request: summary.request,
-            completion: summary.completion,
-            pending_label: summary.pending_label,
+        WidgetSnapshot::from_exchange(&summary)
+    }
+
+    fn widget_exchanges(&self) -> Vec<WidgetExchange> {
+        let mut ranked: Vec<(u64, usize, String, WidgetExchange)> = Vec::new();
+        for (order, source) in self.unique_sources_enumerated() {
+            for summary in source.store.all_exchanges(source.keys()) {
+                ranked.push((
+                    summary.timestamp_ms,
+                    order,
+                    summary.exchange_key.clone(),
+                    WidgetExchange {
+                        source_identity: source.identity.clone(),
+                        summary,
+                    },
+                ));
+            }
         }
+        ranked.sort_by(|left, right| {
+            compare_newest_first((left.0, left.1, &left.2), (right.0, right.1, &right.2))
+        });
+        ranked.into_iter().map(|item| item.3).collect()
     }
 
     fn source_for_key(&self, source_id: &str, generation: u64) -> Option<(usize, &WatchedSource)> {
@@ -777,6 +791,14 @@ fn aggregate_state(states: &[SourceState]) -> SourceState {
     } else {
         SourceState::None
     }
+}
+
+fn compare_newest_first(left: (u64, usize, &str), right: (u64, usize, &str)) -> std::cmp::Ordering {
+    right
+        .0
+        .cmp(&left.0)
+        .then_with(|| left.1.cmp(&right.1))
+        .then_with(|| left.2.cmp(&right.2))
 }
 
 fn empty_exchange_page() -> ExchangePage {

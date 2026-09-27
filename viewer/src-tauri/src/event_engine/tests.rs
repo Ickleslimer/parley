@@ -1069,6 +1069,63 @@ fn extracts_matching_context_marker_and_keeps_context_off_the_widget() {
     assert!(encoded.get("context").is_none());
 }
 
+#[test]
+fn widget_exchanges_follow_global_newest_source_then_key_order() {
+    let older = TempLog::new("browser-order-a");
+    let newer_same_ts = TempLog::new("browser-order-b");
+    write_lines(
+        &older,
+        &[
+            event_line(
+                "request",
+                "a-old",
+                "ex-a-old",
+                Some("session-a"),
+                Some("old"),
+                10,
+            ),
+            event_line(
+                "request",
+                "a-new",
+                "ex-a-new",
+                Some("session-a"),
+                Some("new"),
+                30,
+            ),
+        ],
+    );
+    write_lines(
+        &newer_same_ts,
+        &[
+            event_line("request", "b-z", "ex-b-z", Some("session-b"), Some("z"), 30),
+            event_line("request", "b-m", "ex-b-m", Some("session-b"), Some("m"), 30),
+        ],
+    );
+    let engine = EventEngine::new();
+    engine
+        .set_sources(vec![
+            older.path().to_path_buf(),
+            newer_same_ts.path().to_path_buf(),
+        ])
+        .unwrap();
+    engine.poll();
+
+    let ids = engine
+        .widget_exchanges()
+        .into_iter()
+        .map(|exchange| exchange.summary.exchange_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![
+            "ex-a-new".to_string(),
+            "ex-b-m".to_string(),
+            "ex-b-z".to_string(),
+            "ex-a-old".to_string()
+        ]
+    );
+}
+
 fn session_key_for(page: &SessionPage, path: &Path) -> String {
     let path = path.to_string_lossy();
     page.items
