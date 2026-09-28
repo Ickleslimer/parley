@@ -208,6 +208,30 @@ describe("widget feed", () => {
     mounted.stop();
   });
 
+  it("replaces a disjoint newest page while actively following live", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const pages = [
+      feedPage({ token: "history-a", items: [exchange(1, { requestBody: "alpha" })] }),
+      feedPage({ token: "history-a", items: [exchange(21, { requestBody: "beta" })] }),
+    ];
+    let index = 0;
+    const mounted = mountFeed({
+      getWidgetFeed: async () => pages[Math.min(index++, pages.length - 1)] ?? pages[0]!,
+    });
+    await vi.waitFor(() => {
+      expect(mounted.root.textContent).toContain("alpha");
+    });
+
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => {
+      expect(mounted.root.textContent).toContain("beta");
+    });
+    expect(mounted.root.textContent).not.toContain("alpha");
+    expect(mounted.root.textContent).not.toContain("History changed");
+    expect(button(mounted.root, LANDMARKS.widgetFeedLiveToggle).getAttribute("aria-pressed")).toBe("true");
+    mounted.stop();
+  });
+
   it("treats resetRequired as a closed history change", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const first = feedPage({ items: [exchange(1, { requestBody: "kept exact" })] });

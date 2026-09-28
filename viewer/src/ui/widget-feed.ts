@@ -134,7 +134,9 @@ export interface MountWidgetFeedOptions {
 }
 
 export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => void } {
-  const capturePresentation = readCapturePresentation();
+  const development =
+    (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV === true;
+  const capturePresentation = development ? readCapturePresentation() : null;
   const state: FeedState = {
     historyToken: null,
     exchanges: [],
@@ -760,6 +762,9 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
       }
     }
     if (state.exchanges.length > 0 && overlap < 0) {
+      if (state.followingLive) {
+        return replaceNewest(page) ? "applied" : "invalid";
+      }
       state.historyChanged = true;
       state.followingLive = false;
       return "rejected";

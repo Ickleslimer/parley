@@ -50,7 +50,7 @@ $fixtures = @(
     @{ File = "surface-unknown-agent-720x560.png"; Query = "view=widget-surface&fixture=unknown-agent"; Width = 720; Height = 560 },
     @{ File = "surface-empty-720x560.png"; Query = "view=widget-surface&fixture=empty"; Width = 720; Height = 560 },
     @{ File = "surface-missing-image-720x560.png"; Query = "view=widget-surface&fixture=missing-image"; Width = 720; Height = 560 },
-    @{ File = "surface-reduced-motion-720x560.png"; Query = "view=widget-surface&fixture=live"; Width = 720; Height = 560; ReducedMotion = $true },
+    @{ File = "surface-pending-reduced-motion-720x560.png"; Query = "view=widget-surface&fixture=pending"; Width = 720; Height = 560; ReducedMotion = $true },
     @{ File = "surface-text-scale-200-720x560.png"; Query = "view=widget-surface&fixture=live&text-scale=2"; Width = 720; Height = 560 },
     @{ File = "surface-minimum-480x420.png"; Query = "view=widget-surface&fixture=live"; Width = 480; Height = 420 },
     @{ File = "surface-large-960x720.png"; Query = "view=widget-surface&fixture=live"; Width = 960; Height = 720 },

@@ -60,6 +60,13 @@ struct InteractiveRuntimeDiagnostic<'a> {
     detail: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatchedSurfaceAction {
+    Continue,
+    Destroy,
+    ConfirmDestroyed,
+}
+
 pub struct TrayControls<R: Runtime> {
     widget_visible: CheckMenuItem<R>,
     launch_at_login: CheckMenuItem<R>,
@@ -841,8 +848,23 @@ fn drive_interactive<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
     }
 
     let interactive = state.interactive_snapshot();
-    if interactive.fallback_latched {
-        return;
+    match latched_surface_action(
+        interactive.fallback_latched,
+        app.get_webview_window(interactive_surface::SURFACE_LABEL)
+            .is_some(),
+    ) {
+        LatchedSurfaceAction::Continue => {}
+        LatchedSurfaceAction::Destroy => {
+            match interactive_surface::destroy_surface(app) {
+                Ok(()) => state.mark_surface_destroyed(),
+                Err(error) => state.set_runtime_error(error),
+            }
+            return;
+        }
+        LatchedSurfaceAction::ConfirmDestroyed => {
+            state.mark_surface_destroyed();
+            return;
+        }
     }
     let Some(bounds) = interactive.bounds else {
         return;
@@ -1469,6 +1491,14 @@ fn interactive_gate_open() -> bool {
     env_flag("PARLEY_VIEWER_INTERACTIVE_DESKTOP")
 }
 
+fn latched_surface_action(fallback_latched: bool, surface_exists: bool) -> LatchedSurfaceAction {
+    match (fallback_latched, surface_exists) {
+        (false, _) => LatchedSurfaceAction::Continue,
+        (true, true) => LatchedSurfaceAction::Destroy,
+        (true, false) => LatchedSurfaceAction::ConfirmDestroyed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1502,6 +1532,22 @@ mod tests {
         assert_eq!(
             value["detail"],
             "widget-surface document did not report readiness"
+        );
+    }
+
+    #[test]
+    fn latched_fallback_cleans_only_while_the_surface_exists() {
+        assert_eq!(
+            latched_surface_action(false, true),
+            LatchedSurfaceAction::Continue
+        );
+        assert_eq!(
+            latched_surface_action(true, true),
+            LatchedSurfaceAction::Destroy
+        );
+        assert_eq!(
+            latched_surface_action(true, false),
+            LatchedSurfaceAction::ConfirmDestroyed
         );
     }
 

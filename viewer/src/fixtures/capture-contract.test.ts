@@ -47,7 +47,7 @@ describe("synthetic capture contract", () => {
       "unknown-agent 720x560 scale=1 motion=false",
       "empty 720x560 scale=1 motion=false",
       "missing-image 720x560 scale=1 motion=false",
-      "live 720x560 scale=1 motion=true",
+      "pending 720x560 scale=1 motion=true",
       "live 720x560 scale=2 motion=false",
       "live 480x420 scale=1 motion=false",
       "live 960x720 scale=1 motion=false",

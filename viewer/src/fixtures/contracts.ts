@@ -45,7 +45,7 @@ export const REQUIRED_FIXTURES: readonly FixtureRequest[] = [
   { surface: "widget-surface", scenario: "unknown-agent", width: 720, height: 560, textScale: 1, reducedMotion: false },
   { surface: "widget-surface", scenario: "empty", width: 720, height: 560, textScale: 1, reducedMotion: false },
   { surface: "widget-surface", scenario: "missing-image", width: 720, height: 560, textScale: 1, reducedMotion: false },
-  { surface: "widget-surface", scenario: "live", width: 720, height: 560, textScale: 1, reducedMotion: true },
+  { surface: "widget-surface", scenario: "pending", width: 720, height: 560, textScale: 1, reducedMotion: true },
   { surface: "widget-surface", scenario: "live", width: 720, height: 560, textScale: 2, reducedMotion: false },
   { surface: "widget-surface", scenario: "live", width: 480, height: 420, textScale: 1, reducedMotion: false },
   { surface: "widget-surface", scenario: "live", width: 960, height: 720, textScale: 1, reducedMotion: false },
