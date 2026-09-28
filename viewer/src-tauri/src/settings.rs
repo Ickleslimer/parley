@@ -201,7 +201,6 @@ pub fn reconcile_autostart(
         return AutostartReconcile::KeepPreference;
     }
     match (saved_launch_at_login, registration_enabled) {
-        (true, Some(true)) => AutostartReconcile::KeepPreference,
         (true, _) => AutostartReconcile::EnableRegistration,
         (false, Some(true)) => AutostartReconcile::DisableRegistration,
         (false, _) => AutostartReconcile::KeepPreference,
@@ -227,6 +226,21 @@ pub fn load_settings(path: &Path) -> Result<SettingsFile, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(SettingsFile::default()),
         Err(error) => Err(format!("failed to read settings: {error}")),
     }
+}
+
+pub fn persist_migrated_settings(path: &Path, settings: &SettingsFile) -> Result<bool, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("failed to read settings for migration: {error}")),
+    };
+    let stored = serde_json::from_slice::<SettingsFile>(&bytes)
+        .map_err(|error| format!("failed to parse settings for migration: {error}"))?;
+    if stored == *settings {
+        return Ok(false);
+    }
+    save_settings(path, settings)?;
+    Ok(true)
 }
 
 pub fn save_settings(path: &Path, settings: &SettingsFile) -> Result<(), String> {
@@ -337,6 +351,48 @@ mod tests {
         assert_eq!(settings.viewer.height, DEFAULT_HEIGHT);
         assert_eq!(settings.viewer.desktop_mode, DesktopMode::Interactive);
         assert_eq!(settings.settings_version, CURRENT_SETTINGS_VERSION);
+        assert!(!persist_migrated_settings(&path, &settings)
+            .expect("missing settings should not need persistence"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn persists_loaded_legacy_migrations_atomically() {
+        let path = temp_settings_path();
+        fs::create_dir_all(path.parent().expect("temporary settings parent"))
+            .expect("temporary settings folder should be creatable");
+        fs::write(
+            &path,
+            r#"{
+                "selectedLog": "C:\\logs\\events.jsonl",
+                "corner": "top-right",
+                "offsetX": 24.0,
+                "offsetY": 24.0,
+                "width": 560.0,
+                "height": 360.0,
+                "launchAtLogin": true,
+                "autostartInitialized": true,
+                "settingsVersion": 1
+            }"#,
+        )
+        .expect("legacy settings should be writable");
+
+        let migrated = load_settings(&path).expect("legacy settings should migrate in memory");
+        assert!(persist_migrated_settings(&path, &migrated)
+            .expect("migration should persist atomically"));
+        let persisted = serde_json::from_slice::<SettingsFile>(
+            &fs::read(&path).expect("persisted settings should be readable"),
+        )
+        .expect("persisted settings should parse");
+
+        assert_eq!(persisted, migrated);
+        assert_eq!(persisted.settings_version, CURRENT_SETTINGS_VERSION);
+        assert_eq!(persisted.viewer.width, DEFAULT_WIDTH);
+        assert_eq!(persisted.viewer.height, DEFAULT_HEIGHT);
+        assert_eq!(persisted.viewer.corner, Corner::TopRight);
+        assert!(persisted.viewer.launch_at_login);
+        assert_eq!(persisted.viewer.desktop_mode, DesktopMode::Interactive);
+        fs::remove_dir_all(path.parent().unwrap()).expect("temp settings should be removable");
     }
 
     #[test]
@@ -586,7 +642,10 @@ mod tests {
         );
         assert_eq!(reconcile_autostart(false, false, None), KeepPreference);
 
-        assert_eq!(reconcile_autostart(true, true, Some(true)), KeepPreference);
+        assert_eq!(
+            reconcile_autostart(true, true, Some(true)),
+            EnableRegistration
+        );
         assert_eq!(
             reconcile_autostart(true, true, Some(false)),
             EnableRegistration

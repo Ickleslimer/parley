@@ -33,7 +33,8 @@ use crate::runtime::{
     WidgetSurfaceBoundsReport, WorkArea,
 };
 use crate::settings::{
-    load_settings, reconcile_autostart, AutostartReconcile, DesktopMode, SettingsFile,
+    load_settings, persist_migrated_settings, reconcile_autostart, AutostartReconcile, DesktopMode,
+    SettingsFile,
 };
 
 pub(crate) const WIDGET_LABEL: &str = "widget";
@@ -79,7 +80,10 @@ pub struct TrayControls<R: Runtime> {
 pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let settings_path = app.path().app_config_dir()?.join("settings.json");
     let (settings, settings_error) = match load_settings(&settings_path) {
-        Ok(settings) => (settings, None),
+        Ok(settings) => {
+            let migration_error = persist_migrated_settings(&settings_path, &settings).err();
+            (settings, migration_error)
+        }
         Err(error) => (SettingsFile::default(), Some(error)),
     };
     let (launch, launch_error) = match LaunchOptions::parse(env::args_os()) {
