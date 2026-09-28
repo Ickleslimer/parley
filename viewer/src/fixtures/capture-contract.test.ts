@@ -9,6 +9,10 @@ const captureScript = readFileSync(
   fileURLToPath(new URL("../../scripts/capture-fixtures.ps1", import.meta.url)),
   "utf8",
 );
+const fixtureMount = readFileSync(
+  fileURLToPath(new URL("./mount.ts", import.meta.url)),
+  "utf8",
+);
 
 describe("synthetic capture contract", () => {
   it("covers every frozen surface, state, viewport, tab, and text scale", () => {
@@ -59,6 +63,10 @@ describe("synthetic capture contract", () => {
     expect(captureScript).toContain("WaitForExit(5000)");
     expect(captureScript).toContain("-WindowStyle Hidden");
     expect(captureScript).not.toMatch(/WindowStyle\s+(?:Normal|Maximized|Minimized)/i);
+  });
+
+  it("keeps missing artwork absent after asynchronous fixture rendering", () => {
+    expect(fixtureMount).toContain(".fixture-missing-images img{display:none!important}");
   });
 });
 

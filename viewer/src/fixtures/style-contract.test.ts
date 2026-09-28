@@ -24,7 +24,10 @@ describe("Two Chairs style contract", () => {
   it("keeps every required text and focus pair above its deterministic threshold", () => {
     expect(contrast("#241c16", "#f3e6d0")).toBeGreaterThanOrEqual(4.5);
     expect(contrast("#5c5146", "#f3e6d0")).toBeGreaterThanOrEqual(4.5);
+    expect(contrast("#8a7865", "#f3e6d0")).toBeGreaterThanOrEqual(3);
+    expect(contrast("#8a7865", "#fff3df")).toBeGreaterThanOrEqual(3);
     expect(contrast("#234e86", "#f3e6d0")).toBeGreaterThanOrEqual(3);
+    expect(contrast("#8e4038", "#f3e6d0")).toBeGreaterThanOrEqual(3);
     expect(contrast("#f3e6d0", "#2c2428")).toBeGreaterThanOrEqual(3);
     expect(contrast("#4c3100", "#f0c983")).toBeGreaterThanOrEqual(4.5);
     expect(contrast("#521c17", "#e6aaa1")).toBeGreaterThanOrEqual(4.5);

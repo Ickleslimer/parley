@@ -64,7 +64,7 @@ export function mountSyntheticFixture(
   label.className = "synthetic-fixture-label";
   label.textContent = `Synthetic fixture: ${scenario}`;
   const style = document.createElement("style");
-  style.textContent = `.synthetic-fixture-label{position:fixed;z-index:9999;right:8px;bottom:8px;margin:0;padding:3px 6px;border:1px solid #241c16;background:#f3e6d0;color:#241c16;font:12px/1.2 sans-serif}`;
+  style.textContent = `.synthetic-fixture-label{position:fixed;z-index:9999;right:8px;bottom:8px;margin:0;padding:3px 6px;border:1px solid #241c16;background:#f3e6d0;color:#241c16;font:12px/1.2 sans-serif}.fixture-missing-images img{display:none!important}`;
   document.head.append(style);
   document.body.append(label);
   if (surface === "widget") {
