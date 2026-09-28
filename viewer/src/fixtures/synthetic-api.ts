@@ -10,6 +10,9 @@ import {
   type ViewerSettings,
   type ViewerStatus,
   type WidgetBrowserSnapshot,
+  type WidgetFeedExchange,
+  type WidgetFeedMessage,
+  type WidgetFeedPage,
   type WidgetSnapshot,
 } from "../contracts";
 import type { ViewerApi } from "../ipc";
@@ -188,6 +191,7 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
         },
       ]
     : [];
+  const feed = buildSyntheticFeed(scenario);
   const api: ViewerApi = {
     getStatus: async () => mutableStatus,
     getWidgetSnapshot: async () => widget,
@@ -196,16 +200,8 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
     widgetBrowseNewer: async () => api.getWidgetBrowser(),
     widgetBrowseLive: async () => api.getWidgetBrowser(),
     openWidgetExchange: async () => undefined,
-    getWidgetFeed: async () => ({
-      historyToken: "synthetic-history-v1",
-      items: [],
-      nextBeforeExchangeKey: null,
-      hasEarlier: false,
-      totalExchanges: 0,
-      totalEvents: 0,
-      resetRequired: false,
-    }),
-    getWidgetMessage: async () => null,
+    getWidgetFeed: async (beforeExchangeKey) => feed.page(beforeExchangeKey),
+    getWidgetMessage: async (eventKey) => feed.message(eventKey),
     openWidgetEvent: async () => undefined,
     reportWidgetSurfaceBounds: async () => mutableStatus,
     reportWidgetSurfaceActivity: async () => undefined,
@@ -446,4 +442,258 @@ function syntheticPeerActivity(): PeerActivitySnapshot {
       },
     ],
   };
+}
+
+const FEED_HISTORY = "synthetic-history-v1";
+
+function buildSyntheticFeed(scenario: FixtureScenario): {
+  page: (beforeExchangeKey: string | null) => WidgetFeedPage;
+  message: (eventKey: string) => WidgetFeedMessage | null;
+} {
+  const fullByKey = new Map<string, WidgetFeedMessage>();
+  const items = feedExchanges(scenario, fullByKey);
+  const eventCount = items.reduce(
+    (total, exchange) => total + (exchange.request ? 1 : 0) + (exchange.completion ? 1 : 0),
+    0,
+  );
+  return {
+    page(beforeExchangeKey) {
+      const visible = beforeExchangeKey ? [] : items;
+      return {
+        historyToken: FEED_HISTORY,
+        items: visible,
+        nextBeforeExchangeKey: null,
+        hasEarlier: false,
+        totalExchanges: items.length,
+        totalEvents: eventCount,
+        resetRequired: false,
+      };
+    },
+    message(eventKey) {
+      const full = fullByKey.get(eventKey);
+      return full ? { ...full } : null;
+    },
+  };
+}
+
+function feedExchanges(
+  scenario: FixtureScenario,
+  fullByKey: Map<string, WidgetFeedMessage>,
+): WidgetFeedExchange[] {
+  if (
+    scenario === "empty" ||
+    scenario === "idle" ||
+    scenario === "missing-selection" ||
+    scenario === "ambiguous" ||
+    scenario === "passive-fallback"
+  ) {
+    return [];
+  }
+  if (scenario === "live") {
+    return [
+      completedExchange(fullByKey, {
+        index: 1,
+        sessionKey: "session:synthetic-a",
+        request: "Check the new conversation studio against the frozen design contract.",
+        response: "The paper surfaces preserve exact content and the controls remain keyboard reachable.",
+        contextOmitted: true,
+        projection: "current-request",
+      }),
+      completedExchange(fullByKey, {
+        index: 2,
+        sessionKey: "session:synthetic-a",
+        request: "Keep the chronology global.",
+        response: "Session order stays quiet on the paper column.",
+      }),
+      completedExchange(fullByKey, {
+        index: 3,
+        sessionKey: "session:synthetic-b",
+        request: "Start the next conversation.",
+        response: "The divider stays free of paths and identifiers.",
+      }),
+    ];
+  }
+  if (scenario === "paused-unread" || scenario === "historical") {
+    return [
+      completedExchange(fullByKey, {
+        index: 1,
+        sessionKey: "session:synthetic-a",
+        request: "Review the earlier exchange.",
+        response: "The earlier exchange stays on the page.",
+      }),
+      completedExchange(fullByKey, {
+        index: 2,
+        sessionKey: "session:synthetic-b",
+        request: "Note the messages that arrived while paused.",
+        response: "Unread events stay counted until live resumes.",
+      }),
+    ];
+  }
+  if (scenario === "pending") {
+    return [
+      {
+        exchangeKey: "exchange:synthetic-pending",
+        sessionKey: "session:synthetic",
+        timestampMs: NOW,
+        request: feedMessage(fullByKey, {
+          eventKey: "event:request",
+          eventType: "request",
+          speaker: "codex",
+          recipient: "grok",
+          timestampMs: NOW,
+          status: "started",
+          full: "Check the new conversation studio against the frozen design contract.",
+        }),
+        completion: null,
+        pendingLabel: PENDING_LABEL,
+      },
+    ];
+  }
+  if (scenario === "error") {
+    return [
+      completedExchange(fullByKey, {
+        index: 1,
+        sessionKey: "session:synthetic",
+        request: "Check the new conversation studio against the frozen design contract.",
+        response: "Synthetic transport failure. No model speech was delivered.",
+        responseType: "error",
+        responseSpeaker: "codex",
+      }),
+    ];
+  }
+  if (scenario === "unknown-agent") {
+    return [
+      {
+        exchangeKey: "exchange:synthetic-unknown",
+        sessionKey: "session:synthetic",
+        timestampMs: NOW,
+        request: feedMessage(fullByKey, {
+          eventKey: "event:request",
+          eventType: "request",
+          speaker: "nova",
+          recipient: "codex",
+          timestampMs: NOW,
+          status: "ok",
+          full: "Can the two chairs make room for a visiting reviewer?",
+        }),
+        completion: null,
+        pendingLabel: null,
+      },
+    ];
+  }
+  if (scenario === "collapsed" || scenario === "expanded" || scenario === "maximum-exchange") {
+    return [
+      completedExchange(fullByKey, {
+        index: 1,
+        sessionKey: "session:synthetic",
+        request: "Review the assembled evidence without rewriting any exact record.",
+        response: `${"Exact synthetic record. ".repeat(250)}end`,
+        truncateResponse: true,
+      }),
+    ];
+  }
+  if (scenario === "reversed-route") {
+    return [
+      completedExchange(fullByKey, {
+        index: 1,
+        sessionKey: "session:synthetic",
+        request: "Check the new conversation studio against the frozen design contract.",
+        response: "The paper surfaces preserve exact content and the controls remain keyboard reachable.",
+        requestSpeaker: "grok",
+        responseSpeaker: "codex",
+        requestRecipient: "codex",
+        responseRecipient: "grok",
+      }),
+    ];
+  }
+  return [
+    completedExchange(fullByKey, {
+      index: 1,
+      sessionKey: "session:synthetic",
+      request: "Check the new conversation studio against the frozen design contract.",
+      response: "The paper surfaces preserve exact content and the controls remain keyboard reachable.",
+    }),
+  ];
+}
+
+function completedExchange(
+  fullByKey: Map<string, WidgetFeedMessage>,
+  input: {
+    index: number;
+    sessionKey: string;
+    request: string;
+    response: string;
+    requestSpeaker?: string;
+    responseSpeaker?: string;
+    requestRecipient?: string;
+    responseRecipient?: string;
+    responseType?: "response" | "error";
+    truncateResponse?: boolean;
+    contextOmitted?: boolean;
+    projection?: WidgetFeedMessage["projection"];
+  },
+): WidgetFeedExchange {
+  const requestSpeaker = input.requestSpeaker ?? "codex";
+  const responseSpeaker = input.responseSpeaker ?? (input.responseType === "error" ? "codex" : "grok");
+  return {
+    exchangeKey: `exchange:synthetic-${input.index}`,
+    sessionKey: input.sessionKey,
+    timestampMs: NOW + input.index * 1_000,
+    request: feedMessage(fullByKey, {
+      eventKey: `event:request-${input.index}`,
+      eventType: "request",
+      speaker: requestSpeaker,
+      recipient: input.requestRecipient ?? "grok",
+      timestampMs: NOW + input.index * 1_000,
+      status: "ok",
+      full: input.request,
+      projection: input.projection,
+      contextOmitted: input.contextOmitted,
+    }),
+    completion: feedMessage(fullByKey, {
+      eventKey: `event:completion-${input.index}`,
+      eventType: input.responseType ?? "response",
+      speaker: responseSpeaker,
+      recipient: input.responseRecipient ?? "codex",
+      timestampMs: NOW + input.index * 1_000 + 42_000,
+      status: input.responseType === "error" ? "failed" : "ok",
+      full: input.response,
+      truncate: input.truncateResponse,
+    }),
+    pendingLabel: null,
+  };
+}
+
+function feedMessage(
+  fullByKey: Map<string, WidgetFeedMessage>,
+  input: {
+    eventKey: string;
+    eventType: WidgetFeedMessage["eventType"];
+    speaker: string;
+    recipient: string;
+    timestampMs: number;
+    status: string;
+    full: string;
+    truncate?: boolean;
+    projection?: WidgetFeedMessage["projection"];
+    contextOmitted?: boolean;
+  },
+): WidgetFeedMessage {
+  const scalars = Array.from(input.full);
+  const truncated = input.truncate === true && scalars.length > 4_000;
+  const automatic: WidgetFeedMessage = {
+    eventKey: input.eventKey,
+    eventType: input.eventType,
+    speaker: input.speaker,
+    recipient: input.recipient,
+    timestampMs: input.timestampMs,
+    status: input.status,
+    body: truncated ? scalars.slice(0, 4_000).join("") : input.full,
+    fullCharacterLength: scalars.length,
+    truncated,
+    projection: input.projection ?? "exact",
+    contextOmitted: input.contextOmitted === true,
+  };
+  fullByKey.set(input.eventKey, { ...automatic, body: input.full, truncated: false });
+  return automatic;
 }

@@ -16,7 +16,11 @@ export type FixtureScenario =
   | "historical"
   | "missing-selection"
   | "ambiguous"
-  | "passive-fallback";
+  | "passive-fallback"
+  | "paused-unread"
+  | "collapsed"
+  | "expanded"
+  | "completion";
 
 export type FixtureInspectorTab = "event" | "activity" | "sources" | "settings";
 
@@ -40,15 +44,20 @@ export const REQUIRED_FIXTURES: readonly FixtureRequest[] = [
   { surface: "widget", scenario: "error", width: 560, height: 360, textScale: 1, reducedMotion: false },
   { surface: "widget", scenario: "idle", width: 560, height: 360, textScale: 1, reducedMotion: false },
   { surface: "widget", scenario: "missing-image", width: 560, height: 360, textScale: 1, reducedMotion: false },
-  { surface: "widget-surface", scenario: "live", width: 314, height: 348, textScale: 1, reducedMotion: false },
-  { surface: "widget-surface", scenario: "historical", width: 314, height: 348, textScale: 1, reducedMotion: false },
-  { surface: "widget-surface", scenario: "pending", width: 314, height: 348, textScale: 1, reducedMotion: false },
-  { surface: "widget-surface", scenario: "error", width: 314, height: 348, textScale: 1, reducedMotion: false },
-  { surface: "widget-surface", scenario: "empty", width: 314, height: 348, textScale: 1, reducedMotion: false },
-  { surface: "widget-surface", scenario: "missing-selection", width: 314, height: 348, textScale: 1, reducedMotion: false },
-  { surface: "widget-surface", scenario: "live", width: 320, height: 180, textScale: 1, reducedMotion: false },
-  { surface: "widget-surface", scenario: "live", width: 314, height: 348, textScale: 2, reducedMotion: false },
-  { surface: "widget-surface", scenario: "passive-fallback", width: 314, height: 348, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "live", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "paused-unread", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "collapsed", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "expanded", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "pending", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "completion", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "error", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "unknown-agent", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "empty", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "missing-image", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "live", width: 720, height: 560, textScale: 1, reducedMotion: true },
+  { surface: "widget-surface", scenario: "live", width: 720, height: 560, textScale: 2, reducedMotion: false },
+  { surface: "widget-surface", scenario: "live", width: 480, height: 420, textScale: 1, reducedMotion: false },
+  { surface: "widget-surface", scenario: "live", width: 960, height: 720, textScale: 1, reducedMotion: false },
   { surface: "detail", scenario: "short-exchange", width: 1120, height: 760, textScale: 1, reducedMotion: false, inspectorTab: "event" },
   { surface: "detail", scenario: "short-exchange", width: 840, height: 560, textScale: 1, reducedMotion: false, inspectorTab: "activity" },
   { surface: "detail", scenario: "search-results", width: 1120, height: 760, textScale: 1, reducedMotion: false, inspectorTab: "sources" },
