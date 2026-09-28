@@ -14,13 +14,11 @@ export interface PaperColumnHandle {
   column: HTMLDivElement;
   live: HTMLDivElement;
   paint(model: WidgetSceneModel): void;
-  setCovered(covered: boolean): void;
   setLiveOwner(owner: boolean): void;
 }
 
-export interface WidgetSceneHandle {
-  paint(model: WidgetSceneModel): void;
-  setCovered(covered: boolean): void;
+export interface WidgetUnderlayHandle {
+  column: HTMLDivElement;
 }
 
 export function createPaperColumn(options: PaperColumnOptions): PaperColumnHandle {
@@ -55,22 +53,11 @@ export function createPaperColumn(options: PaperColumnOptions): PaperColumnHandl
     live.removeAttribute("aria-atomic");
   };
 
-  const setCovered = (covered: boolean): void => {
-    if (covered) {
-      column.setAttribute("aria-hidden", "true");
-      setLiveOwner(false);
-      return;
-    }
-    column.removeAttribute("aria-hidden");
-    setLiveOwner(true);
-  };
-
   setLiveOwner(options.liveOwner !== false);
 
   return {
     column,
     live,
-    setCovered,
     setLiveOwner,
     paint(model) {
       setText(source, model.sourceLabel);
@@ -89,7 +76,7 @@ export function createPaperColumn(options: PaperColumnOptions): PaperColumnHandl
   };
 }
 
-export function createWidgetScene(root: HTMLElement): WidgetSceneHandle {
+export function createWidgetUnderlayScene(root: HTMLElement): WidgetUnderlayHandle {
   root.className = "widget-shell";
   root.removeAttribute("role");
   root.removeAttribute("aria-live");
@@ -107,14 +94,16 @@ export function createWidgetScene(root: HTMLElement): WidgetSceneHandle {
     ILLUSTRATIONS.grok.path,
     LANDMARKS.widgetGrok,
   );
-  const paper = createPaperColumn({
-    liveId: LANDMARKS.widgetLive,
-    columnId: LANDMARKS.widgetColumn,
-    figures: { codex, grok },
+  const column = el("div", {
+    id: LANDMARKS.widgetColumn,
+    className: "widget-column widget-underlay-column",
+    attrs: {
+      "aria-hidden": "true",
+    },
   });
   const bench = el("div", {
     className: "widget-bench",
-    children: [codex, paper.column, grok],
+    children: [codex, column, grok],
   });
   const scene = el("section", {
     id: LANDMARKS.widgetScene,
@@ -123,14 +112,7 @@ export function createWidgetScene(root: HTMLElement): WidgetSceneHandle {
   });
   root.replaceChildren(scene);
 
-  return {
-    paint(model) {
-      paper.paint(model);
-    },
-    setCovered(covered) {
-      paper.setCovered(covered);
-    },
-  };
+  return { column };
 }
 
 function visibleRevision(model: WidgetSceneModel): string {

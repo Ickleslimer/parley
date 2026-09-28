@@ -13,6 +13,7 @@ import type {
   ViewerStatus,
   WidgetBrowserSnapshot,
   WidgetSnapshot,
+  WidgetSurfaceActivityReport,
   WidgetSurfaceBoundsReport,
 } from "./contracts";
 
@@ -25,6 +26,8 @@ export interface ViewerApi {
   widgetBrowseLive(): Promise<WidgetBrowserSnapshot>;
   openWidgetExchange(): Promise<void>;
   reportWidgetSurfaceBounds(report: WidgetSurfaceBoundsReport): Promise<ViewerStatus>;
+  reportWidgetSurfaceActivity(report: WidgetSurfaceActivityReport): Promise<void>;
+  widgetSurfacePointerDown(): Promise<void>;
   widgetSurfaceReady(): Promise<ViewerStatus>;
   retryInteractiveMode(): Promise<ViewerStatus>;
   listSessions(cursor: number | null, limit: number): Promise<SessionPage>;
@@ -61,6 +64,9 @@ export const viewerApi: ViewerApi = {
   openWidgetExchange: () => invoke<void>("open_widget_exchange"),
   reportWidgetSurfaceBounds: (report) =>
     invoke<ViewerStatus>("report_widget_surface_bounds", { report }),
+  reportWidgetSurfaceActivity: (report) =>
+    invoke<void>("report_widget_surface_activity", { report }),
+  widgetSurfacePointerDown: () => invoke<void>("widget_surface_pointer_down"),
   widgetSurfaceReady: () => invoke<ViewerStatus>("widget_surface_ready"),
   retryInteractiveMode: () => invoke<ViewerStatus>("retry_interactive_mode"),
   listSessions: (cursor, limit) =>

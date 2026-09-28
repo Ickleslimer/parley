@@ -197,6 +197,8 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
     widgetBrowseLive: async () => api.getWidgetBrowser(),
     openWidgetExchange: async () => undefined,
     reportWidgetSurfaceBounds: async () => mutableStatus,
+    reportWidgetSurfaceActivity: async () => undefined,
+    widgetSurfacePointerDown: async () => undefined,
     widgetSurfaceReady: async () => mutableStatus,
     retryInteractiveMode: async () => mutableStatus,
     listSessions: async () => ({

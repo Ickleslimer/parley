@@ -193,6 +193,15 @@ export interface WidgetSurfaceBoundsReport {
   devicePixelRatio: number;
 }
 
+export interface WidgetSurfaceActivityReport {
+  phase: "poll" | "dom-paint" | "animation-frame";
+  sequence: number;
+  generation: number;
+  changed: boolean;
+  documentVisibility: "visible" | "hidden" | "prerender";
+  monotonicMs: number;
+}
+
 export interface MonitorInfo {
   id: string;
   name: string;

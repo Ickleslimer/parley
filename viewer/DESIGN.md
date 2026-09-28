@@ -40,7 +40,7 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 
 - Codex remains visually fixed on the left and Grok on the right.
 - The newest exchange occupies one central chronological message column.
-- The full illustrated scene remains a passive desktop underlay. Interactive mode overlays only the paper conversation column with a visually identical, taskbar-free mouse surface.
+- The illustrated workshop remains a passive desktop underlay, but its paper column is a neutral geometry plate rather than a second transcript. The taskbar-free interactive surface is the sole desktop conversation view.
 - The interactive column offers Older, Newer, Live, and Open transcript. These controls remain visually part of the paper workbench rather than becoming a toolbar or dashboard.
 - Live is the calm default. Historical browsing must remain visibly distinct without adding badges, gamification, or ambient animation.
 - Bubble direction follows the normalized speaker, never request or completion role.

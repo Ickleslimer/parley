@@ -1,11 +1,8 @@
-import type { ViewerStatus, WidgetSnapshot, WidgetSurfaceBoundsReport } from "../contracts";
+import type { ViewerStatus, WidgetSurfaceBoundsReport } from "../contracts";
 import type { ViewerApi } from "../ipc";
 
-import { loadErrorLabel } from "./labels";
-import { LANDMARKS } from "./landmarks";
 import { createSingleFlightPoller, WIDGET_POLL_MS } from "./poll";
-import { widgetSceneModel } from "./status-model";
-import { createWidgetScene } from "./widget-scene";
+import { createWidgetUnderlayScene } from "./widget-scene";
 
 const MAX_DEVICE_PIXEL_RATIO = 8;
 const MAX_BOUNDS_FAILURES = 3;
@@ -64,10 +61,7 @@ export function validatedSurfaceBounds(
 }
 
 export function mountWidget(root: HTMLElement, api: ViewerApi): { stop: () => void } {
-  const scene = createWidgetScene(root);
-  let status: ViewerStatus | null = null;
-  let snapshot: WidgetSnapshot | null = null;
-  let error: string | null = null;
+  const scene = createWidgetUnderlayScene(root);
   let alive = true;
   let acceptedSignature: string | null = null;
   let pendingSignature: string | null = null;
@@ -88,12 +82,8 @@ export function mountWidget(root: HTMLElement, api: ViewerApi): { stop: () => vo
     if (!alive) {
       return;
     }
-    const column = root.querySelector<HTMLElement>(`#${LANDMARKS.widgetColumn}`);
-    if (!column) {
-      return;
-    }
     const report = validatedSurfaceBounds(
-      column.getBoundingClientRect(),
+      scene.column.getBoundingClientRect(),
       window.innerWidth,
       window.innerHeight,
       window.devicePixelRatio,
@@ -134,18 +124,9 @@ export function mountWidget(root: HTMLElement, api: ViewerApi): { stop: () => vo
     );
   };
 
-  const paint = (): void => {
-    scene.paint(widgetSceneModel({ status, snapshot, loadError: error }));
-    scene.setCovered(status?.desktopRuntimeState === "interactive");
-    reportBounds();
-  };
-
   const poller = createSingleFlightPoller(async () => {
     try {
-      const [nextStatus, nextSnapshot] = await Promise.all([
-        api.getStatus(),
-        api.getWidgetSnapshot(),
-      ]);
+      const nextStatus = await api.getStatus();
       if (!alive) {
         return;
       }
@@ -156,33 +137,24 @@ export function mountWidget(root: HTMLElement, api: ViewerApi): { stop: () => vo
         resetBoundsRetry();
       }
       previousDesktopRuntimeState = nextStatus.desktopRuntimeState;
-      status = nextStatus;
-      snapshot = nextSnapshot;
-      error = null;
     } catch {
       if (!alive) {
         return;
       }
-      error = loadErrorLabel("load widget snapshot");
     }
-    paint();
+    reportBounds();
   }, WIDGET_POLL_MS);
 
   const onResize = (): void => {
     reportBounds();
   };
 
-  paint();
+  reportBounds();
   poller.start();
   window.addEventListener("resize", onResize);
-  const observedColumn = root.querySelector<HTMLElement>(`#${LANDMARKS.widgetColumn}`);
   const resizeObserver =
-    observedColumn && typeof ResizeObserver === "function"
-      ? new ResizeObserver(() => reportBounds())
-      : null;
-  if (observedColumn) {
-    resizeObserver?.observe(observedColumn);
-  }
+    typeof ResizeObserver === "function" ? new ResizeObserver(() => reportBounds()) : null;
+  resizeObserver?.observe(scene.column);
 
   const stop = (): void => {
     alive = false;

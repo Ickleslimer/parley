@@ -164,12 +164,46 @@ describe("widget surface", () => {
     root.dispatchEvent(new WheelEvent("wheel", { deltaY: 80, bubbles: true }));
     expect(widgetBrowseOlder).not.toHaveBeenCalled();
     button(root, LANDMARKS.widgetSurfaceOpen).click();
-    expect(openWidgetExchange).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(openWidgetExchange).toHaveBeenCalledTimes(1);
+    });
     expect(showDetail).not.toHaveBeenCalled();
     expect(reportWidgetSurfaceBounds).not.toHaveBeenCalled();
     expect(retryInteractiveMode).not.toHaveBeenCalled();
     expect(root.querySelector("[tabindex='0']")).toBeNull();
     handle.stop();
+  });
+
+  it("reasserts the desktop band on pointerdown before browsing", async () => {
+    let releaseReassertion: () => void = () => undefined;
+    const widgetSurfacePointerDown = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseReassertion = resolve;
+        }),
+    );
+    const widgetBrowseOlder = vi.fn(async () => browser({ followLive: false, position: 1 }));
+    const mounted = mountSurface({
+      browser: browser(),
+      widgetSurfacePointerDown,
+      widgetBrowseOlder,
+    });
+    await vi.waitFor(() => {
+      expect(button(mounted.root, LANDMARKS.widgetSurfaceOlder).disabled).toBe(false);
+    });
+
+    const older = button(mounted.root, LANDMARKS.widgetSurfaceOlder);
+    older.dispatchEvent(new Event("pointerdown", { bubbles: true, cancelable: true }));
+    older.click();
+
+    expect(widgetSurfacePointerDown).toHaveBeenCalledTimes(1);
+    await Promise.resolve();
+    expect(widgetBrowseOlder).not.toHaveBeenCalled();
+    releaseReassertion();
+    await vi.waitFor(() => {
+      expect(widgetBrowseOlder).toHaveBeenCalledTimes(1);
+    });
+    mounted.handle.stop();
   });
 
   it("shows pending, error, missing, ambiguous, and empty states without selecting a hidden payload", async () => {
@@ -392,27 +426,62 @@ describe("widget surface", () => {
     surfaceHandle.stop();
   });
 
-  it("restores the underlay as the only polite region for passive fallback", async () => {
+  it("reports only sanitized poll, DOM, and frame activity", async () => {
+    const originalRequestAnimationFrame = window.requestAnimationFrame;
+    window.requestAnimationFrame = (callback: FrameRequestCallback): number => {
+      callback(performance.now());
+      return 1;
+    };
+    const reportWidgetSurfaceActivity = vi.fn(
+      async (_report: Parameters<ViewerApi["reportWidgetSurfaceActivity"]>[0]) => undefined,
+    );
+    const mounted = mountSurface({
+      browser: browser(),
+      reportWidgetSurfaceActivity,
+    });
+    await vi.waitFor(() => {
+      expect(reportWidgetSurfaceActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ phase: "dom-paint", generation: expect.any(Number) }),
+      );
+      expect(reportWidgetSurfaceActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ phase: "animation-frame", generation: expect.any(Number) }),
+      );
+      expect(reportWidgetSurfaceActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ phase: "poll", generation: expect.any(Number) }),
+      );
+    });
+    for (const [report] of reportWidgetSurfaceActivity.mock.calls) {
+      expect(Object.keys(report).sort()).toEqual([
+        "changed",
+        "documentVisibility",
+        "generation",
+        "monotonicMs",
+        "phase",
+        "sequence",
+      ]);
+    }
+    mounted.handle.stop();
+    window.requestAnimationFrame = originalRequestAnimationFrame;
+  });
+
+  it("keeps passive fallback scene-only without restoring a second transcript", async () => {
     const fixture = createSyntheticFixture("passive-fallback");
     const underlay = document.createElement("div");
     const surface = document.createElement("div");
     document.body.append(underlay, surface);
     const underlayHandle = mountWidget(underlay, fixture.api);
     const surfaceHandle = mountWidgetSurface(surface, fixture.api);
-    await vi.waitFor(() => {
-      expect(underlay.querySelector(".widget-excerpt")?.textContent).toContain("frozen design contract");
-    });
-    expect(underlay.querySelector(`#${LANDMARKS.widgetLive}`)?.getAttribute("aria-live")).toBe("polite");
-    expect(underlay.querySelector(`#${LANDMARKS.widgetColumn}`)?.hasAttribute("aria-hidden")).toBe(
-      false,
+    expect(underlay.querySelector(`#${LANDMARKS.widgetColumn}`)?.getAttribute("aria-hidden")).toBe(
+      "true",
     );
+    expect(underlay.querySelector(".widget-live, .widget-slip, .widget-excerpt")).toBeNull();
+    expect(underlay.querySelectorAll('[aria-live="polite"]')).toHaveLength(0);
     expect(surface.querySelector('[aria-live="polite"]')).toBeNull();
-    expect(surface.querySelector(".widget-excerpt")?.textContent).toContain("frozen design contract");
     for (const image of underlay.querySelectorAll("img")) {
       image.dispatchEvent(new Event("error"));
     }
     expect(underlay.querySelectorAll("img.is-missing")).toHaveLength(3);
-    expect(underlay.querySelector(".widget-excerpt")?.textContent).toContain("frozen design contract");
+    expect(underlay.textContent).toBe("");
     underlayHandle.stop();
     surfaceHandle.stop();
   });
@@ -442,6 +511,8 @@ function mountSurface(options: {
   openWidgetExchange?: ViewerApi["openWidgetExchange"];
   showDetail?: ViewerApi["showDetail"];
   reportWidgetSurfaceBounds?: ViewerApi["reportWidgetSurfaceBounds"];
+  reportWidgetSurfaceActivity?: ViewerApi["reportWidgetSurfaceActivity"];
+  widgetSurfacePointerDown?: ViewerApi["widgetSurfacePointerDown"];
   retryInteractiveMode?: ViewerApi["retryInteractiveMode"];
   widgetSurfaceReady?: ViewerApi["widgetSurfaceReady"];
 }): { root: HTMLDivElement; handle: { stop: () => void }; openWidgetExchange: ReturnType<typeof vi.fn> } {
@@ -460,6 +531,8 @@ function mountSurface(options: {
       openWidgetExchange,
       showDetail: options.showDetail,
       reportWidgetSurfaceBounds: options.reportWidgetSurfaceBounds,
+      reportWidgetSurfaceActivity: options.reportWidgetSurfaceActivity,
+      widgetSurfacePointerDown: options.widgetSurfacePointerDown,
       retryInteractiveMode: options.retryInteractiveMode,
       widgetSurfaceReady: options.widgetSurfaceReady,
     }),
@@ -477,6 +550,8 @@ function surfaceApi(options: {
   openWidgetExchange?: ViewerApi["openWidgetExchange"];
   showDetail?: ViewerApi["showDetail"];
   reportWidgetSurfaceBounds?: ViewerApi["reportWidgetSurfaceBounds"];
+  reportWidgetSurfaceActivity?: ViewerApi["reportWidgetSurfaceActivity"];
+  widgetSurfacePointerDown?: ViewerApi["widgetSurfacePointerDown"];
   retryInteractiveMode?: ViewerApi["retryInteractiveMode"];
   widgetSurfaceReady?: ViewerApi["widgetSurfaceReady"];
 }): ViewerApi {
@@ -491,6 +566,9 @@ function surfaceApi(options: {
     widgetBrowseLive: options.widgetBrowseLive ?? (async () => currentBrowser),
     openWidgetExchange: options.openWidgetExchange ?? (async () => undefined),
     reportWidgetSurfaceBounds: options.reportWidgetSurfaceBounds ?? (async () => currentStatus),
+    reportWidgetSurfaceActivity:
+      options.reportWidgetSurfaceActivity ?? (async () => undefined),
+    widgetSurfacePointerDown: options.widgetSurfacePointerDown ?? (async () => undefined),
     widgetSurfaceReady: options.widgetSurfaceReady ?? (async () => currentStatus),
     retryInteractiveMode: options.retryInteractiveMode ?? (async () => currentStatus),
     showDetail: options.showDetail ?? (async () => undefined),

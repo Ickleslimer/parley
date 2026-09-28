@@ -13,6 +13,7 @@ const MISSING_LABEL = "The selected exchange is no longer available";
 const AMBIGUOUS_LABEL = "The selected exchange matches more than one record";
 const LIVE_LABEL = "Following the newest exchange";
 const EARLIER_LABEL = "Showing an earlier exchange";
+const PRESENTATION_HEARTBEAT_MS = 5_000;
 
 export function mountWidgetSurface(root: HTMLElement, api: ViewerApi): { stop: () => void } {
   root.className = "widget-surface-shell";
@@ -28,6 +29,7 @@ export function mountWidgetSurface(root: HTMLElement, api: ViewerApi): { stop: (
   const mode = el("p", { className: "widget-surface-mode" });
   mode.hidden = true;
   paper.live.prepend(mode);
+  let pointerReassert = Promise.resolve();
 
   const older = mouseButton("Older", LANDMARKS.widgetSurfaceOlder, () => {
     browse(() => api.widgetBrowseOlder());
@@ -42,7 +44,8 @@ export function mountWidgetSurface(root: HTMLElement, api: ViewerApi): { stop: (
     if (open.disabled || !alive) {
       return;
     }
-    void api.openWidgetExchange();
+    const reassertion = pointerReassert;
+    void reassertion.then(() => api.openWidgetExchange());
   });
   const controls = el("div", {
     id: LANDMARKS.widgetSurfaceControls,
@@ -72,10 +75,51 @@ export function mountWidgetSurface(root: HTMLElement, api: ViewerApi): { stop: (
   let epoch = 0;
   let browsing = false;
   let readySent = false;
+  let activitySequence = 0;
+  let domGeneration = 0;
+  let lastPresentationRevision: string | null = null;
+  let lastHeartbeatMs = Number.NEGATIVE_INFINITY;
+  const reassertOnPointerDown = (): void => {
+    if (!alive) {
+      return;
+    }
+    pointerReassert = api.widgetSurfacePointerDown().catch(() => undefined);
+  };
+  frame.addEventListener("pointerdown", reassertOnPointerDown);
 
-  const paint = (): void => {
+  const reportActivity = (
+    phase: "poll" | "dom-paint" | "animation-frame",
+    changed: boolean,
+  ): void => {
+    activitySequence += 1;
+    void api
+      .reportWidgetSurfaceActivity({
+        phase,
+        sequence: activitySequence,
+        generation: domGeneration,
+        changed,
+        documentVisibility: normalizedVisibility(),
+        monotonicMs: monotonicMs(),
+      })
+      .catch(() => undefined);
+  };
+
+  const reportFrame = (): void => {
+    if (typeof window.requestAnimationFrame !== "function") {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      if (alive) {
+        reportActivity("animation-frame", true);
+      }
+    });
+  };
+
+  const paint = (): boolean => {
     const selected = browser?.selectionState === "selected";
     const model = presentedModel(status, selected ? browser?.widget ?? null : blankWidget(), error, browser);
+    const revision = presentationRevision(model, browser);
+    const changed = revision !== lastPresentationRevision;
     paper.paint(model);
     paper.setLiveOwner(status?.desktopRuntimeState === "interactive");
     const modeText = browserMode(browser);
@@ -93,6 +137,13 @@ export function mountWidgetSurface(root: HTMLElement, api: ViewerApi): { stop: (
     );
     root.dataset.selectionState = browser?.selectionState ?? "";
     root.dataset.followLive = following ? "true" : "false";
+    if (changed) {
+      lastPresentationRevision = revision;
+      domGeneration += 1;
+      reportActivity("dom-paint", true);
+      reportFrame();
+    }
+    return changed;
   };
 
   const poller = createSingleFlightPoller(async () => {
@@ -111,7 +162,12 @@ export function mountWidgetSurface(root: HTMLElement, api: ViewerApi): { stop: (
       }
       error = loadErrorLabel("load widget browser");
     }
-    paint();
+    const changed = paint();
+    const now = monotonicMs();
+    if (changed || now - lastHeartbeatMs >= PRESENTATION_HEARTBEAT_MS) {
+      lastHeartbeatMs = now;
+      reportActivity("poll", changed);
+    }
   }, WIDGET_POLL_MS);
 
   const browse = (action: () => Promise<WidgetBrowserSnapshot>): void => {
@@ -121,7 +177,9 @@ export function mountWidgetSurface(root: HTMLElement, api: ViewerApi): { stop: (
     browsing = true;
     epoch += 1;
     const token = epoch;
+    const reassertion = pointerReassert;
     void Promise.resolve()
+      .then(() => reassertion)
       .then(action)
       .then((next) => {
         if (!alive || token !== epoch) {
@@ -161,6 +219,7 @@ export function mountWidgetSurface(root: HTMLElement, api: ViewerApi): { stop: (
     alive = false;
     epoch += 1;
     poller.stop();
+    frame.removeEventListener("pointerdown", reassertOnPointerDown);
     window.removeEventListener("pagehide", stop);
   };
   window.addEventListener("pagehide", stop);
@@ -198,6 +257,36 @@ function browserMode(browser: WidgetBrowserSnapshot | null): string {
     return `${EARLIER_LABEL}. ${newer} newer exchanges.`;
   }
   return EARLIER_LABEL;
+}
+
+function presentationRevision(
+  model: WidgetSceneModel,
+  browser: WidgetBrowserSnapshot | null,
+): string {
+  return [
+    model.liveRevision,
+    model.banner ?? "",
+    model.idleLabel ?? "",
+    model.loadError ?? "",
+    model.sourceLabel,
+    browser?.selectionState ?? "",
+    browser?.followLive === true ? "live" : "historical",
+    browser?.position ?? -1,
+    browser?.total ?? 0,
+    browser?.newerCount ?? 0,
+  ].join("\u001d");
+}
+
+function normalizedVisibility(): "visible" | "hidden" | "prerender" {
+  const visibility = String(document.visibilityState);
+  if (visibility === "hidden" || visibility === "prerender") {
+    return visibility;
+  }
+  return "visible";
+}
+
+function monotonicMs(): number {
+  return Math.max(0, Math.trunc(performance.now()));
 }
 
 function blankWidget(): WidgetSnapshot {

@@ -34,7 +34,7 @@ All retrieval uses source- and generation-qualified opaque keys. Event, exchange
 - Handle UTF-8 BOM, CRLF, Unicode split across reads, concurrent append, missing/reappearing files, and bodies above 60,000 characters.
 - Skip malformed lines, unsupported records, and physical lines above 8 MiB while incrementing source and aggregate diagnostics.
 
-Widget excerpts are bounded to 420 Unicode scalar values and never model-generated. For framed requests, extraction searches for `PARLEY_CURRENT_REQUEST_V1` with the event's exact exchange ID, then uses the exact `task:` line remainder when present. The legacy first-`task:` fallback applies only to unframed events. Context source, mode, offsets, counts, truncation, and recovery are available only in detail diagnostics; the underlay remains conversation-only.
+Widget excerpts are bounded to 420 Unicode scalar values and never model-generated. For framed requests, extraction searches for `PARLEY_CURRENT_REQUEST_V1` with the event's exact exchange ID, then uses the exact `task:` line remainder when present. The legacy first-`task:` fallback applies only to unframed events. Context source, mode, offsets, counts, truncation, and recovery are available only in detail diagnostics. The interactive surface is the sole desktop transcript renderer.
 
 ## Runtime and Settings
 
@@ -51,24 +51,24 @@ Widget excerpts are bounded to 420 Unicode scalar values and never model-generat
 
 ### Interactive desktop composition
 
-- `widget` remains the complete `WorkerW`/`Progman` underlay and the fail-closed passive fallback.
+- `widget` remains the `WorkerW`/`Progman` workshop-scene and geometry host. It never polls or paints transcript data and is not a second conversation fallback.
 - `widget-surface` is a dynamic parentless top-level WebView containing only the paper conversation column. Rust owns its creation, styles, placement, z-order, readiness, destruction, and retry policy.
 - The surface is `WS_POPUP` with `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`; `WS_EX_APPWINDOW`, `WS_EX_TOPMOST`, and click-through styles are forbidden. It is never reparented and never becomes topmost.
 - The underlay reports the column rectangle in CSS pixels together with viewport size and device-pixel ratio. Rust accepts reports only from `widget`, validates finite in-viewport geometry, converts to physical coordinates, and requires alignment within one physical pixel.
 - The surface reports document readiness only from `widget-surface`. Activation requires a healthy underlay, verified styles and null ownership, valid geometry, and a passing desktop-band z-order check.
-- Runtime state is one of `passive`, `interactive-starting`, `interactive`, or `passive-fallback`. Fallback reasons are a closed enum. Runtime fallback never rewrites the saved `desktopMode` preference.
+- Runtime state is one of `passive`, `interactive-starting`, `interactive`, or `passive-fallback`. Fallback reasons are a closed enum. `passive` and `passive-fallback` retain only the neutral scene; they do not expose an older desktop transcript. Runtime fallback never rewrites the saved `desktopMode` preference.
 - The surface and underlay change visibility atomically. Explorer loss destroys the surface before the underlay enters its existing bounded reattachment path.
 - Browser selection is process-local Rust state. Global order is timestamp descending, configured-source order, then opaque exchange key. Historical identity recovery uses source identity plus raw session, exchange, and event identifiers and fails closed on missing or ambiguous matches.
-- While the surface is active, the covered underlay conversation subtree is hidden from accessibility APIs and its live region is disabled. The surface owns the sole polite live region.
+- The underlay paper column is an empty, accessibility-hidden layout box used only for validated surface geometry. The surface owns the sole desktop conversation and polite live region.
 - Settings schema v2 adds `desktopMode: interactive | passive`; missing values migrate to `interactive` without changing placement, dimensions, sources, monitor, autostart, or any explicit corner choice.
 
 ## Frontend IPC
 
 `src/ipc.ts` is the complete frontend authority boundary. Detail and widget views use only its `ViewerApi`; implementation files must not invoke arbitrary Tauri commands.
 
-- `getStatus` and `getWidgetSnapshot` drive bounded live refresh across all sources.
+- `getStatus` drives underlay lifecycle and geometry refresh. `getWidgetBrowser` carries the bounded desktop transcript snapshot; the underlay never requests `getWidgetSnapshot`.
 - `getWidgetBrowser`, `widgetBrowseOlder`, `widgetBrowseNewer`, and `widgetBrowseLive` expose the bounded process-local global browser. `openWidgetExchange` opens the selected exchange in detail.
-- `reportWidgetSurfaceBounds` accepts only validated underlay geometry; `widgetSurfaceReady` accepts readiness only from the surface; `retryInteractiveMode` explicitly clears only the runtime fallback latch.
+- `reportWidgetSurfaceBounds` accepts only validated underlay geometry; `widgetSurfaceReady` accepts readiness only from the surface; `widgetSurfacePointerDown` lets only the surface synchronously restore and verify its desktop-band position before a mouse action; `retryInteractiveMode` explicitly clears only the runtime fallback latch.
 - `listSessions`, `listExchanges`, `search`, and `getEventContent` use opaque keys for paging, search, and exact retrieval.
 - `getSettings`, `saveSettings`, and `listMonitors` drive source ordering and geometry settings.
 - `getPeerActivity` returns the newest bounded handoff records, sanitized activity metadata, visible-output excerpts, and exact reports only after their stored fingerprints verify.

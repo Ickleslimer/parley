@@ -17,7 +17,7 @@ import { LANDMARKS } from "./landmarks";
 import { EXTRACTED_TASK_LABEL, PARLEY_ERROR_LABEL, PENDING_LABEL } from "./labels";
 import { widgetSceneModel } from "./status-model";
 import { mountWidget, validatedSurfaceBounds } from "./widget";
-import { createWidgetScene } from "./widget-scene";
+import { createPaperColumn, createWidgetUnderlayScene } from "./widget-scene";
 
 const HOSTILE = "<img src=x onerror=alert(1)><script>alert(1)</script>";
 
@@ -83,8 +83,24 @@ const snapshot = (overrides: Partial<WidgetSnapshot> = {}): WidgetSnapshot => ({
 function paint(modelSnapshot: WidgetSnapshot, modelStatus: ViewerStatus | null = status()) {
   const root = document.createElement("div");
   document.body.append(root);
-  const scene = createWidgetScene(root);
-  scene.paint(
+  const codex = document.createElement("img");
+  codex.id = LANDMARKS.widgetCodex;
+  codex.alt = "";
+  codex.setAttribute("aria-hidden", "true");
+  const grok = document.createElement("img");
+  grok.id = LANDMARKS.widgetGrok;
+  grok.alt = "";
+  grok.setAttribute("aria-hidden", "true");
+  const paper = createPaperColumn({
+    liveId: LANDMARKS.widgetLive,
+    columnId: LANDMARKS.widgetColumn,
+    figures: { codex, grok },
+  });
+  const scene = document.createElement("section");
+  scene.id = LANDMARKS.widgetScene;
+  scene.append(codex, paper.column, grok);
+  root.append(scene);
+  paper.paint(
     widgetSceneModel({
       status: modelStatus,
       snapshot: modelSnapshot,
@@ -92,7 +108,7 @@ function paint(modelSnapshot: WidgetSnapshot, modelStatus: ViewerStatus | null =
       utc: true,
     }),
   );
-  return { root, scene };
+  return { root, scene: paper };
 }
 
 function slips(root: ParentNode): HTMLElement[] {
@@ -122,7 +138,7 @@ describe("widget scene", () => {
     expect(scene?.contains(codex)).toBe(true);
     expect(codex?.getAttribute("aria-hidden")).toBe("true");
     expect(grok?.getAttribute("alt")).toBe("");
-    expect(root.querySelectorAll("img")).toHaveLength(3);
+    expect(root.querySelectorAll("img")).toHaveLength(2);
     expect(root.querySelector("button, a, input, textarea, select, [tabindex]")).toBeNull();
     expect(root.getAttribute("role")).toBeNull();
     expect(live?.querySelector("img, script")).toBeNull();
@@ -244,34 +260,33 @@ describe("widget scene", () => {
     expect(fresh?.parentElement?.classList.contains("is-reacting")).toBe(true);
   });
 
-  it("does not replace message nodes on an identical 500 ms poll", async () => {
+  it("keeps the desktop underlay scene-only and never polls transcript data", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const currentStatus = status();
-    const currentSnapshot = snapshot();
     const getStatus = vi.fn(async () => currentStatus);
-    const getWidgetSnapshot = vi.fn(async () => currentSnapshot);
+    const getWidgetSnapshot = vi.fn(async () => snapshot());
     const api = { getStatus, getWidgetSnapshot } as unknown as ViewerApi;
     const root = document.createElement("div");
     document.body.append(root);
     const handle = mountWidget(root, api);
     await vi.waitFor(() => {
-      expect(root.querySelector(".widget-excerpt")?.textContent).toBe("Ship the engine");
+      expect(getStatus).toHaveBeenCalled();
     });
-    const excerpt = root.querySelector(".widget-excerpt");
-    const messages = root.querySelector<HTMLElement>(".widget-messages");
-    expect(messages?.dataset.bubbleCount).toBe("2");
+    expect(getWidgetSnapshot).not.toHaveBeenCalled();
+    expect(root.querySelector(`#${LANDMARKS.widgetColumn}`)?.getAttribute("aria-hidden")).toBe(
+      "true",
+    );
+    expect(root.querySelector(".widget-live, .widget-slip, .widget-excerpt")).toBeNull();
+    expect(root.querySelectorAll("img")).toHaveLength(3);
     currentStatus.sessionCount = 3;
     await vi.advanceTimersByTimeAsync(500);
-    await vi.waitFor(() => {
-      expect(getWidgetSnapshot.mock.calls.length).toBeGreaterThanOrEqual(2);
-    });
-    expect(root.querySelector(".widget-excerpt")).toBe(excerpt);
-    expect(root.querySelector(".widget-messages")).toBe(messages);
-    expect(root.querySelector(".widget-source")?.textContent).toContain("3 sessions");
+    expect(getStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(getWidgetSnapshot).not.toHaveBeenCalled();
+    expect(root.textContent).toBe("");
     handle.stop();
   });
 
-  it("keeps a solid conversation surface when artwork fails and skips decoration without motion", () => {
+  it("keeps a solid conversation surface when underlay artwork fails and skips motion", () => {
     vi.spyOn(window, "matchMedia").mockImplementation(
       (query: string) =>
         ({
@@ -286,11 +301,14 @@ describe("widget scene", () => {
         }) as unknown as MediaQueryList,
     );
     const long = "Exact bounded excerpt. ".repeat(30);
-    const { root } = paint(snapshot({ request: preview({ excerpt: long }) }));
-    for (const image of root.querySelectorAll("img")) {
+    const underlayRoot = document.createElement("div");
+    document.body.append(underlayRoot);
+    createWidgetUnderlayScene(underlayRoot);
+    for (const image of underlayRoot.querySelectorAll("img")) {
       image.dispatchEvent(new Event("error"));
     }
-    expect(root.querySelectorAll("img.is-missing")).toHaveLength(3);
+    expect(underlayRoot.querySelectorAll("img.is-missing")).toHaveLength(3);
+    const { root } = paint(snapshot({ request: preview({ excerpt: long }) }));
     expect(root.querySelector(".widget-column")).not.toBeNull();
     expect(root.querySelector(".widget-excerpt")?.textContent).toBe(long);
     expect(root.querySelector(".widget-slip")?.classList.contains("is-reacting")).toBe(false);
@@ -299,15 +317,16 @@ describe("widget scene", () => {
     );
   });
 
-  it("shows idle and load failures as text without a second exchange", async () => {
+  it("shows idle and load failures on a conversation paper without a second exchange", async () => {
     const root = document.createElement("div");
     document.body.append(root);
-    const scene = createWidgetScene(root);
-    scene.paint(widgetSceneModel({ status: null, snapshot: null, loadError: null }));
+    const paper = createPaperColumn({ liveId: LANDMARKS.widgetLive });
+    root.append(paper.column);
+    paper.paint(widgetSceneModel({ status: null, snapshot: null, loadError: null }));
     const idle = root.querySelector(".widget-idle");
     expect(idle?.textContent).toBe("Connecting\u2026");
     expect(slips(root)).toHaveLength(0);
-    scene.paint(
+    paper.paint(
       widgetSceneModel({
         status: status({ sourceState: "missing" }),
         snapshot: snapshot({
@@ -324,7 +343,7 @@ describe("widget scene", () => {
     );
     expect(root.querySelector(".widget-idle")).toBe(idle);
     expect(idle?.textContent).toBe("Event log is missing");
-    scene.paint(
+    paper.paint(
       widgetSceneModel({
         status: status({ trayAvailable: false }),
         snapshot: null,
@@ -335,23 +354,25 @@ describe("widget scene", () => {
     expect(root.querySelector(`#${LANDMARKS.widgetLive}`)?.contains(banner)).toBe(true);
     expect(banner?.textContent).toContain("tray");
 
+  });
+
+  it("keeps the underlay neutral when status polling fails", async () => {
+    const getWidgetSnapshot = vi.fn(async () => snapshot());
     const failing = {
       getStatus: vi.fn(async () => {
         throw new Error("offline");
       }),
-      getWidgetSnapshot: vi.fn(async () => snapshot()),
+      getWidgetSnapshot,
     } as unknown as ViewerApi;
     const mounted = document.createElement("div");
     document.body.append(mounted);
     const handle = mountWidget(mounted, failing);
     await vi.waitFor(() => {
-      expect(mounted.querySelector(".widget-load-error")?.textContent).toBe(
-        "Unable to load widget snapshot",
-      );
+      expect(failing.getStatus).toHaveBeenCalled();
     });
-    expect(mounted.querySelector(`#${LANDMARKS.widgetLive}`)?.contains(
-      mounted.querySelector(".widget-load-error"),
-    )).toBe(true);
+    expect(getWidgetSnapshot).not.toHaveBeenCalled();
+    expect(mounted.querySelector(".widget-live, .widget-load-error, .widget-excerpt")).toBeNull();
+    expect(mounted.textContent).toBe("");
     handle.stop();
   });
 });
@@ -414,54 +435,53 @@ describe("widget scene contract", () => {
 });
 
 describe("underlay interactive handshake", () => {
-  it("keeps the passive live region unless the desktop runtime is interactive", async () => {
+  it("keeps the underlay transcript-free in every desktop runtime state", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const root = document.createElement("div");
     document.body.append(root);
     const current = status();
+    const getWidgetSnapshot = vi.fn(async () => snapshot());
     const handle = mountWidget(root, {
       getStatus: async () => current,
-      getWidgetSnapshot: async () => snapshot(),
+      getWidgetSnapshot,
       reportWidgetSurfaceBounds: async () => current,
     } as unknown as ViewerApi);
-    await vi.waitFor(() => {
-      expect(root.querySelector(".widget-excerpt")?.textContent).toBe("Ship the engine");
-    });
     const column = root.querySelector<HTMLElement>(`#${LANDMARKS.widgetColumn}`);
-    const live = root.querySelector<HTMLElement>(`#${LANDMARKS.widgetLive}`);
     const codex = root.querySelector(`#${LANDMARKS.widgetCodex}`);
     expect(column?.getAttribute("aria-hidden")).toBe("true");
     expect(column?.contains(codex)).toBe(false);
-    expect(live?.getAttribute("aria-live")).toBe("off");
-    expect(live?.getAttribute("role")).toBeNull();
     expect(root.querySelectorAll('[aria-live="polite"]')).toHaveLength(0);
+    expect(root.querySelector(".widget-live, .widget-slip, .widget-excerpt")).toBeNull();
     expect(root.querySelector("button")).toBeNull();
+    expect(getWidgetSnapshot).not.toHaveBeenCalled();
 
-    current.desktopRuntimeState = "passive-fallback";
-    current.desktopFallbackReason = "surface-z-order-invalid";
-    await vi.waitFor(() => {
-      expect(live?.getAttribute("aria-live")).toBe("polite");
-    });
-    expect(column?.hasAttribute("aria-hidden")).toBe(false);
-    expect(live?.getAttribute("role")).toBe("status");
-    expect(root.querySelectorAll('[aria-live="polite"]')).toHaveLength(1);
-    expect(root.querySelector(".widget-excerpt")?.textContent).toBe("Ship the engine");
+    for (const desktopRuntimeState of [
+      "interactive-starting",
+      "passive-fallback",
+      "passive",
+    ] as const) {
+      current.desktopRuntimeState = desktopRuntimeState;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(column?.getAttribute("aria-hidden")).toBe("true");
+      expect(root.querySelector(".widget-live, .widget-slip, .widget-excerpt")).toBeNull();
+      expect(root.querySelectorAll('[aria-live="polite"]')).toHaveLength(0);
+      expect(getWidgetSnapshot).not.toHaveBeenCalled();
+    }
     handle.stop();
   });
 
-  it("does not cover the column while interactive startup is still unfinished", async () => {
+  it("preserves a measurable paper column without creating conversation nodes", () => {
     const root = document.createElement("div");
     document.body.append(root);
-    const current = status({ desktopRuntimeState: "interactive-starting" });
-    const handle = mountWidget(root, {
-      getStatus: async () => current,
-      getWidgetSnapshot: async () => snapshot(),
-      reportWidgetSurfaceBounds: async () => current,
-    } as unknown as ViewerApi);
-    await vi.waitFor(() => {
-      expect(root.querySelector(`#${LANDMARKS.widgetLive}`)?.getAttribute("aria-live")).toBe("polite");
-    });
-    expect(root.querySelector(`#${LANDMARKS.widgetColumn}`)?.hasAttribute("aria-hidden")).toBe(false);
-    handle.stop();
+    const scene = createWidgetUnderlayScene(root);
+    vi.spyOn(scene.column, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(120, 8, 314, 348),
+    );
+    expect(scene.column.getBoundingClientRect()).toEqual(new DOMRect(120, 8, 314, 348));
+    expect(scene.column.getAttribute("aria-hidden")).toBe("true");
+    expect(scene.column.childElementCount).toBe(0);
+    expect(root.querySelector(`#${LANDMARKS.widgetScene}`)).not.toBeNull();
+    expect(root.querySelectorAll("img")).toHaveLength(3);
   });
 
   it("reports quantized in-viewport bounds only when the geometry changes", async () => {
