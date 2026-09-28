@@ -277,7 +277,7 @@ describe("widget scene", () => {
       "true",
     );
     expect(root.querySelector(".widget-live, .widget-slip, .widget-excerpt")).toBeNull();
-    expect(root.querySelectorAll("img")).toHaveLength(3);
+    expect(root.querySelectorAll("img")).toHaveLength(0);
     currentStatus.sessionCount = 3;
     await vi.advanceTimersByTimeAsync(500);
     expect(getStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
@@ -286,7 +286,7 @@ describe("widget scene", () => {
     handle.stop();
   });
 
-  it("keeps a solid conversation surface when underlay artwork fails and skips motion", () => {
+  it("keeps a solid conversation surface without underlay artwork and skips motion", () => {
     vi.spyOn(window, "matchMedia").mockImplementation(
       (query: string) =>
         ({
@@ -304,10 +304,8 @@ describe("widget scene", () => {
     const underlayRoot = document.createElement("div");
     document.body.append(underlayRoot);
     createWidgetUnderlayScene(underlayRoot);
-    for (const image of underlayRoot.querySelectorAll("img")) {
-      image.dispatchEvent(new Event("error"));
-    }
-    expect(underlayRoot.querySelectorAll("img.is-missing")).toHaveLength(3);
+    expect(underlayRoot.querySelectorAll("img")).toHaveLength(0);
+    expect(underlayRoot.querySelector(".widget-underlay-host")).not.toBeNull();
     const { root } = paint(snapshot({ request: preview({ excerpt: long }) }));
     expect(root.querySelector(".widget-column")).not.toBeNull();
     expect(root.querySelector(".widget-excerpt")?.textContent).toBe(long);
@@ -447,9 +445,9 @@ describe("underlay interactive handshake", () => {
       reportWidgetSurfaceBounds: async () => current,
     } as unknown as ViewerApi);
     const column = root.querySelector<HTMLElement>(`#${LANDMARKS.widgetColumn}`);
-    const codex = root.querySelector(`#${LANDMARKS.widgetCodex}`);
     expect(column?.getAttribute("aria-hidden")).toBe("true");
-    expect(column?.contains(codex)).toBe(false);
+    expect(root.querySelector(`#${LANDMARKS.widgetCodex}`)).toBeNull();
+    expect(root.querySelector(`#${LANDMARKS.widgetGrok}`)).toBeNull();
     expect(root.querySelectorAll('[aria-live="polite"]')).toHaveLength(0);
     expect(root.querySelector(".widget-live, .widget-slip, .widget-excerpt")).toBeNull();
     expect(root.querySelector("button")).toBeNull();
@@ -481,7 +479,7 @@ describe("underlay interactive handshake", () => {
     expect(scene.column.getAttribute("aria-hidden")).toBe("true");
     expect(scene.column.childElementCount).toBe(0);
     expect(root.querySelector(`#${LANDMARKS.widgetScene}`)).not.toBeNull();
-    expect(root.querySelectorAll("img")).toHaveLength(3);
+    expect(root.querySelectorAll("img")).toHaveLength(0);
   });
 
   it("reports quantized in-viewport bounds only when the geometry changes", async () => {

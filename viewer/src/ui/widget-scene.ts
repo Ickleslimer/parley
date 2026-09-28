@@ -1,4 +1,3 @@
-import { ILLUSTRATIONS } from "./assets";
 import type { BubbleModel, WidgetSceneModel } from "./attribution";
 import { el, setText } from "./dom";
 import { LANDMARKS } from "./landmarks";
@@ -83,32 +82,17 @@ export function createWidgetUnderlayScene(root: HTMLElement): WidgetUnderlayHand
   root.removeAttribute("aria-atomic");
   root.removeAttribute("tabindex");
 
-  const plate = decorativeImage("widget-plate", ILLUSTRATIONS.plate.path);
-  const codex = decorativeImage(
-    "widget-figure widget-figure-codex",
-    ILLUSTRATIONS.codex.path,
-    LANDMARKS.widgetCodex,
-  );
-  const grok = decorativeImage(
-    "widget-figure widget-figure-grok",
-    ILLUSTRATIONS.grok.path,
-    LANDMARKS.widgetGrok,
-  );
   const column = el("div", {
     id: LANDMARKS.widgetColumn,
-    className: "widget-column widget-underlay-column",
+    className: "widget-underlay-host",
     attrs: {
       "aria-hidden": "true",
     },
   });
-  const bench = el("div", {
-    className: "widget-bench",
-    children: [codex, column, grok],
-  });
   const scene = el("section", {
     id: LANDMARKS.widgetScene,
-    className: "widget-scene",
-    children: [plate, bench],
+    className: "widget-scene widget-underlay-scene",
+    children: [column],
   });
   root.replaceChildren(scene);
 
@@ -123,24 +107,6 @@ function visibleRevision(model: WidgetSceneModel): string {
     model.idleLabel ?? "",
     model.loadError ?? "",
   ].join("\u001d");
-}
-
-function decorativeImage(className: string, src: string, id?: string): HTMLImageElement {
-  const image = el("img", {
-    className,
-    ...(id ? { id } : {}),
-    attrs: {
-      src,
-      alt: "",
-      "aria-hidden": "true",
-      decoding: "async",
-      draggable: "false",
-    },
-  });
-  image.addEventListener("error", () => {
-    image.classList.add("is-missing");
-  });
-  return image;
 }
 
 function paintNotice(node: HTMLElement, text: string | null): void {
