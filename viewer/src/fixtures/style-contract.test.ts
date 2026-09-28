@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { ILLUSTRATIONS } from "../ui/assets";
+import { AVATAR_ILLUSTRATIONS, ILLUSTRATIONS } from "../ui/assets";
 
 const stylesDirectory = fileURLToPath(new URL("../styles", import.meta.url));
 const illustrationDirectory = fileURLToPath(
@@ -49,12 +49,12 @@ describe("Two Chairs style contract", () => {
     );
   });
 
-  it("keeps the shipped illustration payload below 650 KiB", () => {
+  it("keeps the shipped illustration payload below 350 KiB", () => {
     const total = readdirSync(illustrationDirectory).reduce(
       (sum, name) => sum + statSync(`${illustrationDirectory}/${name}`).size,
       0,
     );
-    expect(total).toBeLessThanOrEqual(650 * 1024);
+    expect(total).toBeLessThanOrEqual(350 * 1024);
   });
 
   it("keeps illustration metadata tied to the shipped bytes", () => {
@@ -67,6 +67,19 @@ describe("Two Chairs style contract", () => {
     for (const [key, name] of Object.entries(files)) {
       const bytes = readFileSync(`${illustrationDirectory}/${name}`);
       const metadata = ILLUSTRATIONS[key as keyof typeof ILLUSTRATIONS];
+      expect(metadata.byteLength).toBe(bytes.byteLength);
+      expect(metadata.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+    }
+
+    const avatars = {
+      codexIdle: "codex-device-idle.webp",
+      codexWorking: "codex-device-working.webp",
+      grokIdle: "grok-device-idle.webp",
+      grokWorking: "grok-device-working.webp",
+    } as const;
+    for (const [key, name] of Object.entries(avatars)) {
+      const bytes = readFileSync(`${illustrationDirectory}/${name}`);
+      const metadata = AVATAR_ILLUSTRATIONS[key as keyof typeof AVATAR_ILLUSTRATIONS];
       expect(metadata.byteLength).toBe(bytes.byteLength);
       expect(metadata.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
     }

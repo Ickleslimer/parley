@@ -1323,7 +1323,7 @@ fn create_widget_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         f64::from(placement.width) / scale_factor,
         f64::from(placement.height) / scale_factor,
     )
-    .min_inner_size(320.0, 180.0)
+    .min_inner_size(480.0, 420.0)
     .position(
         f64::from(placement.x) / scale_factor,
         f64::from(placement.y) / scale_factor,

@@ -22,7 +22,7 @@ Apply the product-specific visual contract without changing Parley's data, IPC, 
 - List the existing commands, controls, polling behavior, and keyboard semantics affected by the change.
 - Keep event content in text nodes or `textContent`; never use `innerHTML`.
 - Keep filesystem, settings, evidence, process, and window authority in Rust.
-- Keep the widget noninteractive and its figures outside the live region.
+- Keep the desktop surface mouse-oriented and nonactivating; keep decorative avatars outside the live region.
 - Treat Parley errors as execution records, never agent speech.
 - Normalize speakers only through the shared attribution module.
 
@@ -32,7 +32,7 @@ Apply the product-specific visual contract without changing Parley's data, IPC, 
 - Put exact text on solid paper surfaces.
 - Keep labels in sentence case and use the bundled humanist typeface.
 - Use one central conversation hierarchy rather than repeated dashboard cards.
-- Keep motion finite, event-responsive, and disabled by reduced-motion preference.
+- Keep motion finite and event-responsive except for the documented pending-only working-avatar exception. Disable every decorative animation under reduced-motion preference.
 - Record a purpose for any new visual technique in `viewer/DESIGN.md` or the change description.
 
 ### 3. Prove human use
@@ -42,7 +42,7 @@ Apply the product-specific visual contract without changing Parley's data, IPC, 
 - Verify keyboard operation, visible focus, manual tabs, listbox semantics, and roving timeline focus.
 - Verify focus and selection survive polling by stable keys.
 - Verify empty, loading, pending, error, unknown-agent, degraded, and missing-art states.
-- Verify the compact widget and the 840 px detail width without horizontal overflow.
+- Verify the 480 by 420 minimum widget, the 720 by 560 default, the 960 by 720 large state, and the 840 px detail width without horizontal overflow.
 - Verify 200 percent text scaling and `prefers-reduced-motion`.
 
 ### 4. Use synthetic visual evidence

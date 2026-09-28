@@ -10,16 +10,19 @@ use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 
-const MIN_WIDTH: f64 = 320.0;
-const MIN_HEIGHT: f64 = 180.0;
+const MIN_WIDTH: f64 = 480.0;
+const MIN_HEIGHT: f64 = 420.0;
 const MAX_DIMENSION: f64 = 16_384.0;
 const MAX_OFFSET: f64 = 16_384.0;
-const DEFAULT_WIDTH: f64 = 560.0;
-const DEFAULT_HEIGHT: f64 = 360.0;
+const DEFAULT_WIDTH: f64 = 720.0;
+const DEFAULT_HEIGHT: f64 = 560.0;
+const PRIOR_DEFAULT_WIDTH: f64 = 560.0;
+const PRIOR_DEFAULT_HEIGHT: f64 = 360.0;
 const LEGACY_DEFAULT_WIDTH: f64 = 440.0;
 const LEGACY_DEFAULT_HEIGHT: f64 = 260.0;
 const LEGACY_SIZE_MIGRATION_VERSION: u32 = 1;
-const CURRENT_SETTINGS_VERSION: u32 = 2;
+const LAB_CHAT_SIZE_MIGRATION_VERSION: u32 = 3;
+const CURRENT_SETTINGS_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -161,6 +164,13 @@ impl SettingsFile {
         if self.settings_version < LEGACY_SIZE_MIGRATION_VERSION
             && self.viewer.width == LEGACY_DEFAULT_WIDTH
             && self.viewer.height == LEGACY_DEFAULT_HEIGHT
+        {
+            self.viewer.width = PRIOR_DEFAULT_WIDTH;
+            self.viewer.height = PRIOR_DEFAULT_HEIGHT;
+        }
+        if self.settings_version < LAB_CHAT_SIZE_MIGRATION_VERSION
+            && self.viewer.width == PRIOR_DEFAULT_WIDTH
+            && self.viewer.height == PRIOR_DEFAULT_HEIGHT
         {
             self.viewer.width = DEFAULT_WIDTH;
             self.viewer.height = DEFAULT_HEIGHT;
@@ -418,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_an_explicit_legacy_size_after_migration() {
+    fn current_settings_clamp_dimensions_below_the_supported_minimum() {
         let settings = SettingsFile {
             viewer: ViewerSettings {
                 width: LEGACY_DEFAULT_WIDTH,
@@ -430,8 +440,8 @@ mod tests {
         }
         .sanitized();
 
-        assert_eq!(settings.viewer.width, LEGACY_DEFAULT_WIDTH);
-        assert_eq!(settings.viewer.height, LEGACY_DEFAULT_HEIGHT);
+        assert_eq!(settings.viewer.width, MIN_WIDTH);
+        assert_eq!(settings.viewer.height, MIN_HEIGHT);
     }
 
     #[test]
@@ -455,9 +465,69 @@ mod tests {
         assert_eq!(settings.viewer.corner, Corner::BottomLeft);
         assert_eq!(settings.viewer.offset_x, 31.0);
         assert_eq!(settings.viewer.offset_y, 29.0);
-        assert_eq!(settings.viewer.width, LEGACY_DEFAULT_WIDTH);
-        assert_eq!(settings.viewer.height, LEGACY_DEFAULT_HEIGHT);
+        assert_eq!(settings.viewer.width, MIN_WIDTH);
+        assert_eq!(settings.viewer.height, MIN_HEIGHT);
         assert!(settings.viewer.launch_at_login);
+    }
+
+    #[test]
+    fn schema_v2_migrates_only_the_exact_prior_default() {
+        let migrated = serde_json::from_str::<SettingsFile>(
+            r#"{
+                "settingsVersion": 2,
+                "corner": "top-left",
+                "offsetX": 31.0,
+                "offsetY": 29.0,
+                "width": 560.0,
+                "height": 360.0,
+                "launchAtLogin": true,
+                "desktopMode": "passive"
+            }"#,
+        )
+        .expect("schema v2 settings should parse")
+        .sanitized();
+
+        assert_eq!(migrated.settings_version, CURRENT_SETTINGS_VERSION);
+        assert_eq!(migrated.viewer.width, DEFAULT_WIDTH);
+        assert_eq!(migrated.viewer.height, DEFAULT_HEIGHT);
+        assert_eq!(migrated.viewer.corner, Corner::TopLeft);
+        assert_eq!(migrated.viewer.offset_x, 31.0);
+        assert_eq!(migrated.viewer.offset_y, 29.0);
+        assert!(migrated.viewer.launch_at_login);
+        assert_eq!(migrated.viewer.desktop_mode, DesktopMode::Passive);
+
+        let custom = serde_json::from_str::<SettingsFile>(
+            r#"{
+                "settingsVersion": 2,
+                "corner": "top-right",
+                "offsetX": 24.0,
+                "offsetY": 24.0,
+                "width": 640.0,
+                "height": 500.0,
+                "launchAtLogin": false
+            }"#,
+        )
+        .expect("custom schema v2 settings should parse")
+        .sanitized();
+        assert_eq!(custom.viewer.width, 640.0);
+        assert_eq!(custom.viewer.height, 500.0);
+    }
+
+    #[test]
+    fn schema_v3_preserves_the_prior_default_as_an_explicit_size() {
+        let settings = SettingsFile {
+            viewer: ViewerSettings {
+                width: PRIOR_DEFAULT_WIDTH,
+                height: PRIOR_DEFAULT_HEIGHT,
+                ..ViewerSettings::default()
+            },
+            settings_version: CURRENT_SETTINGS_VERSION,
+            ..SettingsFile::default()
+        }
+        .sanitized();
+
+        assert_eq!(settings.viewer.width, PRIOR_DEFAULT_WIDTH);
+        assert_eq!(settings.viewer.height, MIN_HEIGHT);
     }
 
     #[test]

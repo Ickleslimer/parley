@@ -34,7 +34,7 @@ All retrieval uses source- and generation-qualified opaque keys. Event, exchange
 - Handle UTF-8 BOM, CRLF, Unicode split across reads, concurrent append, missing/reappearing files, and bodies above 60,000 characters.
 - Skip malformed lines, unsupported records, and physical lines above 8 MiB while incrementing source and aggregate diagnostics.
 
-Widget excerpts are bounded to 420 Unicode scalar values and never model-generated. For framed requests, extraction searches for `PARLEY_CURRENT_REQUEST_V1` with the event's exact exchange ID, then uses the exact `task:` line remainder when present. The legacy first-`task:` fallback applies only to unframed events. Context source, mode, offsets, counts, truncation, and recovery are available only in detail diagnostics. The interactive surface is the sole desktop transcript renderer.
+Detail and legacy widget excerpts remain bounded to 420 Unicode scalar values and are never model-generated. The desktop chat uses a separate projection: framed requests expose only the exact matching current-request section, visibly mark omitted historical context, and fail closed when the exchange marker does not match. Responses and errors remain exact. Automatic chat bodies are exact 4,000-scalar prefixes of that projection; full projected bodies are retrieved lazily by opaque event key. Context source, mode, offsets, counts, truncation, and recovery remain detail diagnostics. The interactive surface is the sole desktop transcript renderer.
 
 ## Runtime and Settings
 
@@ -58,16 +58,16 @@ Widget excerpts are bounded to 420 Unicode scalar values and never model-generat
 - The surface reports document readiness only from `widget-surface`. Activation requires a healthy underlay, verified styles and null ownership, valid geometry, and a passing desktop-band z-order check.
 - Runtime state is one of `passive`, `interactive-starting`, `interactive`, or `passive-fallback`. Fallback reasons are a closed enum. `passive` and `passive-fallback` retain only the neutral scene; they do not expose an older desktop transcript. Runtime fallback never rewrites the saved `desktopMode` preference.
 - The surface and underlay change visibility atomically. Explorer loss destroys the surface before the underlay enters its existing bounded reattachment path.
-- Browser selection is process-local Rust state. Global order is timestamp descending, configured-source order, then opaque exchange key. Historical identity recovery uses source identity plus raw session, exchange, and event identifiers and fails closed on missing or ambiguous matches.
+- Desktop chat order is global across configured sources: timestamp, configured-source order, then opaque exchange key. Twenty-exchange pages render oldest to newest and anchor only by source-qualified opaque exchange key. A separate opaque history token changes on source generation or topology changes; stale or missing anchors return `resetRequired` and never recover by raw identifiers.
 - The underlay paper column is an empty, accessibility-hidden layout box used only for validated surface geometry. The surface owns the sole desktop conversation and polite live region.
-- Settings schema v2 adds `desktopMode: interactive | passive`; missing values migrate to `interactive` without changing placement, dimensions, sources, monitor, autostart, or any explicit corner choice.
+- Settings schema v3 keeps `desktopMode: interactive | passive`, changes fresh dimensions to 720 by 560 with a 480 by 420 minimum, and migrates only pre-v3 settings that reach the exact prior 560 by 360 default. Placement, sources, monitor, autostart, desktop mode, and all custom dimensions remain unchanged.
 
 ## Frontend IPC
 
 `src/ipc.ts` is the complete frontend authority boundary. Detail and widget views use only its `ViewerApi`; implementation files must not invoke arbitrary Tauri commands.
 
-- `getStatus` drives underlay lifecycle and geometry refresh. `getWidgetBrowser` carries the bounded desktop transcript snapshot; the underlay never requests `getWidgetSnapshot`.
-- `getWidgetBrowser`, `widgetBrowseOlder`, `widgetBrowseNewer`, and `widgetBrowseLive` expose the bounded process-local global browser. `openWidgetExchange` opens the selected exchange in detail.
+- `getStatus` drives underlay lifecycle and geometry refresh. The underlay never requests transcript data.
+- `getWidgetFeed` returns fixed 20-exchange pages and an opaque history token; `getWidgetMessage` returns one complete projected body by opaque event key; `openWidgetEvent` opens that exact raw event in detail. The surface owns Live latching, viewport retention, and its bounded 200-exchange cache.
 - `reportWidgetSurfaceBounds` accepts only validated underlay geometry; `widgetSurfaceReady` accepts readiness only from the surface; `widgetSurfacePointerDown` lets only the surface synchronously restore and verify its desktop-band position before a mouse action; `retryInteractiveMode` explicitly clears only the runtime fallback latch.
 - `listSessions`, `listExchanges`, `search`, and `getEventContent` use opaque keys for paging, search, and exact retrieval.
 - `getSettings`, `saveSettings`, and `listMonitors` drive source ordering and geometry settings.

@@ -12,6 +12,8 @@ import type {
   ViewerSettings,
   ViewerStatus,
   WidgetBrowserSnapshot,
+  WidgetFeedMessage,
+  WidgetFeedPage,
   WidgetSnapshot,
   WidgetSurfaceActivityReport,
   WidgetSurfaceBoundsReport,
@@ -25,6 +27,9 @@ export interface ViewerApi {
   widgetBrowseNewer(): Promise<WidgetBrowserSnapshot>;
   widgetBrowseLive(): Promise<WidgetBrowserSnapshot>;
   openWidgetExchange(): Promise<void>;
+  getWidgetFeed(beforeExchangeKey: string | null): Promise<WidgetFeedPage>;
+  getWidgetMessage(eventKey: string): Promise<WidgetFeedMessage | null>;
+  openWidgetEvent(eventKey: string | null): Promise<void>;
   reportWidgetSurfaceBounds(report: WidgetSurfaceBoundsReport): Promise<ViewerStatus>;
   reportWidgetSurfaceActivity(report: WidgetSurfaceActivityReport): Promise<void>;
   widgetSurfacePointerDown(): Promise<void>;
@@ -62,6 +67,11 @@ export const viewerApi: ViewerApi = {
   widgetBrowseNewer: () => invoke<WidgetBrowserSnapshot>("widget_browse_newer"),
   widgetBrowseLive: () => invoke<WidgetBrowserSnapshot>("widget_browse_live"),
   openWidgetExchange: () => invoke<void>("open_widget_exchange"),
+  getWidgetFeed: (beforeExchangeKey) =>
+    invoke<WidgetFeedPage>("get_widget_feed", { beforeExchangeKey }),
+  getWidgetMessage: (eventKey) =>
+    invoke<WidgetFeedMessage | null>("get_widget_message", { eventKey }),
+  openWidgetEvent: (eventKey) => invoke<void>("open_widget_event", { eventKey }),
   reportWidgetSurfaceBounds: (report) =>
     invoke<ViewerStatus>("report_widget_surface_bounds", { report }),
   reportWidgetSurfaceActivity: (report) =>

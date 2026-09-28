@@ -38,17 +38,19 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 
 ### Desktop widget
 
-- Codex remains visually fixed on the left and Grok on the right.
-- The newest exchange occupies one central chronological message column.
-- The illustrated workshop remains a passive desktop underlay, but its paper column is a neutral geometry plate rather than a second transcript. The taskbar-free interactive surface is the sole desktop conversation view.
-- The interactive column offers Older, Newer, Live, and Open transcript. These controls remain visually part of the paper workbench rather than becoming a toolbar or dashboard.
-- Live is the calm default. Historical browsing must remain visibly distinct without adding badges, gamification, or ambient animation.
+- The taskbar-free interactive surface is a lab-themed chronological chat, not a workshop wallpaper or dashboard.
+- Codex and Grok appear as compact robot-at-device avatars beside their own messages. Unknown agents use a neutral device avatar.
+- The feed combines configured sources globally and groups each request before its completion, error, or pending state.
+- Quiet `New conversation` dividers mark session changes without exposing paths or identifiers.
+- The underlay remains a neutral, accessibility-hidden lab-paper geometry host with no transcript or large workshop illustration.
+- Live is a distinct latched follow mode, visually separate from history loading and transcript actions.
+- The chat uses a visible scrollbar and a 44 by 44 `Load earlier messages` control. Older and Newer pager buttons are not used.
 - Bubble direction follows the normalized speaker, never request or completion role.
 - Unknown speakers use named center slips with no robot tail.
 - Parley errors are execution records and never robot speech.
 - Pending text attaches only to a known target. Unknown targets remain centered.
 - Artwork stays outside the polite live region.
-- At 320 by 180, hide figures before shrinking text. Keep the message column readable.
+- The fresh widget is 720 by 560 and remains readable down to the supported 480 by 420 minimum.
 - The interactive surface owns its rectangle and assumes it is placed over empty desktop space. It never moves, reserves, or inspects desktop icons.
 
 ### Conversation studio
@@ -70,10 +72,11 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 
 ## Motion
 
-- Motion exists only to acknowledge a new request, reply, pending state, or error.
-- Reactions run once per changed event identity and use only opacity and transforms.
+- Motion normally exists only to acknowledge a new request, reply, or error.
+- A single narrow exception permits continuous robot-at-device working motion while that robot is the known target of a pending request.
+- Pending working motion uses only opacity and transforms, starts once for the pending identity, and stops immediately when the request completes or errors.
 - The 500 ms poll never restarts an animation.
-- No animation is infinite.
+- No other animation is infinite or ambient.
 - `prefers-reduced-motion: reduce` disables all decorative motion.
 - No sound is introduced by this redesign.
 

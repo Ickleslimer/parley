@@ -183,6 +183,41 @@ export interface WidgetBrowserSnapshot {
   widget: WidgetSnapshot;
 }
 
+export type WidgetFeedProjection = "exact" | "current-request" | "withheld";
+
+export interface WidgetFeedMessage {
+  eventKey: string;
+  eventType: "request" | "response" | "error";
+  speaker: string;
+  recipient: string;
+  timestampMs: number;
+  status: string;
+  body: string;
+  fullCharacterLength: number;
+  truncated: boolean;
+  projection: WidgetFeedProjection;
+  contextOmitted: boolean;
+}
+
+export interface WidgetFeedExchange {
+  exchangeKey: string;
+  sessionKey: string;
+  timestampMs: number;
+  request: WidgetFeedMessage | null;
+  completion: WidgetFeedMessage | null;
+  pendingLabel: string | null;
+}
+
+export interface WidgetFeedPage {
+  historyToken: string;
+  items: WidgetFeedExchange[];
+  nextBeforeExchangeKey: string | null;
+  hasEarlier: boolean;
+  totalExchanges: number;
+  totalEvents: number;
+  resetRequired: boolean;
+}
+
 export interface WidgetSurfaceBoundsReport {
   left: number;
   top: number;
@@ -228,8 +263,8 @@ export const DEFAULT_SETTINGS: ViewerSettings = {
   corner: "top-right",
   offsetX: 24,
   offsetY: 24,
-  width: 560,
-  height: 360,
+  width: 720,
+  height: 560,
   launchAtLogin: false,
   desktopMode: "interactive",
 };
