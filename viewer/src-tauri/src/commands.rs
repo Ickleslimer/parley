@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::event_engine::{
-    EventContent, ExchangePage, SearchPage, SessionPage, WidgetBrowserSnapshot, WidgetSnapshot,
+    EventContent, ExchangePage, SearchPage, SessionPage, WidgetFeedMessage, WidgetFeedPage,
 };
 use crate::interactive_surface;
 use crate::lifecycle;
@@ -19,67 +20,69 @@ pub fn get_viewer_status(state: State<'_, AppState>) -> ViewerStatus {
 }
 
 #[tauri::command]
-pub fn get_widget_snapshot(state: State<'_, AppState>) -> WidgetSnapshot {
-    state.engine.widget_snapshot()
-}
-
-#[tauri::command]
-pub fn get_widget_browser<R: Runtime>(
+pub fn get_widget_feed<R: Runtime>(
     window: WebviewWindow<R>,
     state: State<'_, AppState>,
-) -> Result<WidgetBrowserSnapshot, String> {
+    before_exchange_key: Option<String>,
+) -> Result<WidgetFeedPage, String> {
     require_widget_surface(&window)?;
-    Ok(state.widget_browser.snapshot(&state.engine))
+    Ok(state.engine.widget_feed(before_exchange_key.as_deref()))
 }
 
 #[tauri::command]
-pub fn widget_browse_older<R: Runtime>(
+pub fn get_widget_message<R: Runtime>(
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+    event_key: String,
+) -> Result<Option<WidgetFeedMessage>, String> {
+    require_widget_surface(&window)?;
+    Ok(state.engine.widget_feed_message(&event_key))
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WidgetEventSelection {
+    event_key: String,
+}
+
+#[tauri::command]
+pub fn open_widget_event<R: Runtime>(
     app: AppHandle<R>,
     window: WebviewWindow<R>,
     state: State<'_, AppState>,
-) -> Result<WidgetBrowserSnapshot, String> {
-    require_widget_surface(&window)?;
-    let snapshot = state.widget_browser.older(&state.engine);
-    record_surface_focus(&app, &state, "older", false);
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub fn widget_browse_newer<R: Runtime>(
-    app: AppHandle<R>,
-    window: WebviewWindow<R>,
-    state: State<'_, AppState>,
-) -> Result<WidgetBrowserSnapshot, String> {
-    require_widget_surface(&window)?;
-    let snapshot = state.widget_browser.newer(&state.engine);
-    record_surface_focus(&app, &state, "newer", false);
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub fn widget_browse_live<R: Runtime>(
-    app: AppHandle<R>,
-    window: WebviewWindow<R>,
-    state: State<'_, AppState>,
-) -> Result<WidgetBrowserSnapshot, String> {
-    require_widget_surface(&window)?;
-    let snapshot = state.widget_browser.live(&state.engine);
-    record_surface_focus(&app, &state, "live", false);
-    Ok(snapshot)
-}
-
-#[tauri::command]
-pub fn open_widget_exchange<R: Runtime>(
-    app: AppHandle<R>,
-    window: WebviewWindow<R>,
-    state: State<'_, AppState>,
+    event_key: Option<String>,
 ) -> Result<(), String> {
     require_widget_surface(&window)?;
-    let selection = state.widget_browser.displayed_event(&state.engine)?;
+    let event_key = match event_key {
+        Some(event_key) => {
+            state
+                .engine
+                .event_content(&event_key)
+                .ok_or_else(|| "widget event is unavailable".to_string())?;
+            event_key
+        }
+        None => {
+            let page = state.engine.widget_feed(None);
+            let exchange = page
+                .items
+                .last()
+                .ok_or_else(|| "widget feed is empty".to_string())?;
+            exchange
+                .completion
+                .as_ref()
+                .or(exchange.request.as_ref())
+                .map(|message| message.event_key.clone())
+                .ok_or_else(|| "widget exchange has no event".to_string())?
+        }
+    };
     lifecycle::show_detail(&app)?;
-    record_surface_focus(&app, &state, "open-transcript", true);
-    app.emit_to(lifecycle::DETAIL_LABEL, "widget-open-exchange", selection)
-        .map_err(|error| format!("failed to select the widget exchange in detail: {error}"))
+    record_surface_focus(&app, &state, "open-widget-event", true);
+    app.emit_to(
+        lifecycle::DETAIL_LABEL,
+        "widget-open-exchange",
+        WidgetEventSelection { event_key },
+    )
+    .map_err(|error| format!("failed to select the widget event in detail: {error}"))
 }
 
 #[tauri::command]

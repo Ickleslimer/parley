@@ -10,9 +10,9 @@ use super::source::{
 };
 use super::store::{page, Store};
 use super::types::{
-    Diagnostics, EngineStatus, EventContent, ExchangePage, ExchangeSummary, IdMatch, SearchHit,
-    SearchPage, SessionPage, SessionSummary, SourceState, SourceStatus, WidgetExchange,
-    WidgetSnapshot,
+    Diagnostics, EngineStatus, EventContent, ExchangePage, IdMatch, SearchHit, SearchPage,
+    SessionPage, SessionSummary, SourceState, SourceStatus, WidgetFeedMessage, WidgetFeedPage,
+    WIDGET_FEED_PAGE_SIZE,
 };
 
 #[derive(Debug)]
@@ -179,12 +179,12 @@ impl EventEngine {
             .match_latest_grok_response_before(timestamp_ms, session_id)
     }
 
-    pub fn widget_snapshot(&self) -> WidgetSnapshot {
-        self.lock().widget_snapshot()
+    pub fn widget_feed(&self, before_exchange_key: Option<&str>) -> WidgetFeedPage {
+        self.lock().widget_feed(before_exchange_key)
     }
 
-    pub fn widget_exchanges(&self) -> Vec<WidgetExchange> {
-        self.lock().widget_exchanges()
+    pub fn widget_feed_message(&self, event_key: &str) -> Option<WidgetFeedMessage> {
+        self.lock().widget_feed_message(event_key)
     }
 }
 
@@ -653,51 +653,104 @@ impl Inner {
             .unwrap_or(IdMatch::None)
     }
 
-    fn widget_snapshot(&self) -> WidgetSnapshot {
-        let mut ranked: Vec<(u64, usize, String, ExchangeSummary)> = Vec::new();
-        for (order, source) in self.unique_sources_enumerated() {
-            if let Some(exchange) = source.store.newest_exchange_summary(source.keys()) {
+    fn widget_feed(&self, before_exchange_key: Option<&str>) -> WidgetFeedPage {
+        let history_token = self.widget_history_token();
+        let total_events = self
+            .unique_sources()
+            .map(|source| source.store.event_count() as u64)
+            .sum();
+        let mut ranked = Vec::new();
+        for (source_order, source) in self.unique_sources_enumerated() {
+            for rank in source.store.widget_feed_ranks(source.keys()) {
                 ranked.push((
-                    exchange.timestamp_ms,
-                    order,
-                    exchange.exchange_key.clone(),
-                    exchange,
+                    rank.timestamp_ms,
+                    source_order,
+                    rank.exchange_key,
+                    rank.exchange_id,
                 ));
             }
         }
         ranked.sort_by(|left, right| {
-            compare_newest_first((left.0, left.1, &left.2), (right.0, right.1, &right.2))
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
         });
-        let Some(summary) = ranked.into_iter().next().map(|item| item.3) else {
-            return WidgetSnapshot::empty();
+        let total_exchanges = ranked.len() as u64;
+        let end = match before_exchange_key {
+            Some(anchor) => match ranked.iter().position(|item| item.2 == anchor) {
+                Some(position) => position,
+                None => {
+                    return WidgetFeedPage {
+                        history_token,
+                        items: Vec::new(),
+                        next_before_exchange_key: None,
+                        has_earlier: false,
+                        total_exchanges,
+                        total_events,
+                        reset_required: true,
+                    };
+                }
+            },
+            None => ranked.len(),
         };
-        WidgetSnapshot::from_exchange(&summary)
+        let start = end.saturating_sub(WIDGET_FEED_PAGE_SIZE);
+        let items = ranked[start..end]
+            .iter()
+            .filter_map(|(_, source_order, _, exchange_id)| {
+                let source = &self.sources[*source_order];
+                source
+                    .store
+                    .widget_feed_exchange(exchange_id, source.keys())
+            })
+            .collect::<Vec<_>>();
+        let has_earlier = start > 0;
+        let next_before_exchange_key = has_earlier
+            .then(|| items.first().map(|item| item.exchange_key.clone()))
+            .flatten();
+        WidgetFeedPage {
+            history_token,
+            items,
+            next_before_exchange_key,
+            has_earlier,
+            total_exchanges,
+            total_events,
+            reset_required: false,
+        }
     }
 
-    fn widget_exchanges(&self) -> Vec<WidgetExchange> {
-        let mut ranked: Vec<(u64, usize, String, WidgetExchange)> = Vec::new();
-        for (order, source) in self.unique_sources_enumerated() {
-            for summary in source.store.all_exchanges(source.keys()) {
-                ranked.push((
-                    summary.timestamp_ms,
-                    order,
-                    summary.exchange_key.clone(),
-                    WidgetExchange {
-                        source_identity: source.identity.clone(),
-                        summary,
-                    },
-                ));
-            }
+    fn widget_feed_message(&self, event_key: &str) -> Option<WidgetFeedMessage> {
+        let decoded = decode_key(event_key, KeyKind::Event)?;
+        let (_, source) = self.source_for_key(&decoded.source_id, decoded.generation)?;
+        source
+            .store
+            .widget_feed_message(&decoded.raw_id, source.keys())
+    }
+
+    fn widget_history_token(&self) -> String {
+        let mut hash = 0xcbf29ce484222325_u64;
+        for (order, source) in self.sources.iter().enumerate() {
+            hash_feed_part(&mut hash, order.to_string().as_bytes());
+            hash_feed_part(&mut hash, source.identity.as_bytes());
+            hash_feed_part(&mut hash, source.generation.to_string().as_bytes());
+            hash_feed_part(
+                &mut hash,
+                source.alias_of.as_deref().unwrap_or("-").as_bytes(),
+            );
         }
-        ranked.sort_by(|left, right| {
-            compare_newest_first((left.0, left.1, &left.2), (right.0, right.1, &right.2))
-        });
-        ranked.into_iter().map(|item| item.3).collect()
+        format!("wfh1-{hash:016x}")
     }
 
     fn source_for_key(&self, source_id: &str, generation: u64) -> Option<(usize, &WatchedSource)> {
         self.unique_sources_enumerated()
             .find(|(_, source)| source.identity == source_id && source.generation == generation)
+    }
+}
+
+fn hash_feed_part(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes.iter().copied().chain(std::iter::once(0xff)) {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
     }
 }
 
@@ -791,14 +844,6 @@ fn aggregate_state(states: &[SourceState]) -> SourceState {
     } else {
         SourceState::None
     }
-}
-
-fn compare_newest_first(left: (u64, usize, &str), right: (u64, usize, &str)) -> std::cmp::Ordering {
-    right
-        .0
-        .cmp(&left.0)
-        .then_with(|| left.1.cmp(&right.1))
-        .then_with(|| left.2.cmp(right.2))
 }
 
 fn empty_exchange_page() -> ExchangePage {

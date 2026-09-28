@@ -10,8 +10,8 @@ pub use engine::EventEngine;
 pub use types::{
     ContextDiagnostics, Diagnostics, EngineStatus, EventContent, EventType, ExchangePage,
     ExchangeSummary, IdMatch, MessagePreview, SearchHit, SearchPage, SessionPage, SessionSummary,
-    SourceState, SourceStatus, WidgetBrowserSnapshot, WidgetExchange, WidgetSelectionState,
-    WidgetSnapshot,
+    SourceState, SourceStatus, WidgetFeedExchange, WidgetFeedMessage, WidgetFeedPage,
+    WidgetFeedProjection,
 };
 
 #[cfg(test)]

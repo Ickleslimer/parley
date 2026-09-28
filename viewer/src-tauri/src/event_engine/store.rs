@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
-use super::excerpt::{excerpt, parse_context_diagnostics, window_from};
+use super::excerpt::{excerpt, parse_context_diagnostics, widget_projection, window_from};
 use super::keys::KeyContext;
 use super::parse::ParsedEvent;
 use super::types::{
     clamp_page_limit, speakers, EventContent, EventType, ExchangeSummary, MessagePreview,
-    SearchHit, SessionSummary, PENDING_LABEL,
+    SearchHit, SessionSummary, WidgetFeedExchange, WidgetFeedMessage, PENDING_LABEL,
+    WIDGET_FEED_BODY_LIMIT,
 };
 
 #[derive(Clone, Debug)]
@@ -50,6 +51,13 @@ pub(crate) struct Store {
     exchanges: HashMap<String, ExchangeAcc>,
     sessions: HashMap<String, SessionAcc>,
     next_seq: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WidgetFeedRank {
+    pub exchange_id: String,
+    pub exchange_key: String,
+    pub timestamp_ms: u64,
 }
 
 impl Store {
@@ -200,11 +208,47 @@ impl Store {
             .collect()
     }
 
-    pub(crate) fn all_exchanges(&self, keys: KeyContext<'_>) -> Vec<ExchangeSummary> {
+    pub(crate) fn widget_feed_ranks(&self, keys: KeyContext<'_>) -> Vec<WidgetFeedRank> {
         self.exchanges
             .values()
-            .map(|exchange| self.exchange_summary(exchange, keys))
+            .map(|exchange| WidgetFeedRank {
+                exchange_id: exchange.exchange_id.clone(),
+                exchange_key: keys.exchange_key(&exchange.exchange_id),
+                timestamp_ms: exchange.timestamp_ms,
+            })
             .collect()
+    }
+
+    pub(crate) fn widget_feed_exchange(
+        &self,
+        exchange_id: &str,
+        keys: KeyContext<'_>,
+    ) -> Option<WidgetFeedExchange> {
+        let exchange = self.exchanges.get(exchange_id)?;
+        let request = exchange
+            .request_idx
+            .map(|idx| self.widget_feed_message_at(idx, keys, true));
+        let completion = exchange
+            .completion_idx
+            .map(|idx| self.widget_feed_message_at(idx, keys, true));
+        Some(WidgetFeedExchange {
+            exchange_key: keys.exchange_key(&exchange.exchange_id),
+            session_key: keys.session_key(&exchange.session_id),
+            timestamp_ms: exchange.timestamp_ms,
+            pending_label: (request.is_some() && completion.is_none())
+                .then(|| PENDING_LABEL.to_string()),
+            request,
+            completion,
+        })
+    }
+
+    pub(crate) fn widget_feed_message(
+        &self,
+        event_id: &str,
+        keys: KeyContext<'_>,
+    ) -> Option<WidgetFeedMessage> {
+        let idx = *self.by_event_id.get(event_id)?;
+        Some(self.widget_feed_message_at(idx, keys, false))
     }
 
     pub(crate) fn all_search_hits(&self, query: &str, keys: KeyContext<'_>) -> Vec<SearchHit> {
@@ -304,19 +348,6 @@ impl Store {
         }
     }
 
-    pub(crate) fn newest_exchange_summary(&self, keys: KeyContext<'_>) -> Option<ExchangeSummary> {
-        self.newest_exchange()
-            .map(|exchange| self.exchange_summary(exchange, keys))
-    }
-
-    fn newest_exchange(&self) -> Option<&ExchangeAcc> {
-        self.exchanges.values().max_by(|left, right| {
-            left.timestamp_ms
-                .cmp(&right.timestamp_ms)
-                .then_with(|| left.last_seq.cmp(&right.last_seq))
-        })
-    }
-
     fn session_summary(&self, session: &SessionAcc, keys: KeyContext<'_>) -> SessionSummary {
         let exchange = self.exchanges.get(&session.latest_exchange_id);
         let (latest_source, latest_target, latest_excerpt, excerpt_extracted) = exchange
@@ -405,6 +436,45 @@ impl Store {
             excerpt,
             excerpt_extracted,
             content_length: text.chars().count() as u64,
+        }
+    }
+
+    fn widget_feed_message_at(
+        &self,
+        idx: usize,
+        keys: KeyContext<'_>,
+        bounded: bool,
+    ) -> WidgetFeedMessage {
+        let event = &self.events[idx];
+        let (speaker, recipient) = speakers(event.event_type, &event.source, &event.target);
+        let projected = widget_projection(
+            preview_text(event),
+            event.event_type == EventType::Request,
+            &event.exchange_id,
+        );
+        let full_character_length = projected.text.chars().count();
+        let truncated = bounded && full_character_length > WIDGET_FEED_BODY_LIMIT;
+        let body = if bounded {
+            projected
+                .text
+                .chars()
+                .take(WIDGET_FEED_BODY_LIMIT)
+                .collect()
+        } else {
+            projected.text.to_string()
+        };
+        WidgetFeedMessage {
+            event_key: keys.event_key(&event.event_id),
+            event_type: event.event_type,
+            speaker,
+            recipient,
+            timestamp_ms: event.timestamp_ms,
+            status: event.status.clone(),
+            body,
+            full_character_length: full_character_length as u64,
+            truncated,
+            projection: projected.projection,
+            context_omitted: projected.context_omitted,
         }
     }
 }

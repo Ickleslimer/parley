@@ -125,10 +125,293 @@ fn event_engine_is_send_sync_and_starts_empty() {
     assert_eq!(status.source_state, SourceState::None);
     assert_eq!(status.generation, 0);
     assert_eq!(status.session_count, 0);
-    assert!(engine.widget_snapshot().exchange_id.is_none());
+    let feed = engine.widget_feed(None);
+    assert!(feed.items.is_empty());
+    assert_eq!(feed.total_exchanges, 0);
+    assert_eq!(feed.total_events, 0);
     assert!(engine.event_content("missing").is_none());
     assert!(engine.response_for_exchange("missing").is_none());
     assert!(engine.latest_grok_response_before(u64::MAX, None).is_none());
+}
+
+#[test]
+fn widget_feed_pages_oldest_to_newest_with_stable_opaque_anchors() {
+    let log = TempLog::new("widget-feed-pages");
+    let lines = (0..25)
+        .map(|index| {
+            event_line(
+                "request",
+                &format!("request-{index:02}"),
+                &format!("exchange-{index:02}"),
+                Some(&format!("session-{}", index / 5)),
+                Some(&format!("message {index:02}")),
+                index,
+            )
+        })
+        .collect::<Vec<_>>();
+    write_lines(&log, &lines);
+    let engine = watching_engine(&log);
+
+    let newest = engine.widget_feed(None);
+    assert!(!newest.reset_required);
+    assert_eq!(newest.items.len(), 20);
+    assert_eq!(newest.total_exchanges, 25);
+    assert_eq!(newest.total_events, 25);
+    assert!(newest.has_earlier);
+    assert_eq!(
+        newest.items.first().unwrap().request.as_ref().unwrap().body,
+        "message 05"
+    );
+    assert_eq!(
+        newest.items.last().unwrap().request.as_ref().unwrap().body,
+        "message 24"
+    );
+    let anchor = newest
+        .next_before_exchange_key
+        .as_deref()
+        .expect("newest page should expose an older anchor");
+    assert!(anchor.starts_with("pv1:exchange:"));
+
+    let earlier = engine.widget_feed(Some(anchor));
+    assert_eq!(earlier.items.len(), 5);
+    assert!(!earlier.has_earlier);
+    assert!(earlier.next_before_exchange_key.is_none());
+    assert_eq!(
+        earlier
+            .items
+            .first()
+            .unwrap()
+            .request
+            .as_ref()
+            .unwrap()
+            .body,
+        "message 00"
+    );
+    assert_eq!(
+        earlier.items.last().unwrap().request.as_ref().unwrap().body,
+        "message 04"
+    );
+    assert_eq!(earlier.history_token, newest.history_token);
+}
+
+#[test]
+fn widget_feed_projects_matching_requests_and_bounds_unicode_scalars() {
+    let log = TempLog::new("widget-feed-projection");
+    let exact = "\u{1f9ec}".repeat(4_001);
+    let framed = format!(
+        "=== PARLEY_UNTRUSTED_CONTEXT_V1 exchange=ex-framed ===\n\
+source: codex\n\
+=== BEGIN_UNTRUSTED_TRANSCRIPT ===\n\
+private history\n\
+=== END_UNTRUSTED_TRANSCRIPT ===\n\
+=== PARLEY_CURRENT_REQUEST_V1 exchange=ex-framed ===\n{exact}"
+    );
+    write_lines(
+        &log,
+        &[
+            event_line(
+                "request",
+                "request-framed",
+                "ex-framed",
+                Some("session-framed"),
+                Some(&framed),
+                1,
+            ),
+            event_line(
+                "request",
+                "request-mismatch",
+                "ex-mismatch",
+                Some("session-framed"),
+                Some("=== PARLEY_CURRENT_REQUEST_V1 exchange=other ===\nsecret"),
+                2,
+            ),
+        ],
+    );
+    let engine = watching_engine(&log);
+    let page = engine.widget_feed(None);
+    let framed_message = page.items[0].request.as_ref().unwrap();
+    assert_eq!(framed_message.body.chars().count(), 4_000);
+    assert_eq!(framed_message.full_character_length, 4_001);
+    assert!(framed_message.truncated);
+    assert!(framed_message.context_omitted);
+    assert_eq!(
+        framed_message.projection,
+        WidgetFeedProjection::CurrentRequest
+    );
+    assert!(!framed_message.body.contains("private history"));
+
+    let full = engine
+        .widget_feed_message(&framed_message.event_key)
+        .expect("full projected message");
+    assert_eq!(full.body, exact);
+    assert_eq!(full.body.chars().count(), 4_001);
+    assert!(!full.truncated);
+
+    let withheld = page.items[1].request.as_ref().unwrap();
+    assert_eq!(withheld.projection, WidgetFeedProjection::Withheld);
+    assert_eq!(withheld.body, "");
+    assert_eq!(withheld.full_character_length, 0);
+    assert!(withheld.context_omitted);
+}
+
+#[test]
+fn widget_feed_counts_completion_events_and_keeps_error_semantics() {
+    let log = TempLog::new("widget-feed-updates");
+    write_lines(
+        &log,
+        &[
+            event_line(
+                "request",
+                "request-1",
+                "exchange-1",
+                Some("session-1"),
+                Some("waiting"),
+                1,
+            ),
+            event_line(
+                "request",
+                "request-2",
+                "exchange-2",
+                Some("session-1"),
+                Some("will fail"),
+                2,
+            ),
+            event_line("error", "error-2", "exchange-2", Some("session-1"), None, 3),
+        ],
+    );
+    let engine = watching_engine(&log);
+    let initial = engine.widget_feed(None);
+    assert_eq!(initial.total_events, 3);
+    assert_eq!(
+        initial.items[0].pending_label.as_deref(),
+        Some(PENDING_LABEL)
+    );
+    let error = initial.items[1].completion.as_ref().unwrap();
+    assert_eq!(error.event_type, EventType::Error);
+    assert_eq!(error.body, "boom");
+
+    log.append(
+        format!(
+            "{}\n",
+            event_line(
+                "response",
+                "response-1",
+                "exchange-1",
+                Some("session-1"),
+                Some("complete"),
+                4,
+            )
+        )
+        .as_bytes(),
+    );
+    assert!(engine.poll());
+    let updated = engine.widget_feed(None);
+    assert_eq!(updated.total_events, 4);
+    let completed = updated
+        .items
+        .iter()
+        .find(|exchange| {
+            exchange
+                .request
+                .as_ref()
+                .is_some_and(|message| message.body == "waiting")
+        })
+        .unwrap();
+    assert!(completed.pending_label.is_none());
+    assert_eq!(completed.completion.as_ref().unwrap().body, "complete");
+}
+
+#[test]
+fn widget_feed_history_token_and_anchor_fail_closed_after_replacement() {
+    let log = TempLog::new("widget-feed-reset");
+    write_lines(
+        &log,
+        &[
+            event_line(
+                "request",
+                "request-old",
+                "exchange-old",
+                Some("session-old"),
+                Some("old"),
+                1,
+            ),
+            event_line(
+                "request",
+                "request-new",
+                "exchange-new",
+                Some("session-new"),
+                Some("new"),
+                2,
+            ),
+        ],
+    );
+    let engine = watching_engine(&log);
+    let first = engine.widget_feed(None);
+    let stale_anchor = first.items[0].exchange_key.clone();
+
+    fs::remove_file(log.path()).unwrap();
+    write_lines(
+        &log,
+        &[event_line(
+            "request",
+            "request-replacement",
+            "exchange-replacement",
+            Some("session-replacement"),
+            Some("replacement"),
+            3,
+        )],
+    );
+    assert!(engine.poll());
+    let reset = engine.widget_feed(Some(&stale_anchor));
+    assert!(reset.reset_required);
+    assert!(reset.items.is_empty());
+    assert_ne!(reset.history_token, first.history_token);
+    assert_eq!(reset.total_exchanges, 1);
+}
+
+#[test]
+fn widget_feed_keeps_cross_source_raw_id_collisions_distinct() {
+    let first = TempLog::new("widget-feed-source-a");
+    let second = TempLog::new("widget-feed-source-b");
+    write_lines(
+        &first,
+        &[event_line(
+            "request",
+            "request-shared",
+            "exchange-shared",
+            Some("session-shared"),
+            Some("source a"),
+            10,
+        )],
+    );
+    write_lines(
+        &second,
+        &[event_line(
+            "request",
+            "request-shared",
+            "exchange-shared",
+            Some("session-shared"),
+            Some("source b"),
+            10,
+        )],
+    );
+    let engine = EventEngine::new();
+    engine
+        .set_sources(vec![
+            first.path().to_path_buf(),
+            second.path().to_path_buf(),
+        ])
+        .unwrap();
+    engine.poll();
+    let page = engine.widget_feed(None);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].request.as_ref().unwrap().body, "source a");
+    assert_eq!(page.items[1].request.as_ref().unwrap().body, "source b");
+    assert_ne!(page.items[0].exchange_key, page.items[1].exchange_key);
+    assert_ne!(
+        page.items[0].request.as_ref().unwrap().event_key,
+        page.items[1].request.as_ref().unwrap().event_key
+    );
 }
 
 #[test]
@@ -557,9 +840,10 @@ fn pairs_request_response_and_error_and_exposes_pending_label() {
     assert_eq!(error_search.total, 1);
     assert_eq!(error_search.items[0].event_id, "err-2");
 
-    let snapshot = engine.widget_snapshot();
-    assert_eq!(snapshot.exchange_id.as_deref(), Some("ex-3"));
-    assert_eq!(snapshot.pending_label.as_deref(), Some(PENDING_LABEL));
+    let feed = engine.widget_feed(None);
+    let latest = feed.items.last().expect("latest feed exchange");
+    assert_eq!(latest.pending_label.as_deref(), Some(PENDING_LABEL));
+    assert_eq!(latest.request.as_ref().unwrap().body, "waiting");
 }
 
 #[test]
@@ -635,10 +919,20 @@ fn retrieves_exact_content_above_sixty_thousand_characters() {
     assert!(hit.items[0].excerpt.starts_with("UNIQUE_TOKEN"));
     assert!(hit.items[0].excerpt.chars().count() <= 420);
 
-    let preview = engine.widget_snapshot().completion.unwrap();
+    let session = engine.session_page(None, 1).items.remove(0);
+    let preview = engine
+        .exchange_page(&session.session_key, None, 1)
+        .items
+        .remove(0)
+        .completion
+        .unwrap();
     assert_eq!(preview.content_length, 70_012);
     assert_eq!(preview.excerpt.chars().count(), 420);
     assert!(content.starts_with(&preview.excerpt));
+    let feed_message = engine.widget_feed(None).items.remove(0).completion.unwrap();
+    assert_eq!(feed_message.full_character_length, 70_012);
+    assert_eq!(feed_message.body.chars().count(), 4_000);
+    assert!(content.starts_with(&feed_message.body));
 }
 
 #[test]
@@ -808,9 +1102,11 @@ fn does_not_pair_across_sources_or_generations_and_uses_opaque_keys() {
     assert!(engine.response_for_exchange(&unique_a.event_key).is_none());
     assert_eq!(engine.exchange_page(&unique_a.event_key, None, 10).total, 0);
 
-    let snapshot = engine.widget_snapshot();
-    assert_eq!(snapshot.exchange_id.as_deref(), Some("shared-exchange"));
-    assert_eq!(snapshot.request.as_ref().unwrap().excerpt, "from-b");
+    let feed = engine.widget_feed(None);
+    assert_eq!(
+        feed.items.last().unwrap().request.as_ref().unwrap().body,
+        "from-b"
+    );
 }
 
 #[test]
@@ -1005,13 +1301,19 @@ fn acceptance_reads_real_multi_logs_without_gui() {
             && source.alias_of.is_none()
             && source.bytes_read > 0
     }));
-    let snapshot = engine.widget_snapshot();
-    assert_eq!(
-        snapshot.exchange_id.as_deref(),
-        Some(expected_exchange.as_str())
-    );
+    let feed = engine.widget_feed(None);
+    let newest = feed.items.last().expect("globally newest exchange");
+    let newest_message = newest
+        .completion
+        .as_ref()
+        .or(newest.request.as_ref())
+        .expect("globally newest exchange message");
+    let newest_content = engine
+        .event_content(&newest_message.event_key)
+        .expect("globally newest event content");
+    assert_eq!(newest_content.exchange_id, expected_exchange);
     let completion = engine
-        .response_for_exchange(snapshot.exchange_key.as_deref().expect("exchange key"))
+        .response_for_exchange(&newest.exchange_key)
         .expect("globally newest exchange completion");
     let actual_source = fs::canonicalize(&completion.source_path).unwrap();
     let expected_source = fs::canonicalize(&expected_source).unwrap();
@@ -1020,10 +1322,10 @@ fn acceptance_reads_real_multi_logs_without_gui() {
         .eq_ignore_ascii_case(&expected_source.to_string_lossy()));
     assert_eq!(
         status.last_event_timestamp_ms,
-        snapshot
+        newest
             .completion
             .as_ref()
-            .or(snapshot.request.as_ref())
+            .or(newest.request.as_ref())
             .map(|message| message.timestamp_ms)
     );
     eprintln!(
@@ -1059,18 +1361,17 @@ fn extracts_matching_context_marker_and_keeps_context_off_the_widget() {
     assert_eq!(context.from_offset, Some(4));
     assert_eq!(context.truncated, Some(true));
     assert_eq!(context.recovery.as_deref(), Some("skip"));
-    let snapshot = engine.widget_snapshot();
-    assert_eq!(
-        snapshot.request.as_ref().unwrap().excerpt,
-        " Current framed task"
-    );
-    assert!(snapshot.request.as_ref().unwrap().excerpt_extracted);
-    let encoded = serde_json::to_value(&snapshot).unwrap();
+    let feed = engine.widget_feed(None);
+    let request = feed.items[0].request.as_ref().unwrap();
+    assert_eq!(request.body, "policy:\n  task: Current framed task\n");
+    assert_eq!(request.projection, WidgetFeedProjection::CurrentRequest);
+    assert!(request.context_omitted);
+    let encoded = serde_json::to_value(&feed).unwrap();
     assert!(encoded.get("context").is_none());
 }
 
 #[test]
-fn widget_exchanges_follow_global_newest_source_then_key_order() {
+fn widget_feed_follows_timestamp_source_then_key_order() {
     let older = TempLog::new("browser-order-a");
     let newer_same_ts = TempLog::new("browser-order-b");
     write_lines(
@@ -1110,18 +1411,19 @@ fn widget_exchanges_follow_global_newest_source_then_key_order() {
         .unwrap();
     engine.poll();
 
-    let ids = engine
-        .widget_exchanges()
+    let bodies = engine
+        .widget_feed(None)
+        .items
         .into_iter()
-        .map(|exchange| exchange.summary.exchange_id)
+        .map(|exchange| exchange.request.expect("request").body)
         .collect::<Vec<_>>();
     assert_eq!(
-        ids,
+        bodies,
         vec![
-            "ex-a-new".to_string(),
-            "ex-b-m".to_string(),
-            "ex-b-z".to_string(),
-            "ex-a-old".to_string()
+            "old".to_string(),
+            "new".to_string(),
+            "m".to_string(),
+            "z".to_string()
         ]
     );
 }

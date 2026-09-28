@@ -10,7 +10,6 @@ mod peer_activity;
 mod peer_health;
 mod runtime;
 mod settings;
-mod widget_browser;
 
 pub fn run() {
     tauri::Builder::default()
@@ -27,12 +26,9 @@ pub fn run() {
         .plugin(tauri_plugin_desktop_underlay::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_viewer_status,
-            commands::get_widget_snapshot,
-            commands::get_widget_browser,
-            commands::widget_browse_older,
-            commands::widget_browse_newer,
-            commands::widget_browse_live,
-            commands::open_widget_exchange,
+            commands::get_widget_feed,
+            commands::get_widget_message,
+            commands::open_widget_event,
             commands::list_sessions,
             commands::list_exchanges,
             commands::search_events,
