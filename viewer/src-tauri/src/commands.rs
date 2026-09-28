@@ -191,6 +191,28 @@ pub fn widget_surface_ready<R: Runtime>(
 }
 
 #[tauri::command]
+pub fn report_widget_surface_activity<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    report: interactive_surface::WidgetSurfaceActivityReport,
+) -> Result<(), String> {
+    require_widget_surface(&window)?;
+    interactive_surface::record_surface_activity(&app, report)
+}
+
+#[tauri::command]
+pub fn widget_surface_pointer_down<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    require_widget_surface(&window)?;
+    interactive_surface::reassert_surface_after_pointer(&app)?;
+    state.clear_surface_corrections();
+    Ok(())
+}
+
+#[tauri::command]
 pub fn retry_interactive_mode<R: Runtime>(
     app: AppHandle<R>,
     window: WebviewWindow<R>,

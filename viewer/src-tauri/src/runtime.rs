@@ -16,6 +16,7 @@ const ATTACH_RETRY_MS: u64 = 1_000;
 const ATTACH_COOLDOWN_MS: u64 = 15_000;
 const HEALTH_CHECK_MS: u64 = 2_000;
 const SURFACE_CORRECTION_WINDOW_MS: u64 = 10_000;
+const SURFACE_CORRECTION_RETRY_MS: u64 = 1_000;
 const MAX_SURFACE_CORRECTIONS: usize = 3;
 const MIN_SURFACE_WIDTH: f64 = 176.0;
 const MIN_SURFACE_HEIGHT: f64 = 132.0;
@@ -183,6 +184,13 @@ pub struct InteractiveSnapshot {
     pub surface_ready: bool,
     pub fallback_latched: bool,
     pub state: DesktopRuntimeState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceCorrectionDecision {
+    Wait,
+    Attempt,
+    Exhausted,
 }
 
 #[derive(Debug)]
@@ -481,7 +489,7 @@ impl AppState {
         Ok(())
     }
 
-    pub fn allow_surface_correction(&self, now_ms: u64) -> bool {
+    pub fn surface_correction_decision(&self, now_ms: u64) -> SurfaceCorrectionDecision {
         let mut runtime = self.lock_runtime();
         while runtime
             .surface_corrections_ms
@@ -492,11 +500,24 @@ impl AppState {
         {
             runtime.surface_corrections_ms.pop_front();
         }
+        if runtime
+            .surface_corrections_ms
+            .back()
+            .is_some_and(|timestamp| {
+                now_ms.saturating_sub(*timestamp) < SURFACE_CORRECTION_RETRY_MS
+            })
+        {
+            return SurfaceCorrectionDecision::Wait;
+        }
         if runtime.surface_corrections_ms.len() >= MAX_SURFACE_CORRECTIONS {
-            return false;
+            return SurfaceCorrectionDecision::Exhausted;
         }
         runtime.surface_corrections_ms.push_back(now_ms);
-        true
+        SurfaceCorrectionDecision::Attempt
+    }
+
+    pub fn clear_surface_corrections(&self) {
+        self.lock_runtime().surface_corrections_ms.clear();
     }
 
     pub fn mark_exiting(&self) {
@@ -762,11 +783,35 @@ mod tests {
     #[test]
     fn surface_corrections_are_bounded_per_ten_second_window() {
         let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
-        assert!(state.allow_surface_correction(0));
-        assert!(state.allow_surface_correction(1));
-        assert!(state.allow_surface_correction(2));
-        assert!(!state.allow_surface_correction(3));
-        assert!(state.allow_surface_correction(SURFACE_CORRECTION_WINDOW_MS));
+        assert_eq!(
+            state.surface_correction_decision(0),
+            SurfaceCorrectionDecision::Attempt
+        );
+        assert_eq!(
+            state.surface_correction_decision(SURFACE_CORRECTION_RETRY_MS - 1),
+            SurfaceCorrectionDecision::Wait
+        );
+        assert_eq!(
+            state.surface_correction_decision(SURFACE_CORRECTION_RETRY_MS),
+            SurfaceCorrectionDecision::Attempt
+        );
+        assert_eq!(
+            state.surface_correction_decision(SURFACE_CORRECTION_RETRY_MS * 2),
+            SurfaceCorrectionDecision::Attempt
+        );
+        assert_eq!(
+            state.surface_correction_decision(SURFACE_CORRECTION_RETRY_MS * 3),
+            SurfaceCorrectionDecision::Exhausted
+        );
+        assert_eq!(
+            state.surface_correction_decision(SURFACE_CORRECTION_WINDOW_MS),
+            SurfaceCorrectionDecision::Attempt
+        );
+        state.clear_surface_corrections();
+        assert_eq!(
+            state.surface_correction_decision(SURFACE_CORRECTION_WINDOW_MS + 1),
+            SurfaceCorrectionDecision::Attempt
+        );
     }
 
     #[test]

@@ -1,14 +1,17 @@
 use std::env;
 use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{
-    App, AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Runtime, WebviewWindow,
-    Window, WindowEvent,
+    App, AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Runtime, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_desktop_underlay::DesktopUnderlayExt;
@@ -26,7 +29,8 @@ use crate::launch::{resolve_initial_sources, LaunchOptions, SourceOrigin};
 use crate::peer_health;
 use crate::runtime::{
     calculate_placement, AppState, DesktopFallbackReason, DesktopRuntimeState, MonitorInfo,
-    UnderlayAction, UnderlayState, WidgetSurfaceBoundsReport, WorkArea,
+    SurfaceCorrectionDecision, UnderlayAction, UnderlayState, WidgetPlacement,
+    WidgetSurfaceBoundsReport, WorkArea,
 };
 use crate::settings::{
     load_settings, reconcile_autostart, AutostartReconcile, DesktopMode, SettingsFile,
@@ -45,6 +49,16 @@ const MENU_HEALTH_HANDOFF: &str = "peer-health-handoff";
 const MENU_EXIT: &str = "exit";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PEER_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InteractiveRuntimeDiagnostic<'a> {
+    schema_version: u8,
+    timestamp_ms: u64,
+    event_type: &'a str,
+    reason: Option<DesktopFallbackReason>,
+    detail: Option<&'a str>,
+}
 
 pub struct TrayControls<R: Runtime> {
     widget_visible: CheckMenuItem<R>,
@@ -125,7 +139,21 @@ pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let tray_available = state.runtime_snapshot().tray_available;
-    if launch.show_detail() || !tray_available {
+    let widget_available = if tray_available {
+        match create_widget_window(app.handle()) {
+            Ok(()) => true,
+            Err(error) => {
+                state.request_widget(false);
+                sync_widget_check(app.handle());
+                state.set_runtime_error(error);
+                false
+            }
+        }
+    } else {
+        state.request_widget(false);
+        false
+    };
+    if launch.show_detail() || !tray_available || !widget_available {
         if let Err(error) = show_detail(app.handle()) {
             state.set_runtime_error(error);
         }
@@ -225,6 +253,48 @@ pub fn list_monitors<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<MonitorInfo>,
 pub fn apply_widget_placement<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let state = app.state::<AppState>();
     let settings = state.settings().viewer;
+    let (placement, _) = resolve_widget_placement(app)?;
+    let window = widget_window(app)?;
+    let attached = desktop_parent_is_valid(&window);
+    let current = interactive_surface::physical_window_rect(&window).ok();
+    let size_changed = current
+        .map(|rect| {
+            rect.width != i32::try_from(placement.width).unwrap_or(i32::MAX)
+                || rect.height != i32::try_from(placement.height).unwrap_or(i32::MAX)
+        })
+        .unwrap_or(true);
+    let position_changed = current
+        .map(|rect| rect.x != placement.x || rect.y != placement.y)
+        .unwrap_or(true);
+    if attached
+        && (size_changed || position_changed)
+        && settings.desktop_mode == DesktopMode::Interactive
+        && state.runtime_snapshot().desktop_runtime_state == DesktopRuntimeState::Interactive
+    {
+        interactive_surface::destroy_surface(app)?;
+        state.mark_surface_destroyed();
+        state.mark_interactive_starting();
+        if size_changed {
+            state.invalidate_surface_bounds();
+            interactive_surface::reset_surface_handshake_deadline();
+        }
+    }
+    if attached {
+        set_attached_placement(&window, placement)
+    } else {
+        window
+            .set_size(PhysicalSize::new(placement.width, placement.height))
+            .map_err(|error| format!("failed to size widget: {error}"))?;
+        window
+            .set_position(PhysicalPosition::new(placement.x, placement.y))
+            .map_err(|error| format!("failed to position widget: {error}"))
+    }
+}
+
+fn resolve_widget_placement<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<(WidgetPlacement, f64), String> {
+    let settings = app.state::<AppState>().settings().viewer;
     let monitors = app
         .available_monitors()
         .map_err(|error| format!("failed to list monitors: {error}"))?;
@@ -255,40 +325,7 @@ pub fn apply_widget_placement<R: Runtime>(app: &AppHandle<R>) -> Result<(), Stri
             scale_factor: selected.scale_factor(),
         },
     );
-    let window = widget_window(app)?;
-    let attached = desktop_parent_is_valid(&window);
-    let current = interactive_surface::physical_window_rect(&window).ok();
-    let size_changed = current
-        .map(|rect| {
-            rect.width != i32::try_from(placement.width).unwrap_or(i32::MAX)
-                || rect.height != i32::try_from(placement.height).unwrap_or(i32::MAX)
-        })
-        .unwrap_or(true);
-    let position_changed = current
-        .map(|rect| rect.x != placement.x || rect.y != placement.y)
-        .unwrap_or(true);
-    if attached
-        && (size_changed || position_changed)
-        && settings.desktop_mode == DesktopMode::Interactive
-        && state.runtime_snapshot().desktop_runtime_state == DesktopRuntimeState::Interactive
-    {
-        interactive_surface::hide_surface(app)?;
-        state.mark_interactive_starting();
-        if size_changed {
-            state.invalidate_surface_bounds();
-            interactive_surface::reset_surface_handshake_deadline();
-        }
-    }
-    if attached {
-        set_attached_placement(&window, placement)
-    } else {
-        window
-            .set_size(PhysicalSize::new(placement.width, placement.height))
-            .map_err(|error| format!("failed to size widget: {error}"))?;
-        window
-            .set_position(PhysicalPosition::new(placement.x, placement.y))
-            .map_err(|error| format!("failed to position widget: {error}"))
-    }
+    Ok((placement, selected.scale_factor()))
 }
 
 pub fn request_widget<R: Runtime>(app: &AppHandle<R>, visible: bool) -> Result<(), String> {
@@ -315,6 +352,7 @@ pub fn report_widget_surface_bounds<R: Runtime>(
         );
         return Err(error);
     }
+    let _ = record_interactive_diagnostic(app, "bounds-accepted", None, None);
     if state.settings().viewer.desktop_mode == DesktopMode::Interactive {
         state.mark_interactive_starting();
         drive_interactive(app, interactive_surface::monotonic_ms());
@@ -325,6 +363,7 @@ pub fn report_widget_surface_bounds<R: Runtime>(
 pub fn widget_surface_ready<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let state = app.state::<AppState>();
     state.mark_surface_ready();
+    let _ = record_interactive_diagnostic(app, "surface-ready", None, None);
     drive_interactive(app, interactive_surface::monotonic_ms());
     if state.runtime_snapshot().desktop_runtime_state == DesktopRuntimeState::PassiveFallback {
         Err("interactive desktop surface entered passive fallback".to_string())
@@ -444,15 +483,14 @@ pub fn detach_widget<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     }
     state.mark_surface_hidden();
     let window = widget_window(app)?;
-    window
-        .hide()
-        .map_err(|error| format!("failed to hide widget: {error}"))?;
+    stage_widget_offscreen(&window)?;
     if window.is_desktop_underlay() {
         window
             .set_desktop_underlay(false)
             .map_err(|error| format!("failed to detach desktop underlay: {error}"))?;
     }
     detach_shell_parent(&window)?;
+    stage_widget_offscreen(&window)?;
     state.record_detached();
     Ok(())
 }
@@ -668,12 +706,13 @@ fn spawn_supervisor(app: AppHandle) {
 
 fn attach_widget<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
     let state = app.state::<AppState>();
+    if state.interactive_snapshot().bounds.is_none() {
+        return;
+    }
     state.set_underlay_state(UnderlayState::Attaching);
     let result = (|| -> Result<(), String> {
         let window = widget_window(app)?;
-        window
-            .hide()
-            .map_err(|error| format!("failed to hide widget before attach: {error}"))?;
+        stage_widget_offscreen(&window)?;
         if env_flag("PARLEY_VIEWER_FORCE_UNDERLAY_FAILURE") {
             return Err("forced desktop-underlay failure".to_string());
         }
@@ -683,13 +722,7 @@ fn attach_widget<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
                 .map_err(|error| format!("failed to reset desktop underlay: {error}"))?;
         }
         detach_shell_parent(&window)?;
-        apply_widget_placement(app)?;
-        window
-            .set_position(PhysicalPosition::new(-32_000, -32_000))
-            .map_err(|error| format!("failed to stage widget off-screen: {error}"))?;
-        window
-            .show()
-            .map_err(|error| format!("failed to activate widget off-screen: {error}"))?;
+        stage_widget_offscreen(&window)?;
         let plugin_error = window
             .set_desktop_underlay(true)
             .err()
@@ -718,13 +751,17 @@ fn attach_widget<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
         }
         place_below_desktop_icons(&window)?;
         if !desktop_parent_is_valid(&window) {
-            let _ = window.hide();
+            let _ = stage_widget_offscreen(&window);
             if window.is_desktop_underlay() {
                 let _ = window.set_desktop_underlay(false);
             }
             let _ = detach_shell_parent(&window);
             return Err("desktop-underlay parent was lost during z-ordering".to_string());
         }
+        window
+            .as_ref()
+            .show()
+            .map_err(|error| format!("failed to show desktop-underlay webview: {error}"))?;
         Ok(())
     })();
     match result {
@@ -739,7 +776,7 @@ fn attach_widget<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
             state.mark_surface_destroyed();
             state.fallback_interactive(DesktopFallbackReason::UnderlayUnavailable, false);
             if let Ok(window) = widget_window(app) {
-                let _ = window.hide();
+                let _ = stage_widget_offscreen(&window);
             }
             state.record_attach_result(now_ms, false);
             state.set_runtime_error(error);
@@ -764,7 +801,7 @@ fn check_widget_health<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
             state.fallback_interactive(DesktopFallbackReason::ExplorerLost, false);
         }
         if let Ok(window) = widget_window(app) {
-            let _ = window.hide();
+            let _ = stage_widget_offscreen(&window);
             if window.is_desktop_underlay() {
                 let _ = window.set_desktop_underlay(false);
             }
@@ -807,38 +844,7 @@ fn drive_interactive<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
     if interactive.fallback_latched {
         return;
     }
-    let surface = match interactive_surface::ensure_surface(app) {
-        Ok(surface) => surface,
-        Err(error) => {
-            fallback_interactive(app, DesktopFallbackReason::SurfaceCreateFailed, error, true);
-            return;
-        }
-    };
-    if interactive.state != DesktopRuntimeState::Interactive {
-        state.mark_interactive_starting();
-    }
-
-    let interactive = state.interactive_snapshot();
-    if !interactive.surface_ready {
-        if interactive_surface::surface_readiness(false) == Readiness::TimedOut {
-            fallback_interactive(
-                app,
-                DesktopFallbackReason::SurfaceDocumentNotReady,
-                "widget-surface document did not report readiness".to_string(),
-                true,
-            );
-        }
-        return;
-    }
     let Some(bounds) = interactive.bounds else {
-        if interactive_surface::surface_readiness(false) == Readiness::TimedOut {
-            fallback_interactive(
-                app,
-                DesktopFallbackReason::SurfaceBoundsInvalid,
-                "desktop underlay did not report conversation-column bounds".to_string(),
-                true,
-            );
-        }
         return;
     };
     let underlay = match widget_window(app) {
@@ -865,27 +871,105 @@ fn drive_interactive<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
             return;
         }
     };
-
-    if interactive.state == DesktopRuntimeState::Interactive {
-        if interactive_surface::verify_surface(app, rect).is_ok() {
+    let surface_existed = app
+        .get_webview_window(interactive_surface::SURFACE_LABEL)
+        .is_some();
+    let surface = match interactive_surface::ensure_surface(app, rect, bounds.device_pixel_ratio) {
+        Ok(surface) => surface,
+        Err(error) => {
+            fallback_interactive(app, DesktopFallbackReason::SurfaceCreateFailed, error, true);
             return;
         }
-        if !state.allow_surface_correction(now_ms) {
+    };
+    if !surface_existed {
+        let _ = record_interactive_diagnostic(app, "surface-created", None, None);
+        match interactive_surface::position_and_restack(app, &surface, rect) {
+            Ok(()) => {
+                let _ = record_interactive_diagnostic(app, "surface-primed", None, None);
+            }
+            Err(error) => {
+                fallback_interactive(app, classify_surface_failure(&error), error, true);
+                return;
+            }
+        }
+    }
+    if interactive.state != DesktopRuntimeState::Interactive {
+        state.mark_interactive_starting();
+    }
+
+    let interactive = state.interactive_snapshot();
+    if !interactive.surface_ready {
+        if interactive_surface::surface_readiness(false) == Readiness::TimedOut {
             fallback_interactive(
                 app,
-                DesktopFallbackReason::SurfaceRestackLimit,
-                "widget surface exceeded the bounded restack limit".to_string(),
+                DesktopFallbackReason::SurfaceDocumentNotReady,
+                "widget-surface document did not report readiness".to_string(),
                 true,
             );
-            return;
+        }
+        return;
+    }
+
+    let correcting = interactive.state == DesktopRuntimeState::Interactive;
+    if correcting {
+        match interactive_surface::verify_surface(app, rect) {
+            Ok(()) => {
+                state.clear_surface_corrections();
+                return;
+            }
+            Err(error) => {
+                let _ = record_interactive_diagnostic(
+                    app,
+                    "surface-verification-failed",
+                    Some(classify_surface_failure(&error)),
+                    Some(&error),
+                );
+            }
+        }
+        match state.surface_correction_decision(now_ms) {
+            SurfaceCorrectionDecision::Wait => return,
+            SurfaceCorrectionDecision::Attempt => {}
+            SurfaceCorrectionDecision::Exhausted => {
+                fallback_interactive(
+                    app,
+                    DesktopFallbackReason::SurfaceRestackLimit,
+                    "widget surface exceeded the bounded restack limit".to_string(),
+                    true,
+                );
+                return;
+            }
         }
     }
 
-    match interactive_surface::position_and_restack(app, &surface, rect) {
-        Ok(()) => state.mark_interactive(),
+    let result = if correcting {
+        interactive_surface::restack_surface(app, &surface, rect)
+    } else {
+        interactive_surface::position_and_restack(app, &surface, rect)
+    };
+    match result {
+        Ok(()) => {
+            let became_interactive = !correcting;
+            state.mark_interactive();
+            state.clear_surface_corrections();
+            if became_interactive {
+                let _ = record_interactive_diagnostic(app, "interactive", None, None);
+            } else {
+                let _ = record_interactive_diagnostic(app, "surface-restacked", None, None);
+            }
+        }
         Err(error) => {
             let reason = classify_surface_failure(&error);
-            fallback_interactive(app, reason, error, true);
+            if correcting && reason == DesktopFallbackReason::SurfaceZOrderInvalid {
+                let _ = record_interactive_diagnostic(
+                    app,
+                    "surface-restack-failed",
+                    Some(reason),
+                    Some(&error),
+                );
+                state.set_runtime_error(error);
+            } else {
+                fallback_interactive(app, reason, error, true);
+            }
         }
     }
 }
@@ -909,6 +993,7 @@ fn fallback_interactive<R: Runtime>(
     latch: bool,
 ) {
     let state = app.state::<AppState>();
+    let _ = record_interactive_diagnostic(app, "fallback", Some(reason), Some(&error));
     if let Err(destroy_error) = interactive_surface::destroy_surface(app) {
         state.fallback_interactive(DesktopFallbackReason::SurfaceDestroyFailed, true);
         state.set_runtime_error(format!("{error}; {destroy_error}"));
@@ -917,6 +1002,42 @@ fn fallback_interactive<R: Runtime>(
     state.mark_surface_destroyed();
     state.fallback_interactive(reason, latch);
     state.set_runtime_error(error);
+}
+
+fn record_interactive_diagnostic<R: Runtime>(
+    app: &AppHandle<R>,
+    event_type: &str,
+    reason: Option<DesktopFallbackReason>,
+    detail: Option<&str>,
+) -> Result<(), String> {
+    let diagnostic = InteractiveRuntimeDiagnostic {
+        schema_version: 1,
+        timestamp_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+        event_type,
+        reason,
+        detail,
+    };
+    let directory = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("failed to resolve interactive diagnostics directory: {error}"))?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("failed to create interactive diagnostics directory: {error}"))?;
+    let path = directory.join("interactive-runtime.jsonl");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("failed to open interactive runtime diagnostics: {error}"))?;
+    serde_json::to_writer(&mut file, &diagnostic)
+        .map_err(|error| format!("failed to serialize interactive runtime diagnostic: {error}"))?;
+    file.write_all(b"\n")
+        .and_then(|_| file.flush())
+        .map_err(|error| format!("failed to append interactive runtime diagnostic: {error}"))
 }
 
 fn desktop_parent_is_valid<R: Runtime>(window: &WebviewWindow<R>) -> bool {
@@ -1184,6 +1305,65 @@ fn widget_window<R: Runtime>(app: &AppHandle<R>) -> Result<WebviewWindow<R>, Str
         .ok_or_else(|| "widget window is unavailable".to_string())
 }
 
+fn create_widget_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    if app.get_webview_window(WIDGET_LABEL).is_some() {
+        return Ok(());
+    }
+    let (placement, scale_factor) = resolve_widget_placement(app)?;
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return Err("widget display scale factor is invalid".to_string());
+    }
+    let window = WebviewWindowBuilder::new(
+        app,
+        WIDGET_LABEL,
+        WebviewUrl::App("index.html?view=widget".into()),
+    )
+    .title("Parley")
+    .inner_size(
+        f64::from(placement.width) / scale_factor,
+        f64::from(placement.height) / scale_factor,
+    )
+    .min_inner_size(320.0, 180.0)
+    .position(
+        f64::from(placement.x) / scale_factor,
+        f64::from(placement.y) / scale_factor,
+    )
+    .decorations(false)
+    .shadow(false)
+    .transparent(false)
+    .resizable(false)
+    .focused(false)
+    .focusable(false)
+    .always_on_top(false)
+    .skip_taskbar(true)
+    .visible(true)
+    .build()
+    .map_err(|error| format!("failed to create desktop widget: {error}"))?;
+    window
+        .set_size(PhysicalSize::new(placement.width, placement.height))
+        .map_err(|error| format!("failed to size new desktop widget: {error}"))?;
+    window
+        .set_position(PhysicalPosition::new(placement.x, placement.y))
+        .map_err(|error| format!("failed to position new desktop widget: {error}"))?;
+    window
+        .as_ref()
+        .show()
+        .map_err(|error| format!("failed to show new desktop-widget webview: {error}"))
+}
+
+fn stage_widget_offscreen<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String> {
+    window
+        .set_position(PhysicalPosition::new(-32_000, -32_000))
+        .map_err(|error| format!("failed to stage widget off-screen: {error}"))?;
+    window
+        .show()
+        .map_err(|error| format!("failed to keep staged widget renderable: {error}"))?;
+    window
+        .as_ref()
+        .show()
+        .map_err(|error| format!("failed to keep staged widget webview renderable: {error}"))
+}
+
 fn monitor_id(monitor: &tauri::Monitor) -> String {
     let name = monitor.name().map(String::as_str).unwrap_or("Display");
     let position = monitor.position();
@@ -1303,6 +1483,26 @@ mod tests {
         env::set_var(&key, "0");
         assert!(!env_flag(&key));
         env::remove_var(&key);
+    }
+
+    #[test]
+    fn interactive_runtime_diagnostics_use_closed_reason_codes() {
+        let value = serde_json::to_value(InteractiveRuntimeDiagnostic {
+            schema_version: 1,
+            timestamp_ms: 42,
+            event_type: "fallback",
+            reason: Some(DesktopFallbackReason::SurfaceDocumentNotReady),
+            detail: Some("widget-surface document did not report readiness"),
+        })
+        .expect("diagnostic serialization");
+
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["eventType"], "fallback");
+        assert_eq!(value["reason"], "surface-document-not-ready");
+        assert_eq!(
+            value["detail"],
+            "widget-surface document did not report readiness"
+        );
     }
 
     #[test]

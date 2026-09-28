@@ -1,21 +1,26 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW,
-    GetForegroundWindow, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, IsWindow,
-    IsWindowVisible, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, GWL_EXSTYLE,
-    GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WINDOWPOS,
-    WM_MOUSEACTIVATE, WM_WINDOWPOSCHANGING, WNDPROC, WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    GetClassNameW, GetClientRect, GetForegroundWindow, GetParent, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PostMessageW,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
+    GW_HWNDPREV, GW_OWNER, HWND_TOP, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    WINDOWPOS, WM_APP, WM_MOUSEACTIVATE, WM_WINDOWPOSCHANGING, WNDPROC, WS_CAPTION, WS_CHILD,
+    WS_DISABLED, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_NOACTIVATE,
+    WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
 use crate::runtime::WidgetSurfaceBoundsReport;
@@ -23,9 +28,16 @@ use crate::runtime::WidgetSurfaceBoundsReport;
 pub const SURFACE_LABEL: &str = "widget-surface";
 const SURFACE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const GEOMETRY_TOLERANCE_PX: i32 = 1;
+const MAX_DESKTOP_BAND_WINDOWS: usize = 4_096;
+const PRESENTATION_DIAGNOSTICS_ENV: &str = "PARLEY_VIEWER_PRESENTATION_DIAGNOSTICS";
+const WM_REASSERT_DESKTOP_BAND: u32 = WM_APP + 0x32A;
 
 static ORIGINAL_SURFACE_PROC: AtomicIsize = AtomicIsize::new(0);
 static CONTROLLED_SURFACE_POSITION: AtomicBool = AtomicBool::new(false);
+static SURFACE_REASSERT_PENDING: AtomicBool = AtomicBool::new(false);
+static POINTER_REASSERT_SCHEDULED: AtomicU64 = AtomicU64::new(0);
+static POINTER_REASSERT_APPLIED: AtomicU64 = AtomicU64::new(0);
+static POINTER_REASSERT_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static SURFACE_POSITION_LOCK: Mutex<()> = Mutex::new(());
 static LAST_MOUSEACTIVATE_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 static BAND_HELPER_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -41,6 +53,18 @@ impl ControlledSurfacePositionGuard {
         let lock = SURFACE_POSITION_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::from_lock(lock)
+    }
+
+    fn try_enter() -> Option<Self> {
+        match SURFACE_POSITION_LOCK.try_lock() {
+            Ok(lock) => Some(Self::from_lock(lock)),
+            Err(TryLockError::Poisoned(poisoned)) => Some(Self::from_lock(poisoned.into_inner())),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    fn from_lock(lock: std::sync::MutexGuard<'static, ()>) -> Self {
         CONTROLLED_SURFACE_POSITION.store(true, Ordering::Release);
         Self { _lock: lock }
     }
@@ -78,6 +102,56 @@ struct FocusDiagnostic<'a> {
     intentional_focus: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SurfaceActivityPhase {
+    Poll,
+    DomPaint,
+    AnimationFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DocumentVisibility {
+    Visible,
+    Hidden,
+    Prerender,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WidgetSurfaceActivityReport {
+    pub phase: SurfaceActivityPhase,
+    pub sequence: u64,
+    pub generation: u64,
+    pub changed: bool,
+    pub document_visibility: DocumentVisibility,
+    pub monotonic_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SurfaceActivityDiagnostic {
+    schema_version: u8,
+    timestamp_ms: u64,
+    phase: SurfaceActivityPhase,
+    sequence: u64,
+    generation: u64,
+    changed: bool,
+    document_visibility: DocumentVisibility,
+    renderer_monotonic_ms: u64,
+    surface_visible: bool,
+    surface_previous: String,
+    surface_next: String,
+    next_process_id: Option<u32>,
+    next_class: Option<String>,
+    foreground: String,
+    z_order_valid: Option<bool>,
+    pointer_reassert_scheduled: u64,
+    pointer_reassert_applied: u64,
+    pointer_reassert_skipped: u64,
+}
+
 pub fn monotonic_ms() -> u64 {
     PROCESS_STARTED
         .get_or_init(Instant::now)
@@ -86,9 +160,16 @@ pub fn monotonic_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-pub fn ensure_surface<R: Runtime>(app: &AppHandle<R>) -> Result<WebviewWindow<R>, String> {
+pub fn ensure_surface<R: Runtime>(
+    app: &AppHandle<R>,
+    rect: SurfaceRect,
+    scale_factor: f64,
+) -> Result<WebviewWindow<R>, String> {
     if let Some(surface) = app.get_webview_window(SURFACE_LABEL) {
         return Ok(surface);
+    }
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return Err("widget-surface scale factor is invalid".to_string());
     }
 
     let surface = WebviewWindowBuilder::new(
@@ -97,14 +178,22 @@ pub fn ensure_surface<R: Runtime>(app: &AppHandle<R>) -> Result<WebviewWindow<R>
         WebviewUrl::App("index.html?view=widget-surface".into()),
     )
     .title("Parley conversation")
-    .inner_size(320.0, 220.0)
+    .inner_size(
+        f64::from(rect.width) / scale_factor,
+        f64::from(rect.height) / scale_factor,
+    )
+    .position(
+        f64::from(rect.x) / scale_factor,
+        f64::from(rect.y) / scale_factor,
+    )
     .decorations(false)
+    .shadow(false)
     .resizable(false)
     .focused(false)
     .focusable(false)
     .always_on_top(false)
     .skip_taskbar(true)
-    .visible(false)
+    .visible(true)
     .build()
     .map_err(|error| format!("failed to create widget surface: {error}"))?;
 
@@ -213,14 +302,40 @@ pub fn derive_surface_rect<R: Runtime>(
     report: WidgetSurfaceBoundsReport,
 ) -> Result<SurfaceRect, String> {
     let underlay_hwnd = raw_webview_hwnd(underlay)?;
-    let mut underlay_rect = RECT::default();
-    if unsafe { GetWindowRect(underlay_hwnd, &mut underlay_rect) } == 0 {
+    let underlay_rect = physical_client_rect(underlay_hwnd)?;
+    derive_surface_rect_from_physical(underlay_rect, report)
+}
+
+fn physical_client_rect(hwnd: HWND) -> Result<RECT, String> {
+    let mut client_rect = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut client_rect) } == 0 {
         return Err(format!(
-            "failed to read desktop-underlay geometry: {}",
+            "failed to read desktop-underlay client geometry: {}",
             std::io::Error::last_os_error()
         ));
     }
-    derive_surface_rect_from_physical(underlay_rect, report)
+    let mut origin = POINT {
+        x: client_rect.left,
+        y: client_rect.top,
+    };
+    if unsafe { ClientToScreen(hwnd, &mut origin) } == 0 {
+        return Err(format!(
+            "failed to map desktop-underlay client geometry: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(screen_rect_from_client(client_rect, origin))
+}
+
+fn screen_rect_from_client(client_rect: RECT, origin: POINT) -> RECT {
+    let width = client_rect.right.saturating_sub(client_rect.left);
+    let height = client_rect.bottom.saturating_sub(client_rect.top);
+    RECT {
+        left: origin.x,
+        top: origin.y,
+        right: origin.x.saturating_add(width),
+        bottom: origin.y.saturating_add(height),
+    }
 }
 
 pub fn physical_window_rect<R: Runtime>(window: &WebviewWindow<R>) -> Result<SurfaceRect, String> {
@@ -251,7 +366,9 @@ fn derive_surface_rect_from_physical(
     if (underlay_width - reported_width).abs() > GEOMETRY_TOLERANCE_PX
         || (underlay_height - reported_height).abs() > GEOMETRY_TOLERANCE_PX
     {
-        return Err("widget-surface viewport does not match the desktop underlay".to_string());
+        return Err(format!(
+            "widget-surface viewport does not match the desktop underlay client area (client={underlay_width}x{underlay_height}, reported={reported_width}x{reported_height})"
+        ));
     }
 
     let x = underlay.left + (report.left * report.device_pixel_ratio).round() as i32;
@@ -285,45 +402,86 @@ pub fn position_and_restack<R: Runtime>(
 ) -> Result<(), String> {
     let helper_hwnd = band_helper()?;
     let surface_hwnd = raw_webview_hwnd(surface)?;
-    let icon_host = desktop_icon_host()?;
-    let above_icon_host = unsafe { GetWindow(icon_host, GW_HWNDPREV) };
-    if above_icon_host.is_null() {
-        return Err("desktop icon host has no safe normal-band predecessor".to_string());
-    }
 
     verify_helper_styles(helper_hwnd)?;
     verify_surface_styles(surface_hwnd)?;
+    position_desktop_pair(surface_hwnd, helper_hwnd, rect, false)?;
+    surface
+        .show()
+        .map_err(|error| format!("failed to show widget surface: {error}"))?;
+    surface
+        .as_ref()
+        .show()
+        .map_err(|error| format!("failed to show widget-surface webview: {error}"))?;
+    configure_surface_styles(surface_hwnd)?;
+    position_desktop_pair(surface_hwnd, helper_hwnd, rect, true)?;
+    notify_surface_position_changed(surface)?;
+    verify_surface(app, rect)
+}
+
+pub fn restack_surface<R: Runtime>(
+    app: &AppHandle<R>,
+    surface: &WebviewWindow<R>,
+    rect: SurfaceRect,
+) -> Result<(), String> {
+    let helper_hwnd = band_helper()?;
+    let surface_hwnd = raw_webview_hwnd(surface)?;
+    verify_helper_styles(helper_hwnd)?;
+    verify_surface_styles(surface_hwnd)?;
+    position_desktop_pair(surface_hwnd, helper_hwnd, rect, false)?;
+    notify_surface_position_changed(surface)?;
+    verify_surface(app, rect)
+}
+
+fn position_desktop_pair(
+    surface: HWND,
+    helper: HWND,
+    rect: SurfaceRect,
+    show: bool,
+) -> Result<(), String> {
+    let _controlled_position = ControlledSurfacePositionGuard::enter();
+    position_desktop_pair_locked(surface, helper, rect, show)
+}
+
+fn position_desktop_pair_locked(
+    surface: HWND,
+    helper: HWND,
+    rect: SurfaceRect,
+    show: bool,
+) -> Result<(), String> {
+    let icon_host = desktop_icon_host()?;
+    let anchor = desktop_band_anchor(icon_host, helper, surface)?;
+    let mut flags = SWP_NOACTIVATE;
+    if show {
+        flags |= SWP_SHOWWINDOW;
+    }
     let helper_positioned = unsafe {
         SetWindowPos(
-            helper_hwnd,
-            above_icon_host,
+            helper,
+            anchor,
             0,
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
         )
     };
     if helper_positioned == 0 {
         return Err(format!(
-            "failed to place desktop-band helper: {}",
+            "failed to place desktop-band helper above Explorer: {}",
             std::io::Error::last_os_error()
         ));
     }
-
-    let surface_positioned = {
-        let _controlled_position = ControlledSurfacePositionGuard::enter();
-        unsafe {
-            SetWindowPos(
-                surface_hwnd,
-                helper_hwnd,
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )
-        }
+    let surface_positioned = unsafe {
+        SetWindowPos(
+            surface,
+            helper,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            flags,
+        )
     };
     if surface_positioned == 0 {
         return Err(format!(
@@ -331,7 +489,36 @@ pub fn position_and_restack<R: Runtime>(
             std::io::Error::last_os_error()
         ));
     }
-    verify_surface(app, rect)
+    Ok(())
+}
+
+fn desktop_band_anchor(icon_host: HWND, helper: HWND, surface: HWND) -> Result<HWND, String> {
+    let mut anchor = unsafe { GetWindow(icon_host, GW_HWNDPREV) };
+    for _ in 0..MAX_DESKTOP_BAND_WINDOWS {
+        if anchor.is_null() {
+            return Err("Explorer icon host has no safe preceding z-order anchor".to_string());
+        }
+        match classify_anchor_candidate(anchor, helper, surface) {
+            AnchorCandidate::SkipOwned => {}
+            AnchorCandidate::UseWindow => return Ok(anchor),
+        }
+        anchor = unsafe { GetWindow(anchor, GW_HWNDPREV) };
+    }
+    Err("desktop-band anchor traversal exceeded its bound".to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorCandidate {
+    SkipOwned,
+    UseWindow,
+}
+
+fn classify_anchor_candidate(candidate: HWND, helper: HWND, surface: HWND) -> AnchorCandidate {
+    if candidate == helper || candidate == surface {
+        AnchorCandidate::SkipOwned
+    } else {
+        AnchorCandidate::UseWindow
+    }
 }
 
 pub fn verify_surface<R: Runtime>(app: &AppHandle<R>, expected: SurfaceRect) -> Result<(), String> {
@@ -352,11 +539,8 @@ pub fn verify_surface<R: Runtime>(app: &AppHandle<R>, expected: SurfaceRect) -> 
     if unsafe { IsWindowVisible(surface_hwnd) } == 0 {
         return Err("widget surface is not visible".to_string());
     }
-    if unsafe { GetWindow(helper_hwnd, GW_HWNDNEXT) } != surface_hwnd
-        || unsafe { GetWindow(surface_hwnd, GW_HWNDNEXT) } != icon_host
-    {
-        return Err("widget surface left its desktop z-order band".to_string());
-    }
+    verify_helper_precedes_surface(helper_hwnd, surface_hwnd)?;
+    verify_windows_below_surface(surface_hwnd, icon_host)?;
 
     let mut actual = RECT::default();
     if unsafe { GetWindowRect(surface_hwnd, &mut actual) } == 0 {
@@ -374,7 +558,178 @@ pub fn verify_surface<R: Runtime>(app: &AppHandle<R>, expected: SurfaceRect) -> 
     {
         return Err("widget-surface geometry differs from its validated column".to_string());
     }
+    let client = physical_client_rect(surface_hwnd)?;
+    let client_width = client.right.saturating_sub(client.left);
+    let client_height = client.bottom.saturating_sub(client.top);
+    if (client.left - expected.x).abs() > GEOMETRY_TOLERANCE_PX
+        || (client.top - expected.y).abs() > GEOMETRY_TOLERANCE_PX
+        || (client_width - expected.width).abs() > GEOMETRY_TOLERANCE_PX
+        || (client_height - expected.height).abs() > GEOMETRY_TOLERANCE_PX
+    {
+        return Err(format!(
+            "widget-surface client geometry differs from its validated column (expected={},{} {}x{}; actual={},{} {}x{})",
+            expected.x,
+            expected.y,
+            expected.width,
+            expected.height,
+            client.left,
+            client.top,
+            client_width,
+            client_height
+        ));
+    }
     Ok(())
+}
+
+fn verify_helper_precedes_surface(helper: HWND, surface: HWND) -> Result<(), String> {
+    let surface_process_id = window_process_id(surface)?;
+    let mut current = unsafe { GetWindow(helper, GW_HWNDNEXT) };
+    let mut traversed = 0usize;
+    while !current.is_null() && current != surface {
+        if traversed >= MAX_DESKTOP_BAND_WINDOWS {
+            return Err("desktop-band helper traversal exceeded its bound".to_string());
+        }
+        if !safe_intervening_window(current, surface_process_id) {
+            return Err(format!(
+                "visible restored window {} separates the desktop-band helper from the widget surface",
+                describe_window(current)
+            ));
+        }
+        current = unsafe { GetWindow(current, GW_HWNDNEXT) };
+        traversed = traversed.saturating_add(1);
+    }
+    if current != surface {
+        return Err(format!(
+            "desktop-band helper no longer precedes the widget surface (helper={}, surface={})",
+            format_handle(helper as isize),
+            format_handle(surface as isize)
+        ));
+    }
+    Ok(())
+}
+
+fn verify_windows_below_surface(surface: HWND, icon_host: HWND) -> Result<(), String> {
+    let surface_process_id = window_process_id(surface)?;
+    let mut current = unsafe { GetWindow(surface, GW_HWNDNEXT) };
+    let mut traversed = 0usize;
+    while !current.is_null() && current != icon_host {
+        if traversed >= MAX_DESKTOP_BAND_WINDOWS {
+            return Err("widget surface desktop-band traversal exceeded its bound".to_string());
+        }
+        if !safe_intervening_window(current, surface_process_id) {
+            return Err(format!(
+                "visible restored window {} is below the widget surface",
+                describe_window(current)
+            ));
+        }
+        current = unsafe { GetWindow(current, GW_HWNDNEXT) };
+        traversed = traversed.saturating_add(1);
+    }
+    if current != icon_host {
+        return Err("widget surface is not above the Explorer icon host".to_string());
+    }
+    Ok(())
+}
+
+fn safe_intervening_window(window: HWND, surface_process_id: u32) -> bool {
+    let visible = unsafe { IsWindowVisible(window) } != 0;
+    let minimized = unsafe { IsIconic(window) } != 0;
+    let cloaked = window_is_cloaked(window);
+    let same_process = window_process_id(window)
+        .map(|process_id| process_id == surface_process_id)
+        .unwrap_or(false);
+    let inert_infrastructure = inert_infrastructure_window(window);
+    safe_intervening_window_properties(
+        visible,
+        minimized,
+        cloaked,
+        same_process,
+        inert_infrastructure,
+    )
+}
+
+fn safe_intervening_window_properties(
+    visible: bool,
+    minimized: bool,
+    cloaked: bool,
+    same_process: bool,
+    inert_infrastructure: bool,
+) -> bool {
+    !visible || minimized || cloaked || (same_process && inert_infrastructure)
+}
+
+fn window_is_cloaked(window: HWND) -> bool {
+    let mut cloaked = 0u32;
+    let result = unsafe {
+        DwmGetWindowAttribute(
+            window,
+            DWMWA_CLOAKED as u32,
+            std::ptr::addr_of_mut!(cloaked).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    result >= 0 && cloaked != 0
+}
+
+fn inert_infrastructure_window(window: HWND) -> bool {
+    let style = unsafe { GetWindowLongPtrW(window, GWL_STYLE) } as u32;
+    let extended = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) } as u32;
+    let required_extended = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
+    if style & WS_POPUP == 0
+        || extended & required_extended != required_extended
+        || extended & WS_EX_APPWINDOW != 0
+    {
+        return false;
+    }
+    let mut bounds = RECT::default();
+    if unsafe { GetWindowRect(window, &mut bounds) } == 0 {
+        return false;
+    }
+    bounds.right.saturating_sub(bounds.left) <= 32 && bounds.bottom.saturating_sub(bounds.top) <= 32
+}
+
+fn window_process_id(window: HWND) -> Result<u32, String> {
+    let mut process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+    if thread_id == 0 || process_id == 0 {
+        Err(format!(
+            "failed to resolve window process identity: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(process_id)
+    }
+}
+
+fn window_class(window: HWND) -> Option<String> {
+    if window.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 128];
+    let length = unsafe { GetClassNameW(window, buffer.as_mut_ptr(), buffer.len() as i32) };
+    (length > 0).then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+}
+
+fn describe_window(window: HWND) -> String {
+    if window.is_null() {
+        return "unavailable".to_string();
+    }
+    let process_id = window_process_id(window)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "unavailable".to_string());
+    let class = window_class(window).unwrap_or_else(|| "unavailable".to_string());
+    format!(
+        "{} (pid={process_id}, class={class})",
+        format_handle(window as isize)
+    )
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 pub fn hide_surface<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
@@ -394,11 +749,12 @@ pub fn destroy_surface<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         return Ok(());
     };
     hide_surface(app)?;
+    restore_surface_window_proc(raw_webview_hwnd(&surface)?)?;
     surface
         .destroy()
         .map_err(|error| format!("failed to destroy widget surface: {error}"))?;
-    ORIGINAL_SURFACE_PROC.store(0, Ordering::Release);
     LAST_MOUSEACTIVATE_FOREGROUND.store(0, Ordering::Release);
+    SURFACE_REASSERT_PENDING.store(false, Ordering::Release);
     *lock_surface_created() = None;
     Ok(())
 }
@@ -457,6 +813,86 @@ pub fn record_focus_diagnostic<R: Runtime>(
         .map_err(|error| format!("failed to append interactive diagnostics: {error}"))
 }
 
+pub fn record_surface_activity<R: Runtime>(
+    app: &AppHandle<R>,
+    report: WidgetSurfaceActivityReport,
+) -> Result<(), String> {
+    validate_surface_activity(report)?;
+    if !presentation_diagnostics_enabled() {
+        return Ok(());
+    }
+
+    let surface = app
+        .get_webview_window(SURFACE_LABEL)
+        .ok_or_else(|| "widget surface is unavailable".to_string())?;
+    let surface_hwnd = raw_webview_hwnd(&surface)?;
+    let previous = unsafe { GetWindow(surface_hwnd, GW_HWNDPREV) };
+    let next = unsafe { GetWindow(surface_hwnd, GW_HWNDNEXT) };
+    let z_order_valid = desktop_icon_host()
+        .ok()
+        .map(|icon_host| verify_windows_below_surface(surface_hwnd, icon_host).is_ok());
+    let diagnostic = SurfaceActivityDiagnostic {
+        schema_version: 1,
+        timestamp_ms: unix_timestamp_ms(),
+        phase: report.phase,
+        sequence: report.sequence,
+        generation: report.generation,
+        changed: report.changed,
+        document_visibility: report.document_visibility,
+        renderer_monotonic_ms: report.monotonic_ms,
+        surface_visible: unsafe { IsWindowVisible(surface_hwnd) } != 0,
+        surface_previous: format_handle(previous as isize),
+        surface_next: format_handle(next as isize),
+        next_process_id: window_process_id(next).ok(),
+        next_class: window_class(next),
+        foreground: format_handle(unsafe { GetForegroundWindow() } as isize),
+        z_order_valid,
+        pointer_reassert_scheduled: POINTER_REASSERT_SCHEDULED.load(Ordering::Acquire),
+        pointer_reassert_applied: POINTER_REASSERT_APPLIED.load(Ordering::Acquire),
+        pointer_reassert_skipped: POINTER_REASSERT_SKIPPED.load(Ordering::Acquire),
+    };
+    let directory = app.path().app_local_data_dir().map_err(|error| {
+        format!("failed to resolve presentation diagnostics directory: {error}")
+    })?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("failed to create presentation diagnostics directory: {error}"))?;
+    let path = directory.join("interactive-presentation.jsonl");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("failed to open presentation diagnostics: {error}"))?;
+    serde_json::to_writer(&mut file, &diagnostic)
+        .map_err(|error| format!("failed to serialize presentation diagnostics: {error}"))?;
+    file.write_all(b"\n")
+        .and_then(|_| file.flush())
+        .map_err(|error| format!("failed to append presentation diagnostics: {error}"))
+}
+
+fn validate_surface_activity(report: WidgetSurfaceActivityReport) -> Result<(), String> {
+    if report.sequence == 0 {
+        return Err("widget-surface activity sequence must be positive".to_string());
+    }
+    if report.generation > report.sequence {
+        return Err("widget-surface activity generation exceeds its sequence".to_string());
+    }
+    Ok(())
+}
+
+fn presentation_diagnostics_enabled() -> bool {
+    std::env::var(PRESENTATION_DIAGNOSTICS_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
+fn notify_surface_position_changed<R: Runtime>(surface: &WebviewWindow<R>) -> Result<(), String> {
+    surface
+        .with_webview(|webview| unsafe {
+            let _ = webview.controller().NotifyParentWindowPositionChanged();
+        })
+        .map_err(|error| format!("failed to notify WebView2 of widget-surface position: {error}"))
+}
+
 fn configure_surface_styles(window: HWND) -> Result<(), String> {
     let (style, extended) = normalized_surface_styles(
         unsafe { GetWindowLongPtrW(window, GWL_STYLE) } as u32,
@@ -477,9 +913,11 @@ fn configure_helper_styles(window: HWND) -> Result<(), String> {
 }
 
 fn normalized_surface_styles(style: u32, extended: u32) -> (u32, u32) {
+    let frame_styles = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+    let edge_styles = WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE;
     (
-        (style & !WS_CHILD) | WS_POPUP,
-        (extended & !(WS_EX_APPWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT))
+        (style & !(WS_CHILD | frame_styles)) | WS_POPUP,
+        (extended & !(WS_EX_APPWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT | edge_styles))
             | WS_EX_TOOLWINDOW
             | WS_EX_NOACTIVATE,
     )
@@ -520,15 +958,24 @@ fn verify_surface_styles(window: HWND) -> Result<(), String> {
     let style = unsafe { GetWindowLongPtrW(window, GWL_STYLE) } as u32;
     let extended = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) } as u32;
     let required_style = WS_POPUP;
-    let prohibited_style = WS_CHILD;
+    let prohibited_style =
+        WS_CHILD | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
     let required_extended = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-    let prohibited_extended = WS_EX_APPWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
+    let prohibited_extended = WS_EX_APPWINDOW
+        | WS_EX_TOPMOST
+        | WS_EX_TRANSPARENT
+        | WS_EX_CLIENTEDGE
+        | WS_EX_DLGMODALFRAME
+        | WS_EX_STATICEDGE
+        | WS_EX_WINDOWEDGE;
     if style & required_style != required_style
         || style & prohibited_style != 0
         || extended & required_extended != required_extended
         || extended & prohibited_extended != 0
     {
-        return Err("widget-surface native style invariant failed".to_string());
+        return Err(format!(
+            "widget-surface native style invariant failed (style=0x{style:X}, extended=0x{extended:X})"
+        ));
     }
     if !unsafe { GetParent(window) }.is_null() || !unsafe { GetWindow(window, GW_OWNER) }.is_null()
     {
@@ -572,22 +1019,58 @@ fn install_surface_window_proc(window: HWND) -> Result<(), String> {
     Ok(())
 }
 
+fn restore_surface_window_proc(window: HWND) -> Result<(), String> {
+    let original = ORIGINAL_SURFACE_PROC.load(Ordering::Acquire);
+    if original == 0 || unsafe { IsWindow(window) } == 0 {
+        ORIGINAL_SURFACE_PROC.store(0, Ordering::Release);
+        return Ok(());
+    }
+    let current = unsafe { GetWindowLongPtrW(window, GWLP_WNDPROC) };
+    let expected = surface_window_proc as *const () as usize as isize;
+    if current != expected {
+        return Err("widget-surface no-activate guard was replaced unexpectedly".to_string());
+    }
+    let previous = unsafe { SetWindowLongPtrW(window, GWLP_WNDPROC, original) };
+    if previous == 0 {
+        return Err(format!(
+            "failed to restore widget-surface window procedure: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    ORIGINAL_SURFACE_PROC.store(0, Ordering::Release);
+    Ok(())
+}
+
 unsafe extern "system" fn surface_window_proc(
     window: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_MOUSEACTIVATE {
-        LAST_MOUSEACTIVATE_FOREGROUND.store(GetForegroundWindow() as isize, Ordering::Release);
-        return MA_NOACTIVATE as LRESULT;
-    }
-    if message == WM_WINDOWPOSCHANGING
-        && !CONTROLLED_SURFACE_POSITION.load(Ordering::Acquire)
-        && lparam != 0
-    {
-        let position = &mut *(lparam as *mut WINDOWPOS);
-        position.flags |= SWP_NOZORDER | SWP_NOACTIVATE;
+    match surface_message_policy(
+        message,
+        CONTROLLED_SURFACE_POSITION.load(Ordering::Acquire),
+        lparam != 0,
+    ) {
+        SurfaceMessagePolicy::ScheduleReassert => {
+            LAST_MOUSEACTIVATE_FOREGROUND.store(GetForegroundWindow() as isize, Ordering::Release);
+            schedule_surface_reassert(window);
+            return MA_NOACTIVATE as LRESULT;
+        }
+        SurfaceMessagePolicy::RunReassert => {
+            SURFACE_REASSERT_PENDING.store(false, Ordering::Release);
+            if reassert_desktop_band_after_pointer(window) {
+                POINTER_REASSERT_APPLIED.fetch_add(1, Ordering::AcqRel);
+            } else {
+                POINTER_REASSERT_SKIPPED.fetch_add(1, Ordering::AcqRel);
+            }
+            return 0;
+        }
+        SurfaceMessagePolicy::PreserveZOrder => {
+            let position = &mut *(lparam as *mut WINDOWPOS);
+            position.flags |= SWP_NOZORDER | SWP_NOACTIVATE;
+        }
+        SurfaceMessagePolicy::Forward => {}
     }
     let original = ORIGINAL_SURFACE_PROC.load(Ordering::Acquire);
     if original == 0 {
@@ -601,6 +1084,98 @@ unsafe extern "system" fn surface_window_proc(
             lparam,
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceMessagePolicy {
+    ScheduleReassert,
+    RunReassert,
+    PreserveZOrder,
+    Forward,
+}
+
+fn surface_message_policy(
+    message: u32,
+    controlled_position: bool,
+    has_position: bool,
+) -> SurfaceMessagePolicy {
+    if message == WM_MOUSEACTIVATE {
+        SurfaceMessagePolicy::ScheduleReassert
+    } else if message == WM_REASSERT_DESKTOP_BAND {
+        SurfaceMessagePolicy::RunReassert
+    } else if message == WM_WINDOWPOSCHANGING && !controlled_position && has_position {
+        SurfaceMessagePolicy::PreserveZOrder
+    } else {
+        SurfaceMessagePolicy::Forward
+    }
+}
+
+pub fn reassert_surface_after_pointer<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let surface = app
+        .get_webview_window(SURFACE_LABEL)
+        .ok_or_else(|| "widget surface is unavailable".to_string())?;
+    let surface_hwnd = raw_webview_hwnd(&surface)?;
+    LAST_MOUSEACTIVATE_FOREGROUND
+        .store(unsafe { GetForegroundWindow() } as isize, Ordering::Release);
+    POINTER_REASSERT_SCHEDULED.fetch_add(1, Ordering::AcqRel);
+    if reassert_desktop_band_after_pointer(surface_hwnd) {
+        POINTER_REASSERT_APPLIED.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    } else {
+        POINTER_REASSERT_SKIPPED.fetch_add(1, Ordering::AcqRel);
+        Err("widget surface pointer reassertion did not verify".to_string())
+    }
+}
+
+fn schedule_surface_reassert(window: HWND) {
+    if SURFACE_REASSERT_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    POINTER_REASSERT_SCHEDULED.fetch_add(1, Ordering::AcqRel);
+    if unsafe { PostMessageW(window, WM_REASSERT_DESKTOP_BAND, 0, 0) } == 0 {
+        SURFACE_REASSERT_PENDING.store(false, Ordering::Release);
+        POINTER_REASSERT_SKIPPED.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn reassert_desktop_band_after_pointer(surface: HWND) -> bool {
+    let helper = BAND_HELPER_HWND.load(Ordering::Acquire) as HWND;
+    if surface.is_null()
+        || helper.is_null()
+        || unsafe { IsWindow(surface) } == 0
+        || unsafe { IsWindow(helper) } == 0
+    {
+        return false;
+    }
+    let Some(_controlled_position) = ControlledSurfacePositionGuard::try_enter() else {
+        return false;
+    };
+    let mut bounds = RECT::default();
+    if unsafe { GetWindowRect(surface, &mut bounds) } == 0 {
+        return false;
+    }
+    let rect = SurfaceRect {
+        x: bounds.left,
+        y: bounds.top,
+        width: bounds.right.saturating_sub(bounds.left),
+        height: bounds.bottom.saturating_sub(bounds.top),
+    };
+    if rect.width <= 0
+        || rect.height <= 0
+        || position_desktop_pair_locked(surface, helper, rect, false).is_err()
+    {
+        return false;
+    }
+    let Ok(icon_host) = desktop_icon_host() else {
+        return false;
+    };
+    verify_helper_styles(helper).is_ok()
+        && verify_surface_styles(surface).is_ok()
+        && verify_helper_precedes_surface(helper, surface).is_ok()
+        && verify_windows_below_surface(surface, icon_host).is_ok()
 }
 
 fn desktop_icon_host() -> Result<HWND, String> {
@@ -694,18 +1269,35 @@ mod tests {
     #[test]
     fn style_normalization_enforces_nonactivating_tool_window() {
         let (style, extended) = normalized_surface_styles(
-            WS_CHILD,
-            WS_EX_APPWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
+            WS_CHILD | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
+            WS_EX_APPWINDOW
+                | WS_EX_TOPMOST
+                | WS_EX_TRANSPARENT
+                | WS_EX_CLIENTEDGE
+                | WS_EX_DLGMODALFRAME
+                | WS_EX_STATICEDGE
+                | WS_EX_WINDOWEDGE,
         );
 
         assert_eq!(style & WS_CHILD, 0);
         assert_eq!(style & WS_POPUP, WS_POPUP);
         assert_eq!(
+            style & (WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX),
+            0
+        );
+        assert_eq!(
             extended & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE),
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         );
         assert_eq!(
-            extended & (WS_EX_APPWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT),
+            extended
+                & (WS_EX_APPWINDOW
+                    | WS_EX_TOPMOST
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_CLIENTEDGE
+                    | WS_EX_DLGMODALFRAME
+                    | WS_EX_STATICEDGE
+                    | WS_EX_WINDOWEDGE),
             0
         );
     }
@@ -717,9 +1309,108 @@ mod tests {
             let _guard = ControlledSurfacePositionGuard::enter();
             assert!(CONTROLLED_SURFACE_POSITION.load(Ordering::Acquire));
             assert!(SURFACE_POSITION_LOCK.try_lock().is_err());
+            assert!(ControlledSurfacePositionGuard::try_enter().is_none());
         }
         assert!(!CONTROLLED_SURFACE_POSITION.load(Ordering::Acquire));
         assert!(SURFACE_POSITION_LOCK.try_lock().is_ok());
+    }
+
+    #[test]
+    fn desktop_band_allows_only_noncovering_intervening_windows() {
+        assert!(safe_intervening_window_properties(
+            false, false, false, false, false
+        ));
+        assert!(safe_intervening_window_properties(
+            false, true, false, false, false
+        ));
+        assert!(safe_intervening_window_properties(
+            true, true, false, false, false
+        ));
+        assert!(safe_intervening_window_properties(
+            true, false, true, false, false
+        ));
+        assert!(safe_intervening_window_properties(
+            true, false, false, true, true
+        ));
+        assert!(!safe_intervening_window_properties(
+            true, false, false, false, true
+        ));
+        assert!(!safe_intervening_window_properties(
+            true, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn desktop_band_anchor_never_climbs_past_an_ordinary_window() {
+        let helper = 1usize as HWND;
+        let surface = 2usize as HWND;
+        let ordinary = 3usize as HWND;
+        let topmost = 4usize as HWND;
+
+        assert_eq!(
+            classify_anchor_candidate(helper, helper, surface),
+            AnchorCandidate::SkipOwned
+        );
+        assert_eq!(
+            classify_anchor_candidate(surface, helper, surface),
+            AnchorCandidate::SkipOwned
+        );
+        assert_eq!(
+            classify_anchor_candidate(ordinary, helper, surface),
+            AnchorCandidate::UseWindow
+        );
+        assert_eq!(
+            classify_anchor_candidate(topmost, helper, surface),
+            AnchorCandidate::UseWindow
+        );
+    }
+
+    #[test]
+    fn mouse_activation_defers_one_nonactivating_reassert() {
+        assert_eq!(
+            surface_message_policy(WM_MOUSEACTIVATE, false, false),
+            SurfaceMessagePolicy::ScheduleReassert
+        );
+        assert_eq!(
+            surface_message_policy(WM_REASSERT_DESKTOP_BAND, false, false),
+            SurfaceMessagePolicy::RunReassert
+        );
+        assert_eq!(
+            surface_message_policy(WM_WINDOWPOSCHANGING, false, true),
+            SurfaceMessagePolicy::PreserveZOrder
+        );
+        assert_eq!(
+            surface_message_policy(WM_WINDOWPOSCHANGING, true, true),
+            SurfaceMessagePolicy::Forward
+        );
+        assert_eq!(
+            surface_message_policy(WM_WINDOWPOSCHANGING, false, false),
+            SurfaceMessagePolicy::Forward
+        );
+    }
+
+    #[test]
+    fn surface_activity_requires_monotonic_identifiers() {
+        let valid = WidgetSurfaceActivityReport {
+            phase: SurfaceActivityPhase::Poll,
+            sequence: 2,
+            generation: 1,
+            changed: false,
+            document_visibility: DocumentVisibility::Hidden,
+            monotonic_ms: 5_000,
+        };
+        assert!(validate_surface_activity(valid).is_ok());
+        assert!(validate_surface_activity(WidgetSurfaceActivityReport {
+            sequence: 0,
+            ..valid
+        })
+        .is_err());
+        assert!(validate_surface_activity(WidgetSurfaceActivityReport {
+            sequence: 2,
+            generation: 3,
+            ..valid
+        })
+        .is_err());
     }
 
     #[test]
@@ -738,6 +1429,36 @@ mod tests {
                 y: 136,
                 width: 480,
                 height: 450,
+            }
+        );
+    }
+
+    #[test]
+    fn client_geometry_excludes_the_underlay_frame() {
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 544,
+            bottom: 351,
+        };
+        let screen = screen_rect_from_client(client, POINT { x: 1_344, y: 25 });
+        let report = WidgetSurfaceBoundsReport {
+            left: 112.0,
+            top: 20.0,
+            width: 320.0,
+            height: 300.0,
+            viewport_width: 544.0,
+            viewport_height: 351.0,
+            device_pixel_ratio: 1.0,
+        };
+
+        assert_eq!(
+            derive_surface_rect_from_physical(screen, report).unwrap(),
+            SurfaceRect {
+                x: 1_456,
+                y: 45,
+                width: 320,
+                height: 300,
             }
         );
     }

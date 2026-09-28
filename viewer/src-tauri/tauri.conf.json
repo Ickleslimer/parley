@@ -15,24 +15,6 @@
     },
     "windows": [
       {
-        "label": "widget",
-        "title": "Parley",
-        "url": "index.html?view=widget",
-        "width": 560,
-        "height": 360,
-        "minWidth": 320,
-        "minHeight": 180,
-        "decorations": false,
-        "transparent": false,
-        "resizable": false,
-        "focus": false,
-        "focusable": false,
-        "alwaysOnTop": false,
-        "skipTaskbar": true,
-        "visible": false,
-        "backgroundColor": "#2c2428"
-      },
-      {
         "label": "detail",
         "title": "Parley Conversation Viewer",
         "url": "index.html?view=detail",

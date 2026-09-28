@@ -47,6 +47,8 @@ pub fn run() {
             commands::save_settings,
             commands::report_widget_surface_bounds,
             commands::widget_surface_ready,
+            commands::report_widget_surface_activity,
+            commands::widget_surface_pointer_down,
             commands::retry_interactive_mode,
             commands::list_monitors,
             commands::select_event_log,
