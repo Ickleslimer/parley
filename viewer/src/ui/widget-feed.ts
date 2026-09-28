@@ -1,13 +1,13 @@
 import type { ViewerStatus, WidgetFeedExchange, WidgetFeedMessage, WidgetFeedPage } from "../contracts";
 import type { ViewerApi } from "../ipc";
 
-import { AVATAR_ILLUSTRATIONS } from "./assets";
 import { displaySpeaker, normalizeSpeaker, tailForSpeaker, type TailDirection } from "./attribution";
 import { el, setText } from "./dom";
 import { formatTimestamp, idleWidgetLabel } from "./format";
 import { degradedBanner, loadErrorLabel, PARLEY_ERROR_LABEL } from "./labels";
 import { LANDMARKS } from "./landmarks";
 import { createSingleFlightPoller, WIDGET_POLL_MS } from "./poll";
+import { createWidgetAvatar, type WidgetAvatarAgent } from "./widget-avatar";
 
 export const FEED_PAGE_EXCHANGES = 20;
 export const FEED_MAX_EXCHANGES = 200;
@@ -55,7 +55,7 @@ export function userScrollShouldPause(input: {
 }
 
 type ScrollHold = "pin" | "pin-if-moved" | "preserve" | "anchor" | "none";
-type AvatarKind = "codex" | "grok" | "neutral" | "none";
+type AvatarKind = WidgetAvatarAgent | "none";
 
 interface StoredMessage {
   eventKey: string;
@@ -103,6 +103,7 @@ interface RowModel {
   displayName: string;
   tail: TailDirection;
   avatar: AvatarKind;
+  working: boolean;
   meta: string;
   body: string;
   note: string | null;
@@ -585,7 +586,7 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     } else {
       delete handle.root.dataset.eventKey;
     }
-    syncAvatar(handle, model.avatar);
+    syncAvatar(handle, model.avatar, model.working);
     setText(handle.name, model.displayName);
     setText(handle.meta, model.meta);
     handle.body.hidden = model.projection === "withheld";
@@ -600,9 +601,10 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     handle.openButton.hidden = model.eventKey == null;
   }
 
-  function syncAvatar(handle: RowHandle, avatar: AvatarKind): void {
-    const current = handle.avatar?.dataset.avatarKind;
-    if (current === avatar) {
+  function syncAvatar(handle: RowHandle, avatar: AvatarKind, working: boolean): void {
+    const currentAgent = handle.avatar?.dataset.agent;
+    const currentWorking = handle.avatar?.dataset.working === "true";
+    if (currentAgent === avatar && currentWorking === working) {
       return;
     }
     handle.avatar?.remove();
@@ -610,8 +612,7 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     if (avatar === "none") {
       return;
     }
-    const node = avatar === "neutral" ? neutralDevice() : idleAvatar(avatar);
-    node.dataset.avatarKind = avatar;
+    const node = createWidgetAvatar({ agent: avatar, working });
     handle.root.prepend(node);
     handle.avatar = node;
   }
@@ -1007,6 +1008,7 @@ function messageModel(message: StoredMessage, role: "request" | "completion"): R
       displayName: "Parley",
       tail: "none",
       avatar: "none",
+      working: false,
       meta: `${PARLEY_ERROR_LABEL} \u00b7 ${formatTimestamp(message.timestampMs)}`,
       body: visibleBody(message),
       note: visibleNote(message),
@@ -1025,6 +1027,7 @@ function messageModel(message: StoredMessage, role: "request" | "completion"): R
     displayName: displaySpeaker(message.speaker),
     tail: tailForSpeaker(message.speaker),
     avatar: known ?? "neutral",
+    working: false,
     meta: `${role === "request" ? "Request" : "Completion"} \u00b7 ${formatTimestamp(message.timestampMs)}`,
     body: visibleBody(message),
     note: visibleNote(message),
@@ -1046,6 +1049,7 @@ function pendingModel(exchange: StoredExchange): RowModel {
     displayName: known ? displaySpeaker(recipient) : "Parley",
     tail: known ? tailForSpeaker(recipient) : "none",
     avatar: known ?? "none",
+    working: known != null,
     meta: "Pending response",
     body: exchange.pendingLabel ?? "",
     note: null,
@@ -1110,33 +1114,6 @@ function messageSignature(message: StoredMessage | null): string {
     message.projection,
     message.contextOmitted ? "1" : "0",
   ].join("\u001d");
-}
-
-function idleAvatar(agent: "codex" | "grok"): HTMLImageElement {
-  const source = agent === "codex" ? AVATAR_ILLUSTRATIONS.codexIdle : AVATAR_ILLUSTRATIONS.grokIdle;
-  const image = el("img", {
-    className: "widget-feed-avatar",
-    attrs: {
-      src: source.path,
-      alt: "",
-      "aria-hidden": "true",
-      decoding: "async",
-      draggable: "false",
-    },
-  });
-  image.addEventListener("error", () => {
-    image.classList.add("is-missing");
-  });
-  return image;
-}
-
-function neutralDevice(): HTMLSpanElement {
-  const screen = el("span", { className: "widget-feed-device-screen" });
-  return el("span", {
-    className: "widget-feed-device",
-    attrs: { "aria-hidden": "true" },
-    children: [screen],
-  });
 }
 
 function nonActivatingButton(label: string, id: string, onClick: () => void): HTMLButtonElement {

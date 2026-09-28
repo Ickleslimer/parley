@@ -411,7 +411,8 @@ describe("widget feed", () => {
     const pending = mounted.root.querySelector<HTMLElement>('[data-kind="pending"]');
     expect(pending?.dataset.tail).toBe("toward-grok");
     expect(pending?.textContent).toContain(PENDING_LABEL);
-    expect(pending?.querySelector("img")?.getAttribute("src")).toBe(AVATAR_ILLUSTRATIONS.grokIdle.path);
+    expect(pending?.querySelector("img")?.getAttribute("src")).toBe(AVATAR_ILLUSTRATIONS.grokWorking.path);
+    expect(pending?.querySelector<HTMLElement>(".widget-feed-avatar-slot")?.dataset.working).toBe("true");
     expect(mounted.root.querySelector("img")?.getAttribute("src")).not.toContain("working");
     mounted.stop();
   });

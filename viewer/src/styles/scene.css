@@ -1,3 +1,5 @@
+@import "./avatar.css";
+
 .widget-shell,
 .widget-shell * {
   pointer-events: none;
@@ -209,21 +211,6 @@
   justify-content: center;
 }
 
-.widget-feed-avatar,
-.widget-feed-device {
-  flex: 0 0 auto;
-  width: 48px;
-  height: 48px;
-}
-
-.widget-feed-avatar {
-  object-fit: contain;
-}
-
-.widget-feed-avatar.is-missing {
-  visibility: hidden;
-}
-
 .widget-feed-device {
   display: flex;
   align-items: center;
@@ -362,12 +349,6 @@
 
   .widget-feed-row {
     gap: 0.35rem;
-  }
-
-  .widget-feed-avatar,
-  .widget-feed-device {
-    width: 42px;
-    height: 42px;
   }
 
   .widget-feed-slip {
