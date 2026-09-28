@@ -21,19 +21,11 @@ afterEach(() => {
 describe("widget surface", () => {
   it("renders the feed with mouse-only controls and no pager", async () => {
     const openWidgetEvent = vi.fn(async () => undefined);
-    const openWidgetExchange = vi.fn(async () => undefined);
-    const showDetail = vi.fn(async () => undefined);
-    const widgetBrowseOlder = vi.fn(async () => {
-      throw new Error("pager");
-    });
     const reportWidgetSurfaceBounds = vi.fn(async () => watchingStatus());
     const retryInteractiveMode = vi.fn(async () => watchingStatus());
     const { root, stop } = mountSurface({
       page: feedPage(HOSTILE),
       openWidgetEvent,
-      openWidgetExchange,
-      showDetail,
-      widgetBrowseOlder,
       reportWidgetSurfaceBounds,
       retryInteractiveMode,
     });
@@ -42,8 +34,8 @@ describe("widget surface", () => {
     });
     expect(root.querySelector("script")).toBeNull();
     expect(root.querySelector(`#${LANDMARKS.widgetSurface}`)).not.toBeNull();
-    expect(root.querySelector(`#${LANDMARKS.widgetSurfaceOlder}`)).toBeNull();
-    expect(root.querySelector(`#${LANDMARKS.widgetSurfaceNewer}`)).toBeNull();
+    expect(root.textContent).not.toContain("Older");
+    expect(root.textContent).not.toContain("Newer");
     const status = root.querySelector(`#${LANDMARKS.widgetFeedStatus}`);
     const scroll = root.querySelector(`#${LANDMARKS.widgetFeedScroll}`);
     const controls = root.querySelector(`#${LANDMARKS.widgetSurfaceControls}`);
@@ -72,13 +64,10 @@ describe("widget surface", () => {
       expect(key.defaultPrevented).toBe(true);
     }
     root.dispatchEvent(new WheelEvent("wheel", { deltaY: 80, bubbles: true }));
-    expect(widgetBrowseOlder).not.toHaveBeenCalled();
     button(root, LANDMARKS.widgetFeedOpenTranscript).click();
     await vi.waitFor(() => {
       expect(openWidgetEvent).toHaveBeenCalledWith("response-1");
     });
-    expect(openWidgetExchange).not.toHaveBeenCalled();
-    expect(showDetail).not.toHaveBeenCalled();
     expect(reportWidgetSurfaceBounds).not.toHaveBeenCalled();
     expect(retryInteractiveMode).not.toHaveBeenCalled();
     stop();
@@ -136,8 +125,8 @@ describe("widget surface", () => {
     expect(document.querySelectorAll('[aria-live="polite"]')).toHaveLength(1);
     expect(surface.querySelector(`#${LANDMARKS.widgetFeedStatus}`)?.getAttribute("aria-live")).toBe("polite");
     expect(underlay.querySelector(`#${LANDMARKS.widgetColumn}`)?.getAttribute("aria-hidden")).toBe("true");
-    expect(underlay.querySelector(`#${LANDMARKS.widgetCodex}`)?.getAttribute("aria-hidden")).toBe("true");
-    expect(underlay.querySelector(".widget-live, .widget-slip, .widget-excerpt")).toBeNull();
+    expect(underlay.querySelector("img")).toBeNull();
+    expect(underlay.querySelector(".widget-feed-row, .widget-feed-body")).toBeNull();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(widgetSurfaceReady).toHaveBeenCalledTimes(1);
     underlayHandle.stop();
@@ -190,26 +179,16 @@ describe("widget surface", () => {
     const underlayHandle = mountWidget(underlay, fixture.api);
     const surfaceHandle = mountWidgetSurface(surface, fixture.api);
     expect(underlay.querySelector(`#${LANDMARKS.widgetColumn}`)?.getAttribute("aria-hidden")).toBe("true");
-    expect(underlay.querySelector(".widget-live, .widget-slip, .widget-excerpt")).toBeNull();
+    expect(underlay.querySelector(".widget-feed-row, .widget-feed-body")).toBeNull();
     expect(underlay.querySelectorAll('[aria-live="polite"]')).toHaveLength(0);
     expect(surface.querySelector('[aria-live="polite"]')).toBeNull();
-    for (const image of underlay.querySelectorAll("img")) {
-      image.dispatchEvent(new Event("error"));
-    }
-    expect(underlay.querySelectorAll("img.is-missing")).toHaveLength(3);
+    expect(underlay.querySelectorAll("img")).toHaveLength(0);
     expect(underlay.textContent).toBe("");
     underlayHandle.stop();
     surfaceHandle.stop();
   });
 
-  it("keeps synthetic browser snapshots for historical, missing, and ambiguous fixtures", async () => {
-    const historical = await createSyntheticFixture("historical").api.getWidgetBrowser();
-    expect(historical.followLive).toBe(false);
-    expect(historical.newerCount).toBe(2);
-    const missing = await createSyntheticFixture("missing-selection").api.getWidgetBrowser();
-    expect(missing.selectionState).toBe("missing");
-    const ambiguous = await createSyntheticFixture("ambiguous").api.getWidgetBrowser();
-    expect(ambiguous.selectionState).toBe("ambiguous");
+  it("keeps the synthetic passive fallback diagnostic without a transcript", async () => {
     const passive = await createSyntheticFixture("passive-fallback").api.getStatus();
     expect(passive.desktopRuntimeState).toBe("passive-fallback");
     expect(passive.desktopFallbackReason).toBe("surface-z-order-invalid");
@@ -221,9 +200,6 @@ function mountSurface(options: {
   status?: ViewerStatus;
   getWidgetFeed?: ViewerApi["getWidgetFeed"];
   openWidgetEvent?: ViewerApi["openWidgetEvent"];
-  openWidgetExchange?: ViewerApi["openWidgetExchange"];
-  showDetail?: ViewerApi["showDetail"];
-  widgetBrowseOlder?: ViewerApi["widgetBrowseOlder"];
   reportWidgetSurfaceBounds?: ViewerApi["reportWidgetSurfaceBounds"];
   reportWidgetSurfaceActivity?: ViewerApi["reportWidgetSurfaceActivity"];
   widgetSurfacePointerDown?: ViewerApi["widgetSurfacePointerDown"];
@@ -239,9 +215,6 @@ function mountSurface(options: {
       page: options.page ?? feedPage("Ship the engine"),
       getWidgetFeed: options.getWidgetFeed,
       openWidgetEvent: options.openWidgetEvent,
-      openWidgetExchange: options.openWidgetExchange,
-      showDetail: options.showDetail,
-      widgetBrowseOlder: options.widgetBrowseOlder,
       reportWidgetSurfaceBounds: options.reportWidgetSurfaceBounds,
       reportWidgetSurfaceActivity: options.reportWidgetSurfaceActivity,
       widgetSurfacePointerDown: options.widgetSurfacePointerDown,
@@ -257,9 +230,6 @@ function surfaceApi(options: {
   page: WidgetFeedPage;
   getWidgetFeed?: ViewerApi["getWidgetFeed"];
   openWidgetEvent?: ViewerApi["openWidgetEvent"];
-  openWidgetExchange?: ViewerApi["openWidgetExchange"];
-  showDetail?: ViewerApi["showDetail"];
-  widgetBrowseOlder?: ViewerApi["widgetBrowseOlder"];
   reportWidgetSurfaceBounds?: ViewerApi["reportWidgetSurfaceBounds"];
   reportWidgetSurfaceActivity?: ViewerApi["reportWidgetSurfaceActivity"];
   widgetSurfacePointerDown?: ViewerApi["widgetSurfacePointerDown"];
@@ -276,11 +246,6 @@ function surfaceApi(options: {
     reportWidgetSurfaceActivity: options.reportWidgetSurfaceActivity ?? (async () => undefined),
     reportWidgetSurfaceBounds: options.reportWidgetSurfaceBounds ?? (async () => options.status),
     retryInteractiveMode: options.retryInteractiveMode ?? (async () => options.status),
-    showDetail: options.showDetail ?? (async () => undefined),
-    openWidgetExchange: options.openWidgetExchange ?? (async () => undefined),
-    widgetBrowseOlder: options.widgetBrowseOlder ?? (async () => {
-      throw new Error("pager");
-    }),
   } as unknown as ViewerApi;
 }
 

@@ -163,6 +163,11 @@ describe("widget feed", () => {
     await vi.waitFor(() => {
       expect(mounted.root.textContent).toContain("alpha stays");
     });
+    const scroll = scrollport(mounted.root);
+    stubMetrics(scroll, { scrollHeight: 500, clientHeight: 100 });
+    scroll.scrollTop = 0;
+    scroll.dispatchEvent(new Event("scroll"));
+    expect(button(mounted.root, LANDMARKS.widgetFeedLiveToggle).getAttribute("aria-pressed")).toBe("false");
     await vi.advanceTimersByTimeAsync(500);
     await vi.waitFor(() => {
       expect(mounted.root.textContent).toContain("History changed \u00b7 Jump to live");
@@ -178,6 +183,28 @@ describe("widget feed", () => {
     expect(mounted.root.textContent).not.toContain("History changed");
     expect(button(mounted.root, LANDMARKS.widgetFeedLiveToggle).getAttribute("aria-pressed")).toBe("true");
     expect(button(mounted.root, LANDMARKS.widgetFeedJumpLive).hidden).toBe(true);
+    mounted.stop();
+  });
+
+  it("accepts a changed history token while actively following live", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const pages = [
+      feedPage({ token: "history-a", items: [exchange(1, { requestBody: "alpha" })] }),
+      feedPage({ token: "history-b", items: [exchange(9, { requestBody: "beta" })] }),
+    ];
+    let index = 0;
+    const mounted = mountFeed({
+      getWidgetFeed: async () => pages[Math.min(index++, pages.length - 1)] ?? pages[0]!,
+    });
+    await vi.waitFor(() => {
+      expect(mounted.root.textContent).toContain("alpha");
+    });
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => {
+      expect(mounted.root.textContent).toContain("beta");
+    });
+    expect(mounted.root.textContent).not.toContain("History changed");
+    expect(button(mounted.root, LANDMARKS.widgetFeedLiveToggle).getAttribute("aria-pressed")).toBe("true");
     mounted.stop();
   });
 
@@ -239,13 +266,14 @@ describe("widget feed", () => {
       expect(exchangeKeys(mounted.root)[0]).toBe("exchange-0");
     });
     expect(scroll.scrollTop).toBe(before + 1000);
-    expect(button(mounted.root, LANDMARKS.widgetFeedLiveToggle).getAttribute("aria-pressed")).toBe("true");
+    expect(button(mounted.root, LANDMARKS.widgetFeedLiveToggle).getAttribute("aria-pressed")).toBe("false");
     expect(getWidgetFeed).toHaveBeenCalledWith("exchange-20");
     mounted.stop();
   });
 
   it("keeps at most 200 exchanges while loading earlier", async () => {
     const total = 240;
+    const openWidgetEvent = vi.fn(async () => undefined);
     const getWidgetFeed = vi.fn(async (before: string | null) => {
       const end = before == null ? total : Number(/^exchange-(\d+)$/.exec(before)?.[1] ?? total);
       const start = Math.max(0, end - 20);
@@ -256,15 +284,12 @@ describe("widget feed", () => {
         totalExchanges: total,
       });
     });
-    const mounted = mountFeed({ getWidgetFeed });
+    const mounted = mountFeed({ getWidgetFeed, openWidgetEvent });
     await vi.waitFor(() => {
       expect(exchangeKeys(mounted.root)).toHaveLength(20);
     });
-    for (let attempt = 0; attempt < 15; attempt += 1) {
+    for (let attempt = 0; attempt < 15 && exchangeKeys(mounted.root).length < 200; attempt += 1) {
       const control = button(mounted.root, LANDMARKS.widgetFeedLoadEarlier);
-      if (control.disabled) {
-        break;
-      }
       const calls = getWidgetFeed.mock.calls.length;
       control.click();
       await vi.waitFor(() => {
@@ -273,10 +298,18 @@ describe("widget feed", () => {
     }
     const keys = exchangeKeys(mounted.root);
     expect(keys).toHaveLength(200);
-    expect(keys[0]).toBe("exchange-0");
-    expect(keys[199]).toBe("exchange-199");
-    expect(keys).not.toContain("exchange-239");
-    expect(button(mounted.root, LANDMARKS.widgetFeedLoadEarlier).disabled).toBe(true);
+    expect(keys[0]).toBe("exchange-40");
+    expect(keys[199]).toBe("exchange-239");
+    expect(keys).not.toContain("exchange-39");
+    const control = button(mounted.root, LANDMARKS.widgetFeedLoadEarlier);
+    expect(control.disabled).toBe(false);
+    expect(control.textContent).toBe("Open earlier messages in transcript");
+    const feedCalls = getWidgetFeed.mock.calls.length;
+    control.click();
+    await vi.waitFor(() => {
+      expect(openWidgetEvent).toHaveBeenCalledWith("request-40");
+    });
+    expect(getWidgetFeed).toHaveBeenCalledTimes(feedCalls);
     mounted.stop();
   });
 
@@ -462,8 +495,8 @@ describe("widget feed", () => {
     expect(css).toMatch(/\.widget-feed-load-earlier\s*\{[^}]*min-width:\s*44px;[^}]*min-height:\s*44px/);
     expect(css).toMatch(/\.widget-surface-button\.widget-feed-target\s*\{[^}]*min-width:\s*44px;[^}]*min-height:\s*44px/);
     expect(css).toMatch(/\.widget-feed-scroll\s*\{[^}]*overflow-y:\s*scroll/);
-    expect(mounted.root.querySelector(`#${LANDMARKS.widgetSurfaceOlder}`)).toBeNull();
-    expect(mounted.root.querySelector(`#${LANDMARKS.widgetSurfaceNewer}`)).toBeNull();
+    expect(mounted.root.textContent).not.toContain("Older");
+    expect(mounted.root.textContent).not.toContain("Newer");
     const controls = [
       button(mounted.root, LANDMARKS.widgetFeedLoadEarlier),
       button(mounted.root, LANDMARKS.widgetFeedLiveToggle),

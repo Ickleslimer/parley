@@ -23,10 +23,11 @@ const SCENARIOS = new Set<FixtureScenario>([
   "empty",
   "source-error",
   "live",
-  "historical",
-  "missing-selection",
-  "ambiguous",
   "passive-fallback",
+  "paused-unread",
+  "collapsed",
+  "expanded",
+  "completion",
 ]);
 
 const TAB_LANDMARKS: Record<FixtureInspectorTab, string> = {

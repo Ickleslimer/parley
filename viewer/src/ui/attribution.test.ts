@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import type { PresentedMessage } from "./excerpt";
 import {
-  attributeExchange,
   displaySpeaker,
   messageBubble,
   normalizeSpeaker,
@@ -71,22 +70,4 @@ describe("speaker attribution", () => {
     );
   });
 
-  it("orders one newest exchange chronologically and preserves hostile text", () => {
-    const bubbles = attributeExchange({
-      request: message(),
-      completion: message({
-        eventKey: "event:2",
-        eventId: "event-2",
-        eventType: "response",
-        heading: "Completion",
-        speaker: "grok",
-        recipient: "codex",
-        excerpt: "done & exact",
-      }),
-      pendingLabel: null,
-      completionHeading: "Completion",
-    });
-    expect(bubbles.map((bubble) => bubble.speaker)).toEqual(["codex", "grok"]);
-    expect(bubbles[0]?.excerpt).toBe("<img src=x onerror=alert(1)>");
-  });
 });

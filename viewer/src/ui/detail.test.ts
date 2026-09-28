@@ -293,37 +293,6 @@ function createApi(statusOverrides: Partial<ViewerStatus> = {}) {
   let currentHealth = health(1);
   const api: ViewerApi = {
     getStatus: async () => status({ ...statusOverrides, bytesRead }),
-    getWidgetSnapshot: async () => ({
-      sessionKey: null,
-      exchangeKey: null,
-      sessionId: null,
-      exchangeId: null,
-      request: null,
-      completion: null,
-      pendingLabel: null,
-    }),
-    getWidgetBrowser: async () => ({
-      followLive: true,
-      selectionState: "empty",
-      position: 0,
-      total: 0,
-      hasOlder: false,
-      hasNewer: false,
-      newerCount: 0,
-      widget: {
-        sessionKey: null,
-        exchangeKey: null,
-        sessionId: null,
-        exchangeId: null,
-        request: null,
-        completion: null,
-        pendingLabel: null,
-      },
-    }),
-    widgetBrowseOlder: async () => api.getWidgetBrowser(),
-    widgetBrowseNewer: async () => api.getWidgetBrowser(),
-    widgetBrowseLive: async () => api.getWidgetBrowser(),
-    openWidgetExchange: async () => undefined,
     getWidgetFeed: async () => ({
       historyToken: "test-history-v1",
       items: [],

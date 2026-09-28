@@ -11,22 +11,14 @@ import type {
   SessionPage,
   ViewerSettings,
   ViewerStatus,
-  WidgetBrowserSnapshot,
   WidgetFeedMessage,
   WidgetFeedPage,
-  WidgetSnapshot,
   WidgetSurfaceActivityReport,
   WidgetSurfaceBoundsReport,
 } from "./contracts";
 
 export interface ViewerApi {
   getStatus(): Promise<ViewerStatus>;
-  getWidgetSnapshot(): Promise<WidgetSnapshot>;
-  getWidgetBrowser(): Promise<WidgetBrowserSnapshot>;
-  widgetBrowseOlder(): Promise<WidgetBrowserSnapshot>;
-  widgetBrowseNewer(): Promise<WidgetBrowserSnapshot>;
-  widgetBrowseLive(): Promise<WidgetBrowserSnapshot>;
-  openWidgetExchange(): Promise<void>;
   getWidgetFeed(beforeExchangeKey: string | null): Promise<WidgetFeedPage>;
   getWidgetMessage(eventKey: string): Promise<WidgetFeedMessage | null>;
   openWidgetEvent(eventKey: string | null): Promise<void>;
@@ -61,12 +53,6 @@ export interface ViewerApi {
 
 export const viewerApi: ViewerApi = {
   getStatus: () => invoke<ViewerStatus>("get_viewer_status"),
-  getWidgetSnapshot: () => invoke<WidgetSnapshot>("get_widget_snapshot"),
-  getWidgetBrowser: () => invoke<WidgetBrowserSnapshot>("get_widget_browser"),
-  widgetBrowseOlder: () => invoke<WidgetBrowserSnapshot>("widget_browse_older"),
-  widgetBrowseNewer: () => invoke<WidgetBrowserSnapshot>("widget_browse_newer"),
-  widgetBrowseLive: () => invoke<WidgetBrowserSnapshot>("widget_browse_live"),
-  openWidgetExchange: () => invoke<void>("open_widget_exchange"),
   getWidgetFeed: (beforeExchangeKey) =>
     invoke<WidgetFeedPage>("get_widget_feed", { beforeExchangeKey }),
   getWidgetMessage: (eventKey) =>

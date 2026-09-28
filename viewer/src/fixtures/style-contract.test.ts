@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { AVATAR_ILLUSTRATIONS, ILLUSTRATIONS } from "../ui/assets";
+import { AVATAR_ILLUSTRATIONS } from "../ui/assets";
 
 const stylesDirectory = fileURLToPath(new URL("../styles", import.meta.url));
 const illustrationDirectory = fileURLToPath(
@@ -58,19 +58,6 @@ describe("Two Chairs style contract", () => {
   });
 
   it("keeps illustration metadata tied to the shipped bytes", () => {
-    const files = {
-      plate: "workshop-plate.webp",
-      codex: "codex-robot.webp",
-      grok: "grok-robot.webp",
-    } as const;
-
-    for (const [key, name] of Object.entries(files)) {
-      const bytes = readFileSync(`${illustrationDirectory}/${name}`);
-      const metadata = ILLUSTRATIONS[key as keyof typeof ILLUSTRATIONS];
-      expect(metadata.byteLength).toBe(bytes.byteLength);
-      expect(metadata.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
-    }
-
     const avatars = {
       codexIdle: "codex-device-idle.webp",
       codexWorking: "codex-device-working.webp",

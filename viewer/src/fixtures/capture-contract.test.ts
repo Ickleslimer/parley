@@ -12,10 +12,8 @@ const captureScript = readFileSync(
 
 describe("synthetic capture contract", () => {
   it("covers every frozen surface, state, viewport, tab, and text scale", () => {
-    expect(REQUIRED_FIXTURES).toHaveLength(30);
-    const scripted = REQUIRED_FIXTURES.filter((fixture) => fixture.surface !== "widget-surface");
-    expect(scripted).toHaveLength(16);
-    for (const fixture of scripted) {
+    expect(REQUIRED_FIXTURES).toHaveLength(24);
+    for (const fixture of REQUIRED_FIXTURES) {
       const query = [
         `view=${fixture.surface}`,
         `fixture=${fixture.scenario}`,
@@ -55,6 +53,7 @@ describe("synthetic capture contract", () => {
   it("uses isolated headless Edge and a bounded graceful server shutdown", () => {
     expect(captureScript).toContain('"--headless=new"');
     expect(captureScript).toContain('"--disable-background-networking"');
+    expect(captureScript).not.toContain('"--hide-scrollbars"');
     expect(captureScript).toContain('"--user-data-dir=$edgeProfile"');
     expect(captureScript).toContain('"http://127.0.0.1:1420/__fixture_shutdown"');
     expect(captureScript).toContain("WaitForExit(5000)");

@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import type { MessagePreview, WidgetSnapshot } from "../contracts";
+import type { MessagePreview } from "../contracts";
 
 import {
   exactEventBody,
   participantInitial,
+  presentExchange,
   presentMessage,
-  presentWidgetSnapshot,
 } from "./excerpt";
 import { EXTRACTED_TASK_LABEL, PARLEY_ERROR_LABEL, PENDING_LABEL } from "./labels";
 
@@ -100,27 +100,19 @@ describe("exact excerpt presentation", () => {
     expect(presented.extractedLabel).toBeNull();
   });
 
-  it("presents completion, pending, and Parley error states from the snapshot", () => {
-    const pending: WidgetSnapshot = {
-      sessionKey: "key-s-1",
-      exchangeKey: "key-ex-3",
-      sessionId: "s-1",
-      exchangeId: "ex-3",
+  it("presents completion, pending, and Parley error states from an exchange", () => {
+    const pending = {
       request: preview({ excerpt: "waiting" }),
       completion: null,
       pendingLabel: PENDING_LABEL,
     };
-    const pendingView = presentWidgetSnapshot(pending, true);
+    const pendingView = presentExchange(pending, true);
     expect(pendingView.request?.excerpt).toBe("waiting");
     expect(pendingView.completion).toBeNull();
     expect(pendingView.pendingLabel).toBe(PENDING_LABEL);
     expect(pendingView.completionHeading).toBe(PENDING_LABEL);
 
-    const failed: WidgetSnapshot = {
-      sessionKey: "key-s-1",
-      exchangeKey: "key-ex-2",
-      sessionId: "s-1",
-      exchangeId: "ex-2",
+    const failed = {
       request: preview({ excerpt: "second" }),
       completion: preview({
         eventId: "err-2",
@@ -134,7 +126,7 @@ describe("exact excerpt presentation", () => {
       }),
       pendingLabel: null,
     };
-    const failedView = presentWidgetSnapshot(failed, true);
+    const failedView = presentExchange(failed, true);
     expect(failedView.pendingLabel).toBeNull();
     expect(failedView.completion?.heading).toBe(PARLEY_ERROR_LABEL);
     expect(failedView.completion?.speaker).toBe("codex");

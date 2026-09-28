@@ -160,29 +160,6 @@ export interface ContextDiagnostics {
   recovery: string | null;
 }
 
-export interface WidgetSnapshot {
-  sessionKey: string | null;
-  exchangeKey: string | null;
-  sessionId: string | null;
-  exchangeId: string | null;
-  request: MessagePreview | null;
-  completion: MessagePreview | null;
-  pendingLabel: string | null;
-}
-
-export type WidgetSelectionState = "selected" | "empty" | "missing" | "ambiguous";
-
-export interface WidgetBrowserSnapshot {
-  followLive: boolean;
-  selectionState: WidgetSelectionState;
-  position: number;
-  total: number;
-  hasOlder: boolean;
-  hasNewer: boolean;
-  newerCount: number;
-  widget: WidgetSnapshot;
-}
-
 export type WidgetFeedProjection = "exact" | "current-request" | "withheld";
 
 export interface WidgetFeedMessage {

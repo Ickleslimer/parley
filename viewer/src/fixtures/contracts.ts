@@ -13,9 +13,6 @@ export type FixtureScenario =
   | "empty"
   | "source-error"
   | "live"
-  | "historical"
-  | "missing-selection"
-  | "ambiguous"
   | "passive-fallback"
   | "paused-unread"
   | "collapsed"
@@ -35,15 +32,9 @@ export interface FixtureRequest {
 }
 
 export const REQUIRED_FIXTURES: readonly FixtureRequest[] = [
-  { surface: "widget", scenario: "short-exchange", width: 560, height: 360, textScale: 1, reducedMotion: false },
-  { surface: "widget", scenario: "maximum-exchange", width: 560, height: 360, textScale: 1, reducedMotion: false },
-  { surface: "widget", scenario: "short-exchange", width: 320, height: 180, textScale: 1, reducedMotion: false },
-  { surface: "widget", scenario: "reversed-route", width: 560, height: 360, textScale: 1, reducedMotion: false },
-  { surface: "widget", scenario: "unknown-agent", width: 560, height: 360, textScale: 1, reducedMotion: false },
-  { surface: "widget", scenario: "pending", width: 560, height: 360, textScale: 1, reducedMotion: false },
-  { surface: "widget", scenario: "error", width: 560, height: 360, textScale: 1, reducedMotion: false },
-  { surface: "widget", scenario: "idle", width: 560, height: 360, textScale: 1, reducedMotion: false },
-  { surface: "widget", scenario: "missing-image", width: 560, height: 360, textScale: 1, reducedMotion: false },
+  { surface: "widget", scenario: "live", width: 720, height: 560, textScale: 1, reducedMotion: false },
+  { surface: "widget", scenario: "live", width: 480, height: 420, textScale: 1, reducedMotion: false },
+  { surface: "widget", scenario: "live", width: 960, height: 720, textScale: 1, reducedMotion: false },
   { surface: "widget-surface", scenario: "live", width: 720, height: 560, textScale: 1, reducedMotion: false },
   { surface: "widget-surface", scenario: "paused-unread", width: 720, height: 560, textScale: 1, reducedMotion: false },
   { surface: "widget-surface", scenario: "collapsed", width: 720, height: 560, textScale: 1, reducedMotion: false },

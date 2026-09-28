@@ -1,9 +1,4 @@
-import type {
-  EventContent,
-  ExchangeSummary,
-  MessagePreview,
-  WidgetSnapshot,
-} from "../contracts";
+import type { EventContent, ExchangeSummary, MessagePreview } from "../contracts";
 
 import {
   EXTRACTED_TASK_LABEL,
@@ -89,10 +84,6 @@ export function presentExchange(
       pendingLabel: completion ? null : exchange.pendingLabel,
     }),
   };
-}
-
-export function presentWidgetSnapshot(snapshot: WidgetSnapshot, utc = false): PresentedExchange {
-  return presentExchange(snapshot, utc);
 }
 
 export function searchHitHeading(eventType: MessagePreview["eventType"]): string {

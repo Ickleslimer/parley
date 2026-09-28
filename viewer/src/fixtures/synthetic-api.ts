@@ -9,11 +9,9 @@ import {
   type SearchHit,
   type ViewerSettings,
   type ViewerStatus,
-  type WidgetBrowserSnapshot,
   type WidgetFeedExchange,
   type WidgetFeedMessage,
   type WidgetFeedPage,
-  type WidgetSnapshot,
 } from "../contracts";
 import type { ViewerApi } from "../ipc";
 import type { FixtureScenario } from "./contracts";
@@ -39,7 +37,6 @@ const EMPTY_DIAGNOSTICS = {
 export interface SyntheticFixture {
   api: ViewerApi;
   status: ViewerStatus;
-  widget: WidgetSnapshot;
   exchanges: ExchangeSummary[];
   events: Map<string, EventContent>;
 }
@@ -91,30 +88,6 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
     completion,
     pendingLabel: completion || scenario === "idle" ? null : PENDING_LABEL,
   };
-  const populatedWidget: WidgetSnapshot = {
-    sessionKey: SESSION_KEY,
-    exchangeKey: EXCHANGE_KEY,
-    sessionId: SESSION_ID,
-    exchangeId: EXCHANGE_ID,
-    request,
-    completion,
-    pendingLabel: completion ? null : PENDING_LABEL,
-  };
-  const widget: WidgetSnapshot =
-    scenario === "idle" ||
-    scenario === "empty" ||
-    scenario === "missing-selection" ||
-    scenario === "ambiguous"
-      ? {
-          sessionKey: null,
-          exchangeKey: null,
-          sessionId: null,
-          exchangeId: null,
-          request: null,
-          completion: null,
-          pendingLabel: null,
-        }
-      : populatedWidget;
   const sourceError = scenario === "source-error";
   const empty = scenario === "empty";
   const status: ViewerStatus = {
@@ -194,12 +167,6 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
   const feed = buildSyntheticFeed(scenario);
   const api: ViewerApi = {
     getStatus: async () => mutableStatus,
-    getWidgetSnapshot: async () => widget,
-    getWidgetBrowser: async () => browserFor(scenario, widget),
-    widgetBrowseOlder: async () => api.getWidgetBrowser(),
-    widgetBrowseNewer: async () => api.getWidgetBrowser(),
-    widgetBrowseLive: async () => api.getWidgetBrowser(),
-    openWidgetExchange: async () => undefined,
     getWidgetFeed: async (beforeExchangeKey) => feed.page(beforeExchangeKey),
     getWidgetMessage: async (eventKey) => feed.message(eventKey),
     openWidgetEvent: async () => undefined,
@@ -267,57 +234,7 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
     showDetail: async () => undefined,
     exit: async () => undefined,
   };
-  return { api, status, widget, exchanges, events };
-}
-
-function browserFor(scenario: FixtureScenario, widget: WidgetSnapshot): WidgetBrowserSnapshot {
-  if (scenario === "historical") {
-    return {
-      followLive: false,
-      selectionState: "selected",
-      position: 2,
-      total: 5,
-      hasOlder: true,
-      hasNewer: true,
-      newerCount: 2,
-      widget,
-    };
-  }
-  if (scenario === "missing-selection") {
-    return {
-      followLive: false,
-      selectionState: "missing",
-      position: 1,
-      total: 4,
-      hasOlder: true,
-      hasNewer: true,
-      newerCount: 1,
-      widget,
-    };
-  }
-  if (scenario === "ambiguous") {
-    return {
-      followLive: false,
-      selectionState: "ambiguous",
-      position: 1,
-      total: 4,
-      hasOlder: true,
-      hasNewer: false,
-      newerCount: 0,
-      widget,
-    };
-  }
-  const selected = widget.exchangeKey != null;
-  return {
-    followLive: true,
-    selectionState: selected ? "selected" : "empty",
-    position: 0,
-    total: selected ? 1 : 0,
-    hasOlder: false,
-    hasNewer: false,
-    newerCount: 0,
-    widget,
-  };
+  return { api, status, exchanges, events };
 }
 
 function preview(overrides: Partial<MessagePreview>): MessagePreview {
@@ -483,8 +400,6 @@ function feedExchanges(
   if (
     scenario === "empty" ||
     scenario === "idle" ||
-    scenario === "missing-selection" ||
-    scenario === "ambiguous" ||
     scenario === "passive-fallback"
   ) {
     return [];
@@ -513,7 +428,7 @@ function feedExchanges(
       }),
     ];
   }
-  if (scenario === "paused-unread" || scenario === "historical") {
+  if (scenario === "paused-unread") {
     return [
       completedExchange(fullByKey, {
         index: 1,

@@ -1,4 +1,4 @@
-import type { PresentedExchange, PresentedMessage } from "./excerpt";
+import type { PresentedMessage } from "./excerpt";
 
 export type KnownSpeaker = "codex" | "grok";
 export type BubbleKind = "speech" | "parley-error" | "pending" | "status";
@@ -14,15 +14,6 @@ export interface BubbleModel {
   heading: string;
   timestamp: string;
   extractedLabel: string | null;
-}
-
-export interface WidgetSceneModel {
-  banner: string | null;
-  liveRevision: string;
-  bubbles: BubbleModel[];
-  idleLabel: string | null;
-  loadError: string | null;
-  sourceLabel: string;
 }
 
 export function normalizeSpeaker(value: string): KnownSpeaker | null {
@@ -87,31 +78,4 @@ export function pendingBubble(label: string, recipient: string): BubbleModel {
     timestamp: "",
     extractedLabel: null,
   };
-}
-
-export function attributeExchange(exchange: PresentedExchange): BubbleModel[] {
-  const bubbles: BubbleModel[] = [];
-  if (exchange.request) {
-    bubbles.push(messageBubble(exchange.request));
-  }
-  if (exchange.completion) {
-    bubbles.push(messageBubble(exchange.completion));
-  } else if (exchange.pendingLabel && exchange.request) {
-    bubbles.push(pendingBubble(exchange.pendingLabel, exchange.request.recipient));
-  }
-  return bubbles;
-}
-
-export function liveRevision(bubbles: BubbleModel[]): string {
-  return JSON.stringify(
-    bubbles.map((bubble) => [
-      bubble.kind,
-      bubble.speaker,
-      bubble.eventKey,
-      bubble.heading,
-      bubble.excerpt,
-      bubble.timestamp,
-      bubble.extractedLabel,
-    ]),
-  );
 }

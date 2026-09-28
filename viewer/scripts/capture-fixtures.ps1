@@ -1,5 +1,5 @@
 param(
-    [string]$OutputDirectory = "artifacts\conversation-studio"
+    [string]$OutputDirectory = "artifacts\lab-chat"
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,24 +37,23 @@ $server = Start-Process -FilePath $node `
     -PassThru
 
 $fixtures = @(
-    @{ File = "widget-short-560x360.png"; Query = "view=widget&fixture=short-exchange"; Width = 560; Height = 360 },
-    @{ File = "widget-maximum-560x360.png"; Query = "view=widget&fixture=maximum-exchange"; Width = 560; Height = 360 },
-    @{ File = "widget-compact-320x180.png"; Query = "view=widget&fixture=short-exchange"; Width = 320; Height = 180 },
-    @{ File = "widget-reversed-560x360.png"; Query = "view=widget&fixture=reversed-route"; Width = 560; Height = 360 },
-    @{ File = "widget-unknown-560x360.png"; Query = "view=widget&fixture=unknown-agent"; Width = 560; Height = 360 },
-    @{ File = "widget-pending-560x360.png"; Query = "view=widget&fixture=pending"; Width = 560; Height = 360 },
-    @{ File = "widget-error-560x360.png"; Query = "view=widget&fixture=error"; Width = 560; Height = 360 },
-    @{ File = "widget-idle-560x360.png"; Query = "view=widget&fixture=idle"; Width = 560; Height = 360 },
-    @{ File = "widget-missing-image-560x360.png"; Query = "view=widget&fixture=missing-image"; Width = 560; Height = 360 },
-    @{ File = "surface-live-314x348.png"; Query = "view=widget-surface&fixture=live&fixture-width=314&fixture-height=348"; Width = 314; Height = 348 },
-    @{ File = "surface-historical-314x348.png"; Query = "view=widget-surface&fixture=historical&fixture-width=314&fixture-height=348"; Width = 314; Height = 348 },
-    @{ File = "surface-pending-314x348.png"; Query = "view=widget-surface&fixture=pending&fixture-width=314&fixture-height=348"; Width = 314; Height = 348 },
-    @{ File = "surface-error-314x348.png"; Query = "view=widget-surface&fixture=error&fixture-width=314&fixture-height=348"; Width = 314; Height = 348 },
-    @{ File = "surface-empty-314x348.png"; Query = "view=widget-surface&fixture=empty&fixture-width=314&fixture-height=348"; Width = 314; Height = 348 },
-    @{ File = "surface-missing-314x348.png"; Query = "view=widget-surface&fixture=missing-selection&fixture-width=314&fixture-height=348"; Width = 314; Height = 348 },
-    @{ File = "surface-minimum-320x180.png"; Query = "view=widget-surface&fixture=live&fixture-width=320&fixture-height=180"; Width = 320; Height = 180 },
-    @{ File = "surface-text-scale-200-314x348.png"; Query = "view=widget-surface&fixture=live&text-scale=2&fixture-width=314&fixture-height=348"; Width = 314; Height = 348 },
-    @{ File = "surface-passive-fallback-314x348.png"; Query = "view=widget-surface&fixture=passive-fallback&fixture-width=314&fixture-height=348"; Width = 314; Height = 348 },
+    @{ File = "underlay-live-720x560.png"; Query = "view=widget&fixture=live"; Width = 720; Height = 560 },
+    @{ File = "underlay-minimum-480x420.png"; Query = "view=widget&fixture=live"; Width = 480; Height = 420 },
+    @{ File = "underlay-large-960x720.png"; Query = "view=widget&fixture=live"; Width = 960; Height = 720 },
+    @{ File = "surface-live-720x560.png"; Query = "view=widget-surface&fixture=live"; Width = 720; Height = 560 },
+    @{ File = "surface-paused-unread-720x560.png"; Query = "view=widget-surface&fixture=paused-unread"; Width = 720; Height = 560 },
+    @{ File = "surface-collapsed-720x560.png"; Query = "view=widget-surface&fixture=collapsed"; Width = 720; Height = 560 },
+    @{ File = "surface-expanded-720x560.png"; Query = "view=widget-surface&fixture=expanded"; Width = 720; Height = 560 },
+    @{ File = "surface-pending-720x560.png"; Query = "view=widget-surface&fixture=pending"; Width = 720; Height = 560 },
+    @{ File = "surface-completion-720x560.png"; Query = "view=widget-surface&fixture=completion"; Width = 720; Height = 560 },
+    @{ File = "surface-error-720x560.png"; Query = "view=widget-surface&fixture=error"; Width = 720; Height = 560 },
+    @{ File = "surface-unknown-agent-720x560.png"; Query = "view=widget-surface&fixture=unknown-agent"; Width = 720; Height = 560 },
+    @{ File = "surface-empty-720x560.png"; Query = "view=widget-surface&fixture=empty"; Width = 720; Height = 560 },
+    @{ File = "surface-missing-image-720x560.png"; Query = "view=widget-surface&fixture=missing-image"; Width = 720; Height = 560 },
+    @{ File = "surface-reduced-motion-720x560.png"; Query = "view=widget-surface&fixture=live"; Width = 720; Height = 560; ReducedMotion = $true },
+    @{ File = "surface-text-scale-200-720x560.png"; Query = "view=widget-surface&fixture=live&text-scale=2"; Width = 720; Height = 560 },
+    @{ File = "surface-minimum-480x420.png"; Query = "view=widget-surface&fixture=live"; Width = 480; Height = 420 },
+    @{ File = "surface-large-960x720.png"; Query = "view=widget-surface&fixture=live"; Width = 960; Height = 720 },
     @{ File = "detail-event-1120x760.png"; Query = "view=detail&fixture=short-exchange&tab=event"; Width = 1120; Height = 760 },
     @{ File = "detail-activity-840x560.png"; Query = "view=detail&fixture=short-exchange&tab=activity"; Width = 840; Height = 560 },
     @{ File = "detail-sources-search-1120x760.png"; Query = "view=detail&fixture=search-results&tab=sources"; Width = 1120; Height = 760 },
@@ -91,7 +90,6 @@ try {
             "--disable-background-networking",
             "--disable-component-update",
             "--disable-extensions",
-            "--hide-scrollbars",
             "--no-first-run",
             "--no-proxy-server",
             "--run-all-compositor-stages-before-draw",

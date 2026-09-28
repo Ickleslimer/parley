@@ -26,19 +26,20 @@ export function distanceFromBottom(node: {
   return Number.isFinite(distance) ? distance : 0;
 }
 
-let programmaticScrollDepth = 0;
+const pendingProgrammaticScrolls = new WeakMap<HTMLElement, number>();
 
 export function assignProgrammaticScrollTop(node: HTMLElement, value: number): void {
-  programmaticScrollDepth += 1;
-  try {
-    node.scrollTop = value;
-  } finally {
-    programmaticScrollDepth -= 1;
-  }
+  pendingProgrammaticScrolls.set(node, value);
+  node.scrollTop = value;
 }
 
-function programmaticScrollIsActive(): boolean {
-  return programmaticScrollDepth > 0;
+function consumeProgrammaticScroll(node: HTMLElement): boolean {
+  const expected = pendingProgrammaticScrolls.get(node);
+  if (expected === undefined) {
+    return false;
+  }
+  pendingProgrammaticScrolls.delete(node);
+  return Math.abs(node.scrollTop - expected) <= 1;
 }
 
 export function userScrollShouldPause(input: {
@@ -53,7 +54,6 @@ export function userScrollShouldPause(input: {
   );
 }
 
-type DropEdge = "drop-oldest" | "drop-newest";
 type ScrollHold = "pin" | "pin-if-moved" | "preserve" | "anchor" | "none";
 type AvatarKind = "codex" | "grok" | "neutral" | "none";
 
@@ -159,6 +159,13 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
 
   const loadEarlier = nonActivatingButton("Load earlier messages", LANDMARKS.widgetFeedLoadEarlier, () => {
     afterPointer(() => {
+      if (atHistoryCapacity()) {
+        const target = oldestTranscriptEventKey(state.exchanges);
+        if (target) {
+          void options.api.openWidgetEvent(target);
+        }
+        return;
+      }
       void enqueue(loadEarlierPage);
     });
   });
@@ -220,7 +227,7 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     if (
       !userScrollShouldPause({
         followingLive: state.followingLive,
-        programmatic: programmaticScrollIsActive(),
+        programmatic: consumeProgrammaticScroll(scrollport),
         distanceFromBottomPx: distanceFromBottom(scrollport),
       })
     ) {
@@ -618,9 +625,13 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     setText(jumpButton, jumpText ?? "");
     openButton.disabled = transcriptEventKey(state.exchanges) == null;
     const earlierAnchor = state.nextBeforeExchangeKey ?? state.exchanges[0]?.exchangeKey ?? null;
-    loadEarlier.disabled = loadingEarlier || state.historyChanged || !state.hasEarlier || earlierAnchor == null;
-    const shell = options.parent.closest(".widget-surface-shell");
-    shell?.classList.toggle("is-historical", !following);
+    const historyCapacity = atHistoryCapacity();
+    setText(loadEarlier, historyCapacity ? "Open earlier messages in transcript" : "Load earlier messages");
+    loadEarlier.disabled =
+      loadingEarlier ||
+      state.historyChanged ||
+      !state.hasEarlier ||
+      (historyCapacity ? oldestTranscriptEventKey(state.exchanges) == null : earlierAnchor == null);
     const bannerText = degradedBanner(state.status);
     banner.hidden = bannerText == null;
     setText(banner, bannerText ?? "");
@@ -685,6 +696,7 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
       String(state.unread.length),
       state.historyChanged ? "reset" : "same",
       loadEarlier.disabled ? "earlier-off" : "earlier-on",
+      atHistoryCapacity() ? "earlier-transcript" : "earlier-feed",
       openButton.disabled ? "open-off" : "open-on",
       state.status?.desktopRuntimeState ?? "",
     ].join("\u001f");
@@ -717,18 +729,22 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
       return "invalid";
     }
     const established = state.historyToken !== null;
-    if (established && (page.resetRequired || page.historyToken !== state.historyToken)) {
+    if (established && page.resetRequired) {
       state.historyChanged = true;
       state.followingLive = false;
       return "rejected";
     }
+    if (established && page.historyToken !== state.historyToken) {
+      if (!state.followingLive) {
+        state.historyChanged = true;
+        return "rejected";
+      }
+      return replaceNewest(page) ? "applied" : "invalid";
+    }
     const incoming = dedupeExchanges(clampFeedPage(page.items));
     if (!established) {
       state.historyToken = page.historyToken;
-      state.exchanges = trimExchanges(
-        incoming.map((item) => toExchange(item)),
-        "drop-oldest",
-      );
+      state.exchanges = trimExchanges(incoming.map((item) => toExchange(item)));
       state.hasEarlier = page.hasEarlier === true;
       state.nextBeforeExchangeKey = page.nextBeforeExchangeKey;
       return "applied";
@@ -751,7 +767,7 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     const prefix = overlap < 0 ? [] : state.exchanges.slice(0, overlap);
     const previousByKey = new Map(state.exchanges.map((exchange) => [exchange.exchangeKey, exchange]));
     const tail = incoming.map((item) => toExchange(item, previousByKey.get(item.exchangeKey)));
-    const merged = trimExchanges(prefix.concat(tail), "drop-oldest");
+    const merged = trimExchanges(prefix.concat(tail));
     if (state.followingLive) {
       state.unread = [];
     } else {
@@ -780,11 +796,18 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     const older = dedupeExchanges(clampFeedPage(page.items))
       .filter((item) => !existing.has(item.exchangeKey))
       .map((item) => toExchange(item));
-    state.exchanges = trimExchanges(older.concat(state.exchanges), "drop-newest");
+    const capacity = Math.max(0, FEED_MAX_EXCHANGES - state.exchanges.length);
+    const retainedOlder = older.slice(Math.max(0, older.length - capacity));
+    state.exchanges = retainedOlder.concat(state.exchanges);
     retainVisibleUnread();
-    state.hasEarlier = page.hasEarlier === true;
-    state.nextBeforeExchangeKey = page.nextBeforeExchangeKey;
+    state.followingLive = false;
+    state.hasEarlier = page.hasEarlier === true || retainedOlder.length < older.length;
+    state.nextBeforeExchangeKey = retainedOlder[0]?.exchangeKey ?? page.nextBeforeExchangeKey;
     return "applied";
+  }
+
+  function atHistoryCapacity(): boolean {
+    return state.hasEarlier && state.exchanges.length >= FEED_MAX_EXCHANGES;
   }
 
   function replaceNewest(page: WidgetFeedPage): boolean {
@@ -798,7 +821,6 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     state.unread = [];
     state.exchanges = trimExchanges(
       dedupeExchanges(clampFeedPage(page.items)).map((item) => toExchange(item, previousByKey.get(item.exchangeKey))),
-      "drop-oldest",
     );
     state.hasEarlier = page.hasEarlier === true;
     state.nextBeforeExchangeKey = page.nextBeforeExchangeKey;
@@ -836,7 +858,7 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
 function readCapturePresentation(): "paused-unread" | "expanded" | null {
   const values = [fixtureParam(), document.documentElement.dataset.syntheticFixture ?? ""];
   for (const value of values) {
-    if (value === "paused-unread" || value === "historical") {
+    if (value === "paused-unread") {
       return "paused-unread";
     }
     if (value === "expanded") {
@@ -861,11 +883,11 @@ export function clampFeedPage<T>(items: readonly T[]): T[] {
   return items.slice(items.length - FEED_PAGE_EXCHANGES);
 }
 
-export function trimExchanges<T>(items: readonly T[], edge: DropEdge): T[] {
+export function trimExchanges<T>(items: readonly T[]): T[] {
   if (items.length <= FEED_MAX_EXCHANGES) {
     return [...items];
   }
-  return edge === "drop-oldest" ? items.slice(items.length - FEED_MAX_EXCHANGES) : items.slice(0, FEED_MAX_EXCHANGES);
+  return items.slice(items.length - FEED_MAX_EXCHANGES);
 }
 
 function dedupeExchanges(items: readonly WidgetFeedExchange[]): WidgetFeedExchange[] {
@@ -883,6 +905,11 @@ function dedupeExchanges(items: readonly WidgetFeedExchange[]): WidgetFeedExchan
 
 function isFeedPage(page: WidgetFeedPage | null | undefined): page is WidgetFeedPage {
   return Boolean(page && typeof page.historyToken === "string" && Array.isArray(page.items));
+}
+
+function oldestTranscriptEventKey(exchanges: readonly StoredExchange[]): string | null {
+  const oldest = exchanges[0];
+  return oldest?.request?.eventKey ?? oldest?.completion?.eventKey ?? null;
 }
 
 function toExchange(exchange: WidgetFeedExchange, previous?: StoredExchange): StoredExchange {
