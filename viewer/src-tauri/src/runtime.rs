@@ -42,7 +42,6 @@ pub enum DesktopRuntimeState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DesktopFallbackReason {
-    DevelopmentGateClosed,
     PreferencePassive,
     UnderlayUnavailable,
     SurfaceCreateFailed,
@@ -234,19 +233,14 @@ impl AppState {
         Ok(next)
     }
 
-    pub fn initialize_desktop_mode(&self, mode: DesktopMode, gate_open: bool) {
+    pub fn initialize_desktop_mode(&self, mode: DesktopMode) {
         let mut runtime = self.lock_runtime();
-        match (mode, gate_open) {
-            (DesktopMode::Passive, _) => {
+        match mode {
+            DesktopMode::Passive => {
                 runtime.desktop_runtime_state = DesktopRuntimeState::Passive;
                 runtime.desktop_fallback_reason = Some(DesktopFallbackReason::PreferencePassive);
             }
-            (DesktopMode::Interactive, false) => {
-                runtime.desktop_runtime_state = DesktopRuntimeState::PassiveFallback;
-                runtime.desktop_fallback_reason =
-                    Some(DesktopFallbackReason::DevelopmentGateClosed);
-            }
-            (DesktopMode::Interactive, true) => {
+            DesktopMode::Interactive => {
                 runtime.desktop_runtime_state = DesktopRuntimeState::InteractiveStarting;
                 runtime.desktop_fallback_reason = None;
             }
@@ -467,15 +461,11 @@ impl AppState {
         runtime.surface_corrections_ms.clear();
     }
 
-    pub fn retry_interactive(&self, gate_open: bool) -> Result<(), String> {
+    pub fn retry_interactive(&self) -> Result<(), String> {
         let mode = self.settings().viewer.desktop_mode;
         if mode != DesktopMode::Interactive {
             self.mark_passive_preference();
             return Err("interactive desktop mode is disabled in settings".to_string());
-        }
-        if !gate_open {
-            self.fallback_interactive(DesktopFallbackReason::DevelopmentGateClosed, false);
-            return Err("interactive desktop mode is behind the development gate".to_string());
         }
         let mut runtime = self.lock_runtime();
         runtime.desktop_runtime_state = DesktopRuntimeState::InteractiveStarting;
@@ -812,9 +802,22 @@ mod tests {
     }
 
     #[test]
+    fn interactive_preference_starts_without_an_external_gate() {
+        let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
+
+        state.initialize_desktop_mode(DesktopMode::Interactive);
+
+        assert_eq!(
+            state.runtime_snapshot().desktop_runtime_state,
+            DesktopRuntimeState::InteractiveStarting
+        );
+        assert_eq!(state.runtime_snapshot().desktop_fallback_reason, None);
+    }
+
+    #[test]
     fn runtime_fallback_does_not_rewrite_interactive_preference() {
         let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
-        state.initialize_desktop_mode(DesktopMode::Interactive, true);
+        state.initialize_desktop_mode(DesktopMode::Interactive);
         state.fallback_interactive(DesktopFallbackReason::SurfaceZOrderInvalid, true);
 
         assert_eq!(
@@ -830,7 +833,7 @@ mod tests {
     #[test]
     fn latched_fallback_survives_bounds_refresh_until_explicit_retry() {
         let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
-        state.initialize_desktop_mode(DesktopMode::Interactive, true);
+        state.initialize_desktop_mode(DesktopMode::Interactive);
         state.fallback_interactive(DesktopFallbackReason::SurfaceZOrderInvalid, true);
 
         state.mark_interactive_starting();
@@ -846,7 +849,7 @@ mod tests {
         );
         assert!(state.interactive_snapshot().fallback_latched);
 
-        state.retry_interactive(true).expect("explicit retry");
+        state.retry_interactive().expect("explicit retry");
         let retry = state.runtime_snapshot();
         assert_eq!(
             retry.desktop_runtime_state,

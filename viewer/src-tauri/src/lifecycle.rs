@@ -96,8 +96,8 @@ pub fn setup_app(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let desktop_mode = settings.viewer.desktop_mode;
     app.manage(AppState::new(settings_path, settings));
     let state = app.state::<AppState>();
-    state.initialize_desktop_mode(desktop_mode, interactive_gate_open());
-    if desktop_mode == DesktopMode::Interactive && interactive_gate_open() {
+    state.initialize_desktop_mode(desktop_mode);
+    if desktop_mode == DesktopMode::Interactive {
         if let Err(error) = interactive_surface::ensure_band_helper() {
             state.fallback_interactive(DesktopFallbackReason::SurfaceCreateFailed, true);
             state.set_runtime_error(error);
@@ -381,7 +381,7 @@ pub fn widget_surface_ready<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
 
 pub fn retry_interactive_mode<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state.retry_interactive(interactive_gate_open())?;
+    state.retry_interactive()?;
     if let Err(error) = interactive_surface::ensure_band_helper() {
         state.fallback_interactive(DesktopFallbackReason::SurfaceCreateFailed, true);
         state.set_runtime_error(error.clone());
@@ -403,7 +403,7 @@ pub fn reconcile_interactive_mode<R: Runtime>(app: &AppHandle<R>) -> Result<(), 
             result
         }
         DesktopMode::Interactive => {
-            state.retry_interactive(interactive_gate_open())?;
+            state.retry_interactive()?;
             if let Err(error) = interactive_surface::ensure_band_helper() {
                 state.fallback_interactive(DesktopFallbackReason::SurfaceCreateFailed, true);
                 state.set_runtime_error(error.clone());
@@ -833,14 +833,6 @@ fn drive_interactive<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
         }
         state.mark_surface_destroyed();
         state.mark_passive_preference();
-        return;
-    }
-    if !interactive_gate_open() {
-        if let Err(error) = interactive_surface::destroy_surface(app) {
-            state.set_runtime_error(error);
-        }
-        state.mark_surface_destroyed();
-        state.fallback_interactive(DesktopFallbackReason::DevelopmentGateClosed, false);
         return;
     }
     if runtime.underlay_state != UnderlayState::Attached {
@@ -1485,10 +1477,6 @@ fn env_flag(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-fn interactive_gate_open() -> bool {
-    env_flag("PARLEY_VIEWER_INTERACTIVE_DESKTOP")
 }
 
 fn latched_surface_action(fallback_latched: bool, surface_exists: bool) -> LatchedSurfaceAction {
