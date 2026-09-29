@@ -73,8 +73,10 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 ## Motion
 
 - Motion normally exists only to acknowledge a new request, reply, or error.
-- A single narrow exception permits continuous robot-at-device working motion while that robot is the known target of a pending request.
-- Pending working motion uses only opacity and transforms, starts once for the pending identity, and stops immediately when the request completes or errors.
+- One narrow pending-state exception permits continuous robot-at-device working motion and messenger-style typing dots while Codex or Grok is the known target of an ordinarily logged request.
+- `Codex is typing...` and `Grok is typing...` are presentation metaphors derived only from that exact pending state, not claims about physical keyboard use or peer-activity evidence.
+- Nonstandard pending labels and unknown targets remain exact and unanimated.
+- Pending motion uses only opacity and transforms, starts once for the pending identity, and stops immediately when the request completes or errors.
 - The 500 ms poll never restarts an animation.
 - No other animation is infinite or ambient.
 - `prefers-reduced-motion: reduce` disables all decorative motion.

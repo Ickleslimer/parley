@@ -49,6 +49,8 @@ describe("widget feed", () => {
     expect(surfaceSource.includes("innerHTML")).toBe(false);
     expect(feedSource.includes("codexWorking")).toBe(false);
     expect(feedSource.includes("grokWorking")).toBe(false);
+    expect(feedSource.includes("getPeerActivity")).toBe(false);
+    expect(feedSource.includes("matchMedia")).toBe(false);
     mounted.stop();
   });
 
@@ -434,10 +436,103 @@ describe("widget feed", () => {
 
     const pending = mounted.root.querySelector<HTMLElement>('[data-kind="pending"]');
     expect(pending?.dataset.tail).toBe("toward-grok");
-    expect(pending?.textContent).toContain(PENDING_LABEL);
+    expect(pending?.dataset.typingIndicator).toBe("true");
+    expect(pending?.textContent).toContain("Grok is typing");
+    expect(pending?.textContent).not.toContain(PENDING_LABEL);
+    expect(pending?.querySelector(".widget-feed-body")?.getAttribute("aria-label")).toBe(
+      "Grok is typing\u2026",
+    );
+    const dots = pending?.querySelector<HTMLElement>(".widget-feed-typing-dots");
+    expect(dots?.hidden).toBe(false);
+    expect(dots?.getAttribute("aria-hidden")).toBe("true");
+    expect(dots?.querySelectorAll(".widget-feed-typing-dot")).toHaveLength(3);
+    expect(dots?.textContent).toBe("");
     expect(pending?.querySelector("img")?.getAttribute("src")).toBe(AVATAR_ILLUSTRATIONS.grokWorking.path);
     expect(pending?.querySelector<HTMLElement>(".widget-feed-avatar-slot")?.dataset.working).toBe("true");
     expect(mounted.root.querySelector("img")?.getAttribute("src")).not.toContain("working");
+    mounted.stop();
+  });
+
+  it("uses the typing metaphor only for exact known-target pending states", async () => {
+    const nonstandard = pendingExchange(3, "Waiting for provider evidence", "grok");
+    const mounted = mountFeed({
+      items: [
+        pendingExchange(1, PENDING_LABEL, "  CoDeX  ", "grok"),
+        pendingExchange(2, PENDING_LABEL, "Nova"),
+        nonstandard,
+      ],
+    });
+    await vi.waitFor(() => {
+      expect(mounted.root.querySelectorAll('[data-kind="pending"]')).toHaveLength(3);
+    });
+
+    const codex = mounted.root.querySelector<HTMLElement>(
+      '[data-kind="pending"][data-speaker="codex"]',
+    );
+    expect(codex?.dataset.tail).toBe("toward-codex");
+    expect(codex?.dataset.typingIndicator).toBe("true");
+    expect(codex?.querySelector(".widget-feed-body")?.textContent).toBe("Codex is typing");
+    expect(codex?.querySelector("img")?.getAttribute("src")).toBe(
+      AVATAR_ILLUSTRATIONS.codexWorking.path,
+    );
+
+    const unknown = mounted.root.querySelector<HTMLElement>(
+      '[data-kind="pending"][data-speaker="unknown"]',
+    );
+    expect(unknown?.dataset.typingIndicator).toBe("false");
+    expect(unknown?.querySelector(".widget-feed-body")?.textContent).toBe(PENDING_LABEL);
+    expect(unknown?.querySelector<HTMLElement>(".widget-feed-typing-dots")?.hidden).toBe(true);
+    expect(unknown?.querySelector("img")).toBeNull();
+
+    const exactFallback = [...mounted.root.querySelectorAll<HTMLElement>('[data-kind="pending"]')].find(
+      (candidate) => candidate.querySelector(".widget-feed-body")?.textContent === nonstandard.pendingLabel,
+    );
+    expect(exactFallback?.dataset.speaker).toBe("grok");
+    expect(exactFallback?.dataset.typingIndicator).toBe("false");
+    expect(exactFallback?.querySelector<HTMLElement>(".widget-feed-avatar-slot")?.dataset.working).toBe(
+      "false",
+    );
+    expect(exactFallback?.querySelector("img")?.getAttribute("src")).toBe(
+      AVATAR_ILLUSTRATIONS.grokIdle.path,
+    );
+    expect(exactFallback?.querySelector<HTMLElement>(".widget-feed-typing-dots")?.hidden).toBe(true);
+    mounted.stop();
+  });
+
+  it("keeps typing nodes stable across polls and removes them on completion", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let page = feedPage({ items: [pendingExchange(1, PENDING_LABEL)] });
+    const getWidgetFeed = vi.fn(async () => page);
+    const mounted = mountFeed({ getWidgetFeed });
+    await vi.waitFor(() => {
+      expect(mounted.root.textContent).toContain("Grok is typing");
+    });
+    const pending = mounted.root.querySelector<HTMLElement>('[data-kind="pending"]');
+    const dots = pending?.querySelector(".widget-feed-typing-dots");
+    const avatar = pending?.querySelector("img");
+
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => {
+      expect(getWidgetFeed.mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+    expect(mounted.root.querySelector('[data-kind="pending"] .widget-feed-typing-dots')).toBe(dots);
+    expect(mounted.root.querySelector('[data-kind="pending"] img')).toBe(avatar);
+
+    page = feedPage({
+      items: [
+        {
+          ...pendingExchange(1, PENDING_LABEL),
+          pendingLabel: null,
+          completion: message("completion-1", "response", "grok", "codex", "Finished reply"),
+        },
+      ],
+    });
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => {
+      expect(mounted.root.textContent).toContain("Finished reply");
+    });
+    expect(mounted.root.querySelector('[data-kind="pending"]')).toBeNull();
+    expect(mounted.root.querySelector('[data-typing-indicator="true"]')).toBeNull();
     mounted.stop();
   });
 
@@ -520,7 +615,7 @@ describe("widget feed", () => {
       openWidgetEvent: openPending,
     });
     await vi.waitFor(() => {
-      expect(pending.root.textContent).toContain(PENDING_LABEL);
+      expect(pending.root.textContent).toContain("Grok is typing");
     });
     button(pending.root, LANDMARKS.widgetFeedOpenTranscript).click();
     await vi.waitFor(() => {
@@ -772,12 +867,17 @@ function exchange(
   };
 }
 
-function pendingExchange(index: number, label: string): WidgetFeedExchange {
+function pendingExchange(
+  index: number,
+  label: string,
+  recipient = "grok",
+  speaker = "codex",
+): WidgetFeedExchange {
   return {
     exchangeKey: `exchange-${index}`,
     sessionKey: "session-a",
     timestampMs: index * 1_000,
-    request: message(`request-${index}`, "request", "codex", "grok", `Request ${index}`),
+    request: message(`request-${index}`, "request", speaker, recipient, `Request ${index}`),
     completion: null,
     pendingLabel: label,
   };

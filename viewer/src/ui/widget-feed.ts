@@ -4,7 +4,7 @@ import type { ViewerApi } from "../ipc";
 import { displaySpeaker, normalizeSpeaker, tailForSpeaker, type TailDirection } from "./attribution";
 import { el, setText } from "./dom";
 import { formatTimestamp, idleWidgetLabel } from "./format";
-import { degradedBanner, loadErrorLabel, PARLEY_ERROR_LABEL } from "./labels";
+import { degradedBanner, loadErrorLabel, PARLEY_ERROR_LABEL, PENDING_LABEL } from "./labels";
 import { LANDMARKS } from "./landmarks";
 import { createSingleFlightPoller, WIDGET_POLL_MS } from "./poll";
 import { createWidgetAvatar, type WidgetAvatarAgent } from "./widget-avatar";
@@ -104,6 +104,7 @@ interface RowModel {
   tail: TailDirection;
   avatar: AvatarKind;
   working: boolean;
+  typingIndicator: boolean;
   meta: string;
   body: string;
   note: string | null;
@@ -118,6 +119,7 @@ interface RowHandle {
   name: HTMLParagraphElement;
   meta: HTMLParagraphElement;
   body: HTMLParagraphElement;
+  typingDots: HTMLSpanElement;
   note: HTMLParagraphElement;
   error: HTMLParagraphElement;
   fullButton: HTMLButtonElement;
@@ -539,6 +541,16 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     const name = el("p", { className: "widget-feed-name" });
     const meta = el("p", { className: "widget-feed-meta" });
     const body = el("p", { className: "widget-feed-body" });
+    const typingDots = el("span", {
+      className: "widget-feed-typing-dots",
+      attrs: { "aria-hidden": "true" },
+      children: [
+        el("span", { className: "widget-feed-typing-dot" }),
+        el("span", { className: "widget-feed-typing-dot" }),
+        el("span", { className: "widget-feed-typing-dot" }),
+      ],
+    });
+    typingDots.hidden = true;
     const note = el("p", { className: "widget-feed-note" });
     const error = el("p", { className: "widget-feed-error" });
     const fullButton = nonActivatingButton("Show full message", "", () => {
@@ -562,7 +574,7 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     openMessage.classList.add("widget-feed-target", "widget-feed-open-message");
     const slip = el("div", {
       className: "widget-feed-slip",
-      children: [name, meta, body, note, error, fullButton, openMessage],
+      children: [name, meta, body, typingDots, note, error, fullButton, openMessage],
     });
     root.append(slip);
     return {
@@ -570,6 +582,7 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
       name,
       meta,
       body,
+      typingDots,
       note,
       error,
       fullButton,
@@ -583,6 +596,7 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     handle.root.dataset.speaker = model.speaker;
     handle.root.dataset.tail = model.tail;
     handle.root.dataset.projection = model.projection;
+    handle.root.dataset.typingIndicator = model.typingIndicator ? "true" : "false";
     if (model.eventKey) {
       handle.root.dataset.eventKey = model.eventKey;
     } else {
@@ -593,6 +607,12 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
     setText(handle.meta, model.meta);
     handle.body.hidden = model.projection === "withheld";
     setText(handle.body, model.projection === "withheld" ? "" : model.body);
+    if (model.typingIndicator) {
+      handle.body.setAttribute("aria-label", `${model.body}\u2026`);
+    } else {
+      handle.body.removeAttribute("aria-label");
+    }
+    handle.typingDots.hidden = !model.typingIndicator;
     handle.note.hidden = model.note == null;
     setText(handle.note, model.note ?? "");
     handle.error.hidden = model.error == null;
@@ -1014,6 +1034,7 @@ function messageModel(message: StoredMessage, role: "request" | "completion"): R
       tail: "none",
       avatar: "none",
       working: false,
+      typingIndicator: false,
       meta: `${PARLEY_ERROR_LABEL} \u00b7 ${formatTimestamp(message.timestampMs)}`,
       body: visibleBody(message),
       note: visibleNote(message),
@@ -1033,6 +1054,7 @@ function messageModel(message: StoredMessage, role: "request" | "completion"): R
     tail: tailForSpeaker(message.speaker),
     avatar: known ?? "neutral",
     working: false,
+    typingIndicator: false,
     meta: `${role === "request" ? "Request" : "Completion"} \u00b7 ${formatTimestamp(message.timestampMs)}`,
     body: visibleBody(message),
     note: visibleNote(message),
@@ -1046,6 +1068,8 @@ function messageModel(message: StoredMessage, role: "request" | "completion"): R
 function pendingModel(exchange: StoredExchange): RowModel {
   const recipient = exchange.request?.recipient ?? "";
   const known = normalizeSpeaker(recipient);
+  const typingLabel =
+    known && exchange.pendingLabel === PENDING_LABEL ? `${displaySpeaker(known)} is typing` : null;
   return {
     key: `pending:${exchange.exchangeKey}`,
     eventKey: null,
@@ -1054,9 +1078,10 @@ function pendingModel(exchange: StoredExchange): RowModel {
     displayName: known ? displaySpeaker(recipient) : "Parley",
     tail: known ? tailForSpeaker(recipient) : "none",
     avatar: known ?? "none",
-    working: known != null,
+    working: typingLabel != null,
+    typingIndicator: typingLabel != null,
     meta: "Pending response",
-    body: exchange.pendingLabel ?? "",
+    body: typingLabel ?? exchange.pendingLabel ?? "",
     note: null,
     error: null,
     showFull: false,

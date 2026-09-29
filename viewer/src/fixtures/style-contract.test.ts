@@ -38,12 +38,19 @@ describe("Two Chairs style contract", () => {
     expect(styles).toMatch(/outline:\s*3px\s+solid\s+var\(--focus-on-paper\)/);
   });
 
-  it("removes the old glow language and permits only the pending-avatar loop", () => {
+  it("removes the old glow language and permits only the two pending-state loops", () => {
     expect(styles).not.toContain("#7ee0ff");
     expect(styles).not.toMatch(/radial-gradient\([^)]*(?:cyan|purple|147\s+72\s+255|17\s+211\s+255)/i);
-    expect(styles.match(/animation(?:-iteration-count)?\s*:[^;]*(?:infinite|Infinity)/gi) ?? []).toHaveLength(1);
+    expect(styles.match(/animation(?:-iteration-count)?\s*:[^;]*(?:infinite|Infinity)/gi) ?? []).toHaveLength(2);
     expect(styles).not.toMatch(/text-transform\s*:\s*uppercase/i);
     expect(styles).toContain("@media (prefers-reduced-motion: reduce)");
+    expect(styles).toContain("animation-name: widget-feed-typing-dot");
+    expect(styles).toMatch(
+      /@keyframes widget-feed-typing-dot[\s\S]*?opacity:[^;]+;[\s\S]*?transform:[^;]+;[\s\S]*?opacity:[^;]+;[\s\S]*?transform:[^;]+;/,
+    );
+    expect(styles).toMatch(
+      /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.widget-feed-row\[data-typing-indicator="true"\] \.widget-feed-typing-dot \{[\s\S]*?animation: none;[\s\S]*?transform: none;/,
+    );
   });
 
   it("keeps literal production labels in sentence case", () => {

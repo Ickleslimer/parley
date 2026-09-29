@@ -32,7 +32,7 @@ Apply the product-specific visual contract without changing Parley's data, IPC, 
 - Put exact text on solid paper surfaces.
 - Keep labels in sentence case and use the bundled humanist typeface.
 - Use one central conversation hierarchy rather than repeated dashboard cards.
-- Keep motion finite and event-responsive except for the documented pending-only working-avatar exception. Disable every decorative animation under reduced-motion preference.
+- Keep motion finite and event-responsive except for the documented pending-only working-avatar and typing-indicator exceptions. Disable every decorative animation under reduced-motion preference.
 - Record a purpose for any new visual technique in `viewer/DESIGN.md` or the change description.
 
 ### 3. Prove human use
