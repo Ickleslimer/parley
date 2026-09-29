@@ -141,6 +141,10 @@ struct RuntimeFlags {
     surface_bounds: Option<WidgetSurfaceBoundsReport>,
     surface_ready: bool,
     surface_fallback_latched: bool,
+    surface_startup_deferred: bool,
+    surface_startup_attempts: usize,
+    surface_startup_first_attempt_ms: Option<u64>,
+    surface_startup_last_attempt_ms: Option<u64>,
     surface_corrections_ms: VecDeque<u64>,
     exiting: bool,
     last_error: Option<String>,
@@ -157,6 +161,10 @@ impl Default for RuntimeFlags {
             surface_bounds: None,
             surface_ready: false,
             surface_fallback_latched: false,
+            surface_startup_deferred: false,
+            surface_startup_attempts: 0,
+            surface_startup_first_attempt_ms: None,
+            surface_startup_last_attempt_ms: None,
             surface_corrections_ms: VecDeque::new(),
             exiting: false,
             last_error: None,
@@ -181,6 +189,7 @@ pub struct InteractiveSnapshot {
     pub bounds: Option<WidgetSurfaceBoundsReport>,
     pub surface_ready: bool,
     pub fallback_latched: bool,
+    pub startup_deferred: bool,
     pub state: DesktopRuntimeState,
 }
 
@@ -411,6 +420,7 @@ impl AppState {
             bounds: runtime.surface_bounds,
             surface_ready: runtime.surface_ready,
             fallback_latched: runtime.surface_fallback_latched,
+            startup_deferred: runtime.surface_startup_deferred,
             state: runtime.desktop_runtime_state,
         }
     }
@@ -429,11 +439,14 @@ impl AppState {
         runtime.desktop_runtime_state = DesktopRuntimeState::Interactive;
         runtime.desktop_fallback_reason = None;
         runtime.surface_fallback_latched = false;
+        reset_surface_startup(&mut runtime);
     }
 
     pub fn mark_surface_destroyed(&self) {
         let mut runtime = self.lock_runtime();
         runtime.surface_ready = false;
+        reset_surface_startup(&mut runtime);
+        runtime.surface_corrections_ms.clear();
     }
 
     pub fn mark_surface_hidden(&self) {
@@ -441,6 +454,7 @@ impl AppState {
         runtime.desktop_runtime_state = DesktopRuntimeState::Passive;
         runtime.desktop_fallback_reason = None;
         runtime.surface_ready = false;
+        reset_surface_startup(&mut runtime);
         runtime.surface_corrections_ms.clear();
     }
 
@@ -450,6 +464,7 @@ impl AppState {
         runtime.desktop_fallback_reason = Some(reason);
         runtime.surface_ready = false;
         runtime.surface_fallback_latched |= latch;
+        reset_surface_startup(&mut runtime);
     }
 
     pub fn mark_passive_preference(&self) {
@@ -458,6 +473,7 @@ impl AppState {
         runtime.desktop_fallback_reason = Some(DesktopFallbackReason::PreferencePassive);
         runtime.surface_ready = false;
         runtime.surface_fallback_latched = false;
+        reset_surface_startup(&mut runtime);
         runtime.surface_corrections_ms.clear();
     }
 
@@ -472,8 +488,40 @@ impl AppState {
         runtime.desktop_fallback_reason = None;
         runtime.surface_ready = false;
         runtime.surface_fallback_latched = false;
+        reset_surface_startup(&mut runtime);
         runtime.surface_corrections_ms.clear();
         Ok(())
+    }
+
+    pub fn defer_surface_startup(&self) {
+        self.lock_runtime().surface_startup_deferred = true;
+    }
+
+    pub fn mark_surface_primed(&self) {
+        reset_surface_startup(&mut self.lock_runtime());
+    }
+
+    pub fn surface_startup_attempt_decision(&self, now_ms: u64) -> SurfaceCorrectionDecision {
+        let mut runtime = self.lock_runtime();
+        if runtime
+            .surface_startup_first_attempt_ms
+            .is_some_and(|first| now_ms.saturating_sub(first) >= SURFACE_CORRECTION_WINDOW_MS)
+            || runtime.surface_startup_attempts >= MAX_SURFACE_CORRECTIONS
+        {
+            return SurfaceCorrectionDecision::Exhausted;
+        }
+        if runtime
+            .surface_startup_last_attempt_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) < SURFACE_CORRECTION_RETRY_MS)
+        {
+            return SurfaceCorrectionDecision::Wait;
+        }
+        runtime
+            .surface_startup_first_attempt_ms
+            .get_or_insert(now_ms);
+        runtime.surface_startup_last_attempt_ms = Some(now_ms);
+        runtime.surface_startup_attempts = runtime.surface_startup_attempts.saturating_add(1);
+        SurfaceCorrectionDecision::Attempt
     }
 
     pub fn surface_correction_decision(&self, now_ms: u64) -> SurfaceCorrectionDecision {
@@ -555,6 +603,13 @@ impl AppState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn reset_surface_startup(runtime: &mut RuntimeFlags) {
+    runtime.surface_startup_deferred = false;
+    runtime.surface_startup_attempts = 0;
+    runtime.surface_startup_first_attempt_ms = None;
+    runtime.surface_startup_last_attempt_ms = None;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,6 +852,64 @@ mod tests {
         state.clear_surface_corrections();
         assert_eq!(
             state.surface_correction_decision(SURFACE_CORRECTION_WINDOW_MS + 1),
+            SurfaceCorrectionDecision::Attempt
+        );
+    }
+
+    #[test]
+    fn startup_surface_attempts_exhaust_without_reopening_after_the_window() {
+        let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
+        state.initialize_desktop_mode(DesktopMode::Interactive);
+
+        assert_eq!(
+            state.surface_startup_attempt_decision(0),
+            SurfaceCorrectionDecision::Attempt
+        );
+        assert_eq!(
+            state.surface_startup_attempt_decision(SURFACE_CORRECTION_RETRY_MS - 1),
+            SurfaceCorrectionDecision::Wait
+        );
+        assert_eq!(
+            state.surface_startup_attempt_decision(SURFACE_CORRECTION_RETRY_MS),
+            SurfaceCorrectionDecision::Attempt
+        );
+        assert_eq!(
+            state.surface_startup_attempt_decision(SURFACE_CORRECTION_RETRY_MS * 2),
+            SurfaceCorrectionDecision::Attempt
+        );
+        assert_eq!(
+            state.surface_startup_attempt_decision(SURFACE_CORRECTION_RETRY_MS * 3),
+            SurfaceCorrectionDecision::Exhausted
+        );
+        assert_eq!(
+            state.surface_startup_attempt_decision(SURFACE_CORRECTION_WINDOW_MS + 1),
+            SurfaceCorrectionDecision::Exhausted
+        );
+    }
+
+    #[test]
+    fn startup_surface_state_resets_only_at_a_new_safe_epoch() {
+        let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
+        state.initialize_desktop_mode(DesktopMode::Interactive);
+        assert_eq!(
+            state.surface_startup_attempt_decision(0),
+            SurfaceCorrectionDecision::Attempt
+        );
+        state.defer_surface_startup();
+        assert!(state.interactive_snapshot().startup_deferred);
+
+        state.mark_surface_primed();
+        assert!(!state.interactive_snapshot().startup_deferred);
+        assert_eq!(
+            state.surface_startup_attempt_decision(1),
+            SurfaceCorrectionDecision::Attempt
+        );
+
+        state.defer_surface_startup();
+        state.mark_interactive();
+        assert!(!state.interactive_snapshot().startup_deferred);
+        assert_eq!(
+            state.surface_startup_attempt_decision(2),
             SurfaceCorrectionDecision::Attempt
         );
     }

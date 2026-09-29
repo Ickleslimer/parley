@@ -2,6 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::sync::{Mutex, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,6 +51,7 @@ const MENU_HEALTH_HANDOFF: &str = "peer-health-handoff";
 const MENU_EXIT: &str = "exit";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PEER_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+static INTERACTIVE_DRIVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -826,6 +828,11 @@ fn check_widget_health<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
 }
 
 fn drive_interactive<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
+    let _drive = match INTERACTIVE_DRIVE_LOCK.try_lock() {
+        Ok(lock) => lock,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
     let state = app.state::<AppState>();
     let runtime = state.runtime_snapshot();
     if runtime.exiting || !runtime.widget_requested {
@@ -899,20 +906,50 @@ fn drive_interactive<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
             return;
         }
     };
+    if interactive.state != DesktopRuntimeState::Interactive {
+        state.mark_interactive_starting();
+    }
     if !surface_existed {
         let _ = record_interactive_diagnostic(app, "surface-created", None, None);
-        match interactive_surface::position_and_restack(app, &surface, rect) {
-            Ok(()) => {
-                let _ = record_interactive_diagnostic(app, "surface-primed", None, None);
+        match state.surface_startup_attempt_decision(now_ms) {
+            SurfaceCorrectionDecision::Wait => {
+                state.defer_surface_startup();
+                if let Err(error) = interactive_surface::hide_surface(app) {
+                    fallback_interactive(
+                        app,
+                        DesktopFallbackReason::SurfaceZOrderInvalid,
+                        error,
+                        true,
+                    );
+                }
+                return;
             }
-            Err(error) => {
-                fallback_interactive(app, classify_surface_failure(&error), error, true);
+            SurfaceCorrectionDecision::Attempt => {}
+            SurfaceCorrectionDecision::Exhausted => {
+                fallback_interactive(
+                    app,
+                    DesktopFallbackReason::SurfaceZOrderInvalid,
+                    "widget surface startup placement exceeded its bounded retry window"
+                        .to_string(),
+                    true,
+                );
                 return;
             }
         }
-    }
-    if interactive.state != DesktopRuntimeState::Interactive {
-        state.mark_interactive_starting();
+        match interactive_surface::position_and_restack(app, &surface, rect) {
+            Ok(()) => {
+                state.mark_surface_primed();
+                let _ = record_interactive_diagnostic(app, "surface-primed", None, None);
+            }
+            Err(error) => {
+                if retryable_startup_position_denial(&error) {
+                    defer_startup_position(app, error);
+                } else {
+                    fallback_interactive(app, classify_surface_failure(&error), error, true);
+                }
+                return;
+            }
+        }
     }
 
     let interactive = state.interactive_snapshot();
@@ -929,23 +966,45 @@ fn drive_interactive<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
     }
 
     let correcting = interactive.state == DesktopRuntimeState::Interactive;
-    if correcting {
-        match interactive_surface::verify_surface(app, rect) {
+    let correction = if correcting {
+        let correction = match interactive_surface::verify_surface(app, rect) {
             Ok(()) => {
                 state.clear_surface_corrections();
                 return;
             }
             Err(error) => {
+                let reason = classify_surface_failure(&error);
                 let _ = record_interactive_diagnostic(
                     app,
                     "surface-verification-failed",
-                    Some(classify_surface_failure(&error)),
+                    Some(reason),
                     Some(&error),
                 );
+                (reason, error)
             }
-        }
+        };
         match state.surface_correction_decision(now_ms) {
-            SurfaceCorrectionDecision::Wait => return,
+            SurfaceCorrectionDecision::Wait => {
+                if correction.0 == DesktopFallbackReason::SurfaceZOrderInvalid {
+                    if let Err(error) = interactive_surface::hide_surface(app) {
+                        fallback_interactive(
+                            app,
+                            DesktopFallbackReason::SurfaceZOrderInvalid,
+                            error,
+                            true,
+                        );
+                    } else {
+                        let _ = record_interactive_diagnostic(
+                            app,
+                            "surface-hidden-awaiting-retry",
+                            Some(correction.0),
+                            Some(&correction.1),
+                        );
+                        state.set_runtime_error(correction.1);
+                    }
+                }
+                return;
+            }
             SurfaceCorrectionDecision::Attempt => {}
             SurfaceCorrectionDecision::Exhausted => {
                 fallback_interactive(
@@ -957,38 +1016,105 @@ fn drive_interactive<R: Runtime>(app: &AppHandle<R>, now_ms: u64) {
                 return;
             }
         }
-    }
-
-    let result = if correcting {
-        interactive_surface::restack_surface(app, &surface, rect)
+        Some(correction)
     } else {
-        interactive_surface::position_and_restack(app, &surface, rect)
+        match state.surface_startup_attempt_decision(now_ms) {
+            SurfaceCorrectionDecision::Wait => return,
+            SurfaceCorrectionDecision::Attempt => {}
+            SurfaceCorrectionDecision::Exhausted => {
+                fallback_interactive(
+                    app,
+                    DesktopFallbackReason::SurfaceZOrderInvalid,
+                    "widget surface startup placement exceeded its bounded retry window"
+                        .to_string(),
+                    true,
+                );
+                return;
+            }
+        }
+        None
     };
+
+    let correction_reason = correction.as_ref().map(|(reason, _)| *reason);
+
+    let result =
+        if correcting && correction_reason == Some(DesktopFallbackReason::SurfaceZOrderInvalid) {
+            interactive_surface::recover_surface_z_order(app, &surface, rect)
+                .map(|()| "surface-restacked")
+        } else if correcting {
+            interactive_surface::restack_surface(app, &surface, rect).map(|()| "surface-restacked")
+        } else {
+            interactive_surface::position_and_restack(app, &surface, rect).map(|()| "interactive")
+        };
     match result {
-        Ok(()) => {
-            let became_interactive = !correcting;
+        Ok(success_event) => {
             state.mark_interactive();
             state.clear_surface_corrections();
-            if became_interactive {
-                let _ = record_interactive_diagnostic(app, "interactive", None, None);
-            } else {
-                let _ = record_interactive_diagnostic(app, "surface-restacked", None, None);
-            }
+            let _ = record_interactive_diagnostic(app, success_event, None, None);
         }
         Err(error) => {
             let reason = classify_surface_failure(&error);
-            if correcting && reason == DesktopFallbackReason::SurfaceZOrderInvalid {
-                let _ = record_interactive_diagnostic(
-                    app,
-                    "surface-restack-failed",
-                    Some(reason),
-                    Some(&error),
-                );
-                state.set_runtime_error(error);
+            if failed_correction_requires_hide(correcting, reason) {
+                let event_type =
+                    if correction_reason == Some(DesktopFallbackReason::SurfaceZOrderInvalid) {
+                        "surface-recovery-failed"
+                    } else {
+                        "surface-restack-failed"
+                    };
+                match interactive_surface::hide_surface(app) {
+                    Ok(()) => {
+                        let _ = record_interactive_diagnostic(
+                            app,
+                            event_type,
+                            Some(reason),
+                            Some(&error),
+                        );
+                        state.set_runtime_error(error);
+                    }
+                    Err(hide_error) => fallback_interactive(
+                        app,
+                        DesktopFallbackReason::SurfaceZOrderInvalid,
+                        format!("{error}; {hide_error}"),
+                        true,
+                    ),
+                }
+            } else if !correcting && retryable_startup_position_denial(&error) {
+                defer_startup_position(app, error);
             } else {
                 fallback_interactive(app, reason, error, true);
             }
         }
+    }
+}
+
+fn failed_correction_requires_hide(correcting: bool, reason: DesktopFallbackReason) -> bool {
+    correcting && reason == DesktopFallbackReason::SurfaceZOrderInvalid
+}
+
+fn retryable_startup_position_denial(error: &str) -> bool {
+    let positioning_call = error.starts_with("failed to place desktop-band helper above Explorer:")
+        || error.starts_with("failed to position widget surface:");
+    positioning_call && error.contains("(os error 5)")
+}
+
+fn defer_startup_position<R: Runtime>(app: &AppHandle<R>, error: String) {
+    let state = app.state::<AppState>();
+    state.defer_surface_startup();
+    let _ = record_interactive_diagnostic(
+        app,
+        "surface-startup-position-deferred",
+        Some(DesktopFallbackReason::SurfaceZOrderInvalid),
+        Some(&error),
+    );
+    if let Err(hide_error) = interactive_surface::hide_surface(app) {
+        fallback_interactive(
+            app,
+            DesktopFallbackReason::SurfaceZOrderInvalid,
+            format!("{error}; {hide_error}"),
+            true,
+        );
+    } else {
+        state.set_runtime_error(error);
     }
 }
 
@@ -1541,6 +1667,44 @@ mod tests {
             latched_surface_action(true, false),
             LatchedSurfaceAction::ConfirmDestroyed
         );
+    }
+
+    #[test]
+    fn only_access_denied_from_startup_positioning_is_retryable() {
+        assert!(retryable_startup_position_denial(
+            "failed to place desktop-band helper above Explorer: Access is denied. (os error 5)"
+        ));
+        assert!(retryable_startup_position_denial(
+            "failed to position widget surface: Access is denied. (os error 5)"
+        ));
+        assert!(!retryable_startup_position_denial(
+            "failed to apply widget surface styles: Access is denied. (os error 5)"
+        ));
+        assert!(!retryable_startup_position_denial(
+            "Explorer icon host has no safe preceding z-order anchor"
+        ));
+        assert!(!retryable_startup_position_denial(
+            "failed to position widget surface: The parameter is incorrect. (os error 87)"
+        ));
+        assert!(!retryable_startup_position_denial(
+            "widget surface is not visible"
+        ));
+    }
+
+    #[test]
+    fn every_failed_interactive_z_order_correction_requires_hiding() {
+        assert!(failed_correction_requires_hide(
+            true,
+            DesktopFallbackReason::SurfaceZOrderInvalid
+        ));
+        assert!(!failed_correction_requires_hide(
+            false,
+            DesktopFallbackReason::SurfaceZOrderInvalid
+        ));
+        assert!(!failed_correction_requires_hide(
+            true,
+            DesktopFallbackReason::SurfaceGeometryMismatch
+        ));
     }
 
     #[test]
