@@ -5,7 +5,8 @@ use tauri::{AppHandle, Emitter, Runtime, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::event_engine::{
-    EventContent, ExchangePage, SearchPage, SessionPage, WidgetFeedMessage, WidgetFeedPage,
+    ConversationPage, EventContent, ExchangePage, SearchPage, SessionPage, WidgetFeedMessage,
+    WidgetFeedPage,
 };
 use crate::interactive_surface;
 use crate::lifecycle;
@@ -98,6 +99,20 @@ pub fn list_exchanges(
     limit: usize,
 ) -> ExchangePage {
     state.engine.exchange_page(&session_key, cursor, limit)
+}
+
+#[tauri::command]
+pub fn get_conversation_page(
+    state: State<'_, AppState>,
+    before_exchange_key: Option<String>,
+    around_exchange_key: Option<String>,
+    limit: usize,
+) -> ConversationPage {
+    state.engine.conversation_page(
+        before_exchange_key.as_deref(),
+        around_exchange_key.as_deref(),
+        limit,
+    )
 }
 
 #[tauri::command]

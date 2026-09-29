@@ -110,6 +110,17 @@ export interface ExchangePage {
   total: number;
 }
 
+export interface ConversationPage {
+  historyToken: string;
+  items: ExchangeSummary[];
+  nextBeforeExchangeKey: string | null;
+  hasEarlier: boolean;
+  hasNewer: boolean;
+  totalExchanges: number;
+  anchorExchangeKey: string | null;
+  resetRequired: boolean;
+}
+
 export interface SearchHit {
   eventKey: string;
   exchangeKey: string;

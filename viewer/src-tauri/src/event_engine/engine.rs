@@ -10,9 +10,9 @@ use super::source::{
 };
 use super::store::{page, Store};
 use super::types::{
-    Diagnostics, EngineStatus, EventContent, ExchangePage, IdMatch, SearchHit, SearchPage,
-    SessionPage, SessionSummary, SourceState, SourceStatus, WidgetFeedMessage, WidgetFeedPage,
-    WIDGET_FEED_PAGE_SIZE,
+    clamp_page_limit, ConversationPage, Diagnostics, EngineStatus, EventContent, ExchangePage,
+    IdMatch, SearchHit, SearchPage, SessionPage, SessionSummary, SourceState, SourceStatus,
+    WidgetFeedMessage, WidgetFeedPage, WIDGET_FEED_PAGE_SIZE,
 };
 
 #[derive(Debug)]
@@ -135,6 +135,16 @@ impl EventEngine {
         limit: usize,
     ) -> ExchangePage {
         self.lock().exchange_page(session_key, cursor, limit)
+    }
+
+    pub fn conversation_page(
+        &self,
+        before_exchange_key: Option<&str>,
+        around_exchange_key: Option<&str>,
+        limit: usize,
+    ) -> ConversationPage {
+        self.lock()
+            .conversation_page(before_exchange_key, around_exchange_key, limit)
     }
 
     pub fn search(&self, query: &str, cursor: Option<u64>, limit: usize) -> SearchPage {
@@ -502,6 +512,74 @@ impl Inner {
         })
     }
 
+    fn conversation_page(
+        &self,
+        before_exchange_key: Option<&str>,
+        around_exchange_key: Option<&str>,
+        limit: usize,
+    ) -> ConversationPage {
+        let history_token = self.widget_history_token();
+        let mut ranked = Vec::new();
+        for (source_order, source) in self.unique_sources_enumerated() {
+            for exchange in source.store.all_exact_exchange_summaries(source.keys()) {
+                ranked.push((
+                    exchange.timestamp_ms,
+                    source_order,
+                    exchange.exchange_key.clone(),
+                    exchange,
+                ));
+            }
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        let total_exchanges = ranked.len() as u64;
+        if before_exchange_key.is_some() && around_exchange_key.is_some() {
+            return reset_conversation_page(history_token, total_exchanges);
+        }
+        let anchor_position = |anchor: &str| {
+            decode_key(anchor, KeyKind::Exchange)?;
+            ranked.iter().position(|item| item.2 == anchor)
+        };
+        let (start, anchor_exchange_key) = if let Some(anchor) = around_exchange_key {
+            let Some(position) = anchor_position(anchor) else {
+                return reset_conversation_page(history_token, total_exchanges);
+            };
+            (position, Some(anchor.to_string()))
+        } else if let Some(anchor) = before_exchange_key {
+            let Some(position) = anchor_position(anchor) else {
+                return reset_conversation_page(history_token, total_exchanges);
+            };
+            (position + 1, None)
+        } else {
+            (0, None)
+        };
+        let end = (start + clamp_page_limit(limit)).min(ranked.len());
+        let items = ranked[start..end]
+            .iter()
+            .map(|item| item.3.clone())
+            .collect::<Vec<_>>();
+        let has_earlier = end < ranked.len();
+        let has_newer = start > 0;
+        let next_before_exchange_key = has_earlier
+            .then(|| items.last().map(|item| item.exchange_key.clone()))
+            .flatten();
+        ConversationPage {
+            history_token,
+            items,
+            next_before_exchange_key,
+            has_earlier,
+            has_newer,
+            total_exchanges,
+            anchor_exchange_key,
+            reset_required: false,
+        }
+    }
+
     fn search(&self, query: &str, cursor: Option<u64>, limit: usize) -> SearchPage {
         let query = query.trim();
         if query.is_empty() {
@@ -851,6 +929,19 @@ fn empty_exchange_page() -> ExchangePage {
         items: Vec::new(),
         next_cursor: None,
         total: 0,
+    }
+}
+
+fn reset_conversation_page(history_token: String, total_exchanges: u64) -> ConversationPage {
+    ConversationPage {
+        history_token,
+        items: Vec::new(),
+        next_before_exchange_key: None,
+        has_earlier: false,
+        has_newer: false,
+        total_exchanges,
+        anchor_exchange_key: None,
+        reset_required: true,
     }
 }
 

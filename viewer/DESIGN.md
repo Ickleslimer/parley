@@ -56,8 +56,9 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 
 ### Conversation studio
 
-- The session rail establishes scope.
-- The timeline is the primary focal point and presents paired exchanges.
+- The timeline is one continuous reverse-chronological conversation across every configured source and native session, with the newest exchange first while each request remains above its reply.
+- Native session changes create no divider, label, grouping, or accessibility boundary. The conversation itself exposes no session or source identifiers; selected-event and source-management diagnostics retain them where needed.
+- The timeline is the primary focal point and presents paired exchanges with anchored `Load earlier messages` and `Jump to latest` controls.
 - The inspector explains selected evidence through Event, Activity, Sources, and Settings tabs.
 - Exit and degraded-state notices remain outside tabs.
 - At the content-driven compact breakpoint, the inspector stacks beneath the timeline without removing controls.
@@ -89,7 +90,7 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 - Controls, component boundaries, and focus indicators must meet 3:1 against adjacent colors.
 - Interactive targets are at least 44 by 44 CSS pixels unless the target-size exception genuinely applies.
 - Every control is reachable and operable by keyboard.
-- Focus is restored by stable session, event, or tab identity after polling. It is never moved away from an active input or exact-body region.
+- Focus is restored by stable event or tab identity after polling. It is never moved away from an active input or exact-body region.
 - Text remains usable at 200 percent scaling.
 - Production content is escaped text. Event content never enters `innerHTML`.
 

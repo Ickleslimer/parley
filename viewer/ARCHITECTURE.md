@@ -19,6 +19,7 @@ The event engine below `src-tauri/src/event_engine/` exposes one thread-safe `Ev
 - Replacement, truncation, disappearance, and reappearance rebuild only the affected source generation.
 - Request/completion pairing and event-ID deduplication never cross source-generation boundaries.
 - Session, exchange, search, and widget results sort by timestamp, then configured-source order, then opaque key.
+- The detail transcript projects all exchanges into one global reverse-chronological sequence. The newest exchange appears first while request-before-completion order is retained within each exchange. Session and source changes never create presentation boundaries or appear in timeline/search rows; selected-event and source-management diagnostics retain their identifiers where needed.
 
 All retrieval uses source- and generation-qualified opaque keys. Event, exchange, and session keys are also type-qualified, so one key cannot be substituted for another even when raw IDs collide. Raw IDs remain display and peer-health matching fields only. A raw health event, exchange, or session ID that resolves in more than one source fails closed; when multiple identifiers are present, they must resolve to the same response.
 
@@ -68,8 +69,9 @@ Detail and legacy widget excerpts remain bounded to 420 Unicode scalar values an
 
 - `getStatus` drives underlay lifecycle and geometry refresh. The underlay never requests transcript data.
 - `getWidgetFeed` returns fixed 20-exchange pages and an opaque history token; `getWidgetMessage` returns one complete projected body by opaque event key; `openWidgetEvent` opens that exact raw event in detail. The surface owns Live latching, viewport retention, and its bounded 200-exchange cache.
+- `getConversationPage` returns exact 420-scalar detail excerpts in global newest-to-oldest exchange order. It supports opaque `before` history anchors for appending older exchanges and an opaque `around` anchor that places its target first with older context beneath it; stale, missing, mixed, or wrong-kind anchors fail closed with `resetRequired`.
 - `reportWidgetSurfaceBounds` accepts only validated underlay geometry; `widgetSurfaceReady` accepts readiness only from the surface; `widgetSurfacePointerDown` lets only the surface synchronously restore and verify its desktop-band position before a mouse action; `retryInteractiveMode` explicitly clears only the runtime fallback latch.
-- `listSessions`, `listExchanges`, `search`, and `getEventContent` use opaque keys for paging, search, and exact retrieval.
+- `listSessions` and `listExchanges` remain compatibility commands, while the detail window uses `getConversationPage`; `search` and `getEventContent` retain global search and exact raw retrieval.
 - `getSettings`, `saveSettings`, and `listMonitors` drive source ordering and geometry settings.
 - `getPeerActivity` returns the newest bounded handoff records, sanitized activity metadata, visible-output excerpts, and exact reports only after their stored fingerprints verify.
 - `selectEventLog`, `setEventLogs`, `addEventLog`, and `removeEventLog` manage sources through Rust only.

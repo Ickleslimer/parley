@@ -195,6 +195,285 @@ fn widget_feed_pages_oldest_to_newest_with_stable_opaque_anchors() {
 }
 
 #[test]
+fn conversation_page_merges_sessions_and_sources_newest_first() {
+    let first = TempLog::new("conversation-source-a");
+    let second = TempLog::new("conversation-source-b");
+    write_lines(
+        &first,
+        &[
+            event_line(
+                "request",
+                "a-old",
+                "exchange-a-old",
+                Some("session-a-one"),
+                Some("a old"),
+                1,
+            ),
+            event_line(
+                "request",
+                "a-tie-z",
+                "exchange-z",
+                Some("session-a-two"),
+                Some("a tie z"),
+                3,
+            ),
+            event_line(
+                "request",
+                "a-tie-a",
+                "exchange-a",
+                Some("session-a-three"),
+                Some("a tie a"),
+                3,
+            ),
+        ],
+    );
+    write_lines(
+        &second,
+        &[
+            event_line(
+                "request",
+                "b-mid",
+                "exchange-b-mid",
+                Some("session-b-one"),
+                Some("b mid"),
+                2,
+            ),
+            event_line(
+                "request",
+                "b-collision",
+                "exchange-a",
+                Some("session-b-two"),
+                Some("b tie"),
+                3,
+            ),
+        ],
+    );
+    let engine = EventEngine::new();
+    engine
+        .set_sources(vec![
+            first.path().to_path_buf(),
+            second.path().to_path_buf(),
+        ])
+        .unwrap();
+    engine.poll();
+
+    let page = engine.conversation_page(None, None, 20);
+    let excerpts = page
+        .items
+        .iter()
+        .map(|exchange| exchange.request.as_ref().unwrap().excerpt.as_str())
+        .collect::<Vec<_>>();
+    assert!(excerpts[0..2]
+        .iter()
+        .all(|excerpt| excerpt.starts_with("a tie")));
+    assert_eq!(excerpts[2], "b tie");
+    assert_eq!(excerpts[3..5], ["b mid", "a old"]);
+    assert_eq!(page.items.len(), 5);
+    assert!(page.items[0].exchange_key < page.items[1].exchange_key);
+    assert_ne!(page.items[0].exchange_key, page.items[2].exchange_key);
+    assert!(!page.has_earlier);
+    assert!(!page.has_newer);
+    assert!(!page.reset_required);
+}
+
+#[test]
+fn conversation_before_anchor_stays_stable_after_newer_append() {
+    let log = TempLog::new("conversation-before-stable");
+    let lines = (0..12)
+        .map(|index| {
+            event_line(
+                "request",
+                &format!("request-{index:02}"),
+                &format!("exchange-{index:02}"),
+                Some(&format!("session-{}", index / 3)),
+                Some(&format!("message {index:02}")),
+                index,
+            )
+        })
+        .collect::<Vec<_>>();
+    write_lines(&log, &lines);
+    let engine = watching_engine(&log);
+    let newest = engine.conversation_page(None, None, 5);
+    let anchor = newest.items.last().unwrap().exchange_key.clone();
+    assert_eq!(
+        newest.next_before_exchange_key,
+        Some(anchor.clone()),
+        "the history cursor is the oldest exchange on a newest-first page"
+    );
+    let before = engine.conversation_page(Some(&anchor), None, 3);
+    let before_keys = before
+        .items
+        .iter()
+        .map(|item| item.exchange_key.clone())
+        .collect::<Vec<_>>();
+
+    log.append(
+        format!(
+            "{}\n",
+            event_line(
+                "request",
+                "request-latest",
+                "exchange-latest",
+                Some("session-latest"),
+                Some("latest"),
+                100,
+            )
+        )
+        .as_bytes(),
+    );
+    assert!(engine.poll());
+    let after = engine.conversation_page(Some(&anchor), None, 3);
+    assert_eq!(after.history_token, before.history_token);
+    assert_eq!(
+        after
+            .items
+            .iter()
+            .map(|item| item.exchange_key.clone())
+            .collect::<Vec<_>>(),
+        before_keys
+    );
+    assert!(after.has_newer);
+}
+
+#[test]
+fn conversation_around_returns_old_exchange_from_non_latest_session() {
+    let log = TempLog::new("conversation-around");
+    let lines = (0..15)
+        .map(|index| {
+            event_line(
+                "request",
+                &format!("request-{index:02}"),
+                &format!("exchange-{index:02}"),
+                Some(if index < 5 {
+                    "session-old"
+                } else {
+                    "session-new"
+                }),
+                Some(&format!("message {index:02}")),
+                index,
+            )
+        })
+        .collect::<Vec<_>>();
+    write_lines(&log, &lines);
+    let engine = watching_engine(&log);
+    let old_session = engine.session_page(None, 10).items.pop().unwrap();
+    let old_exchange = engine
+        .exchange_page(&old_session.session_key, None, 10)
+        .items
+        .into_iter()
+        .find(|exchange| exchange.request.as_ref().unwrap().excerpt == "message 04")
+        .unwrap();
+
+    let around = engine.conversation_page(None, Some(&old_exchange.exchange_key), 4);
+    assert_eq!(
+        around.anchor_exchange_key,
+        Some(old_exchange.exchange_key.clone())
+    );
+    assert_eq!(
+        around.items.first().unwrap().exchange_key,
+        old_exchange.exchange_key
+    );
+    assert_eq!(around.items.len(), 4);
+    assert!(around.has_earlier);
+    assert!(around.has_newer);
+}
+
+#[test]
+fn conversation_anchors_fail_closed_without_raw_id_recovery() {
+    let log = TempLog::new("conversation-anchor-errors");
+    write_lines(
+        &log,
+        &[event_line(
+            "request",
+            "request-one",
+            "exchange-one",
+            Some("session-one"),
+            Some("one"),
+            1,
+        )],
+    );
+    let engine = watching_engine(&log);
+    let page = engine.conversation_page(None, None, 20);
+    let exchange_key = page.items[0].exchange_key.clone();
+    let event_key = page.items[0].request.as_ref().unwrap().event_key.clone();
+
+    assert!(
+        engine
+            .conversation_page(Some(&exchange_key), Some(&exchange_key), 20)
+            .reset_required
+    );
+    assert!(
+        engine
+            .conversation_page(Some("not-an-opaque-key"), None, 20)
+            .reset_required
+    );
+    assert!(
+        engine
+            .conversation_page(Some(&event_key), None, 20)
+            .reset_required
+    );
+
+    let foreign = TempLog::new("conversation-foreign-anchor");
+    write_lines(
+        &foreign,
+        &[event_line(
+            "request",
+            "foreign-request",
+            "foreign-exchange",
+            Some("foreign-session"),
+            Some("foreign"),
+            1,
+        )],
+    );
+    let foreign_engine = watching_engine(&foreign);
+    let foreign_key = foreign_engine.conversation_page(None, None, 20).items[0]
+        .exchange_key
+        .clone();
+    assert!(
+        engine
+            .conversation_page(None, Some(&foreign_key), 20)
+            .reset_required
+    );
+}
+
+#[test]
+fn conversation_anchor_fails_closed_after_source_replacement() {
+    let log = TempLog::new("conversation-replacement");
+    write_lines(
+        &log,
+        &[event_line(
+            "request",
+            "request-old",
+            "exchange-old",
+            Some("session-old"),
+            Some("old"),
+            1,
+        )],
+    );
+    let engine = watching_engine(&log);
+    let first = engine.conversation_page(None, None, 20);
+    let stale_anchor = first.items[0].exchange_key.clone();
+
+    fs::remove_file(log.path()).unwrap();
+    write_lines(
+        &log,
+        &[event_line(
+            "request",
+            "request-new",
+            "exchange-new",
+            Some("session-new"),
+            Some("new"),
+            2,
+        )],
+    );
+    assert!(engine.poll());
+    let reset = engine.conversation_page(Some(&stale_anchor), None, 20);
+    assert!(reset.reset_required);
+    assert!(reset.items.is_empty());
+    assert_ne!(reset.history_token, first.history_token);
+}
+
+#[test]
 fn widget_feed_projects_matching_requests_and_bounds_unicode_scalars() {
     let log = TempLog::new("widget-feed-projection");
     let exact = "\u{1f9ec}".repeat(4_001);

@@ -195,6 +195,18 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
       total: exchanges.length ? 1 : 0,
     }),
     listExchanges: async () => ({ items: exchanges, nextCursor: null, total: exchanges.length }),
+    getConversationPage: async (_beforeExchangeKey, aroundExchangeKey) => ({
+      historyToken: "synthetic-conversation-v1",
+      items: aroundExchangeKey
+        ? exchanges.filter((item) => item.exchangeKey === aroundExchangeKey)
+        : exchanges,
+      nextBeforeExchangeKey: null,
+      hasEarlier: false,
+      hasNewer: false,
+      totalExchanges: exchanges.length,
+      anchorExchangeKey: aroundExchangeKey,
+      resetRequired: false,
+    }),
     search: async () => ({ items: searchHits, nextCursor: null, total: searchHits.length }),
     getEventContent: async (eventKey) => events.get(eventKey) ?? null,
     getPeerHealth: async () => peerHealth,

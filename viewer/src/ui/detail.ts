@@ -6,7 +6,6 @@ import type {
   PeerActivitySnapshot,
   PeerHealthSnapshot,
   SearchHit,
-  SessionSummary,
   SourceStatus,
   ViewerSettings,
   ViewerStatus,
@@ -38,14 +37,9 @@ import { degradedBanner, loadErrorLabel } from "./labels";
 import { LANDMARKS } from "./landmarks";
 import {
   applyPageResult,
-  canGoNext,
-  canGoPrevious,
   dataRefreshPlan,
-  pageRangeLabel,
   requestNextPage,
   requestPreviousPage,
-  resetPaging,
-  type PagingState,
 } from "./paging";
 import {
   applyOpenHandoff,
@@ -70,13 +64,7 @@ import {
   type SearchViewState,
 } from "./search";
 import { isFocusLocked } from "./timeline";
-import {
-  buildSessionRail,
-  buildTimeline,
-  paintExchangeTimeline,
-  paintSearchTimeline,
-  paintSessionRail,
-} from "./timeline";
+import { buildTimeline, paintExchangeTimeline, paintSearchTimeline } from "./timeline";
 
 const CORNERS: Array<ViewerSettings["corner"]> = [
   "top-left",
@@ -84,16 +72,20 @@ const CORNERS: Array<ViewerSettings["corner"]> = [
   "bottom-left",
   "bottom-right",
 ];
+const CONVERSATION_PAGE_LIMIT = 50;
 
 interface DetailState {
   status: ViewerStatus | null;
   settings: ViewerSettings;
   monitors: MonitorInfo[];
-  sessions: SessionSummary[];
-  sessionPaging: PagingState;
-  selectedSessionKey: string | null;
   exchanges: ExchangeSummary[];
-  exchangePaging: PagingState;
+  conversationHistoryToken: string | null;
+  conversationBeforeExchangeKey: string | null;
+  conversationHasEarlier: boolean;
+  conversationHasNewer: boolean;
+  conversationTotal: number;
+  conversationLoading: boolean;
+  conversationResetRequired: boolean;
   selectedExchangeKey: string | null;
   selectedEventKey: string | null;
   search: SearchViewState;
@@ -122,7 +114,6 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   root.className = "detail-shell";
   root.removeAttribute("aria-live");
 
-  const sessions = buildSessionRail();
   const timeline = buildTimeline();
   const inspector = buildInspector();
   const desktopMode = el("select", {
@@ -194,7 +185,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       loadError,
       el("div", {
         className: "studio-body",
-        children: [sessions.region, timeline.region, inspector.region],
+        children: [timeline.region, inspector.region],
       }),
     ],
   });
@@ -204,11 +195,14 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     status: null,
     settings: { ...DEFAULT_SETTINGS },
     monitors: [],
-    sessions: [],
-    sessionPaging: resetPaging(),
-    selectedSessionKey: null,
     exchanges: [],
-    exchangePaging: resetPaging(),
+    conversationHistoryToken: null,
+    conversationBeforeExchangeKey: null,
+    conversationHasEarlier: false,
+    conversationHasNewer: false,
+    conversationTotal: 0,
+    conversationLoading: false,
+    conversationResetRequired: false,
     selectedExchangeKey: null,
     selectedEventKey: null,
     search: createSearchState(),
@@ -235,8 +229,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
 
   let alive = true;
   let sourceEpoch = 0;
-  let sessionLoad = 0;
-  let exchangeLoad = 0;
+  let conversationLoad = 0;
   let searchLoad = 0;
   let healthLoad = 0;
   let activityLoad = 0;
@@ -294,30 +287,27 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     }
   };
 
-  const paintSessions = (): void => {
-    setText(sessions.meta, pageRangeLabel(state.sessionPaging));
-    sessions.previous.disabled = !canGoPrevious(state.sessionPaging);
-    sessions.next.disabled = !canGoNext(state.sessionPaging);
-    paintSessionRail(sessions.list, state.sessions, state.selectedSessionKey, (sessionKey) => {
-      void selectSession(sessionKey);
-    });
-  };
-
-  const paintMiddle = (): void => {
+  const paintMiddle = (scroll: "preserve" | "top" = "preserve"): void => {
+    const previousScrollTop = timeline.list.scrollTop;
+    const restoreScroll = (): void => {
+      timeline.list.scrollTop = scroll === "top" ? 0 : previousScrollTop;
+    };
     const searching = isSearchActive(state.search.query);
     setText(timeline.title, searching ? "Search results" : "Conversation");
-    const paging = searching
-      ? searchCanPage(state.search)
-      : {
-          previous: canGoPrevious(state.exchangePaging),
-          next: canGoNext(state.exchangePaging),
-        };
-    timeline.previous.disabled = !paging.previous || state.search.loading;
-    timeline.next.disabled = !paging.next || state.search.loading;
+    const paging = searchCanPage(state.search);
+    setText(timeline.previous, searching ? "Previous" : "Load earlier messages");
     setText(
-      timeline.meta,
-      searching ? searchSummary(state.search) : pageRangeLabel(state.exchangePaging),
+      timeline.next,
+      searching ? "Next" : state.conversationResetRequired ? "Reload latest" : "Jump to latest",
     );
+    timeline.previous.disabled = searching
+      ? !paging.previous || state.search.loading
+      : !state.conversationHasEarlier || state.conversationLoading;
+    timeline.next.disabled = searching
+      ? !paging.next || state.search.loading
+      : (!state.conversationHasNewer && !state.conversationResetRequired) ||
+        state.conversationLoading;
+    setText(timeline.meta, searching ? searchSummary(state.search) : conversationSummary(state));
     if (searching) {
       const showEmpty = state.searchHits.length === 0;
       timeline.empty.hidden = !showEmpty;
@@ -325,18 +315,26 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       paintSearchTimeline(timeline.list, state.searchHits, state.selectedEventKey, (hit) => {
         void selectSearchHit(hit);
       });
+      restoreScroll();
       return;
     }
-    if (!state.selectedSessionKey) {
+    if (state.conversationResetRequired) {
       timeline.empty.hidden = false;
-      setText(timeline.empty, "Select a session to load exchanges");
-      paintExchangeTimeline(timeline.list, [], state.selectedEventKey, () => undefined);
+      setText(timeline.empty, "Conversation history changed. Reload latest to continue safely");
+      paintExchangeTimeline(timeline.list, state.exchanges, state.selectedEventKey, (exchange, eventKey) => {
+        void selectExchangeMessage(exchange, eventKey);
+      });
+      restoreScroll();
       return;
     }
     if (state.exchanges.length === 0) {
       timeline.empty.hidden = false;
-      setText(timeline.empty, "No exchanges in this session");
+      setText(
+        timeline.empty,
+        state.conversationLoading ? "Loading conversation\u2026" : "No exchanges yet",
+      );
       paintExchangeTimeline(timeline.list, [], state.selectedEventKey, () => undefined);
+      restoreScroll();
       return;
     }
     timeline.empty.hidden = true;
@@ -349,6 +347,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
         void selectExchangeMessage(exchange, eventKey);
       },
     );
+    restoreScroll();
   };
 
   const paintPeerHealth = (): void => {
@@ -413,7 +412,6 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     paintChrome();
     paintPeerActivity();
     paintPeerHealth();
-    paintSessions();
     paintMiddle();
     paintEvent();
   };
@@ -438,11 +436,14 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
 
   const resetLists = (): void => {
     sourceEpoch += 1;
-    state.sessions = [];
-    state.sessionPaging = resetPaging();
-    state.selectedSessionKey = null;
     state.exchanges = [];
-    state.exchangePaging = resetPaging();
+    state.conversationHistoryToken = null;
+    state.conversationBeforeExchangeKey = null;
+    state.conversationHasEarlier = false;
+    state.conversationHasNewer = false;
+    state.conversationTotal = 0;
+    state.conversationLoading = false;
+    state.conversationResetRequired = false;
     state.selectedExchangeKey = null;
     state.selectedEventKey = null;
     state.search = createSearchState();
@@ -453,62 +454,69 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     state.eventError = null;
   };
 
-  const loadSessions = async (): Promise<void> => {
-    const token = ++sessionLoad;
+  const loadConversation = async (
+    mode: "latest" | "earlier" | "around" | "refresh",
+    anchorExchangeKey: string | null = null,
+  ): Promise<boolean> => {
+    const token = ++conversationLoad;
     const epoch = sourceEpoch;
-    try {
-      const page = await api.listSessions(state.sessionPaging.cursor, state.sessionPaging.limit);
-      if (!alive || token !== sessionLoad || epoch !== sourceEpoch) {
-        return;
-      }
-      state.sessions = page.items;
-      state.sessionPaging = applyPageResult(state.sessionPaging, {
-        nextCursor: page.nextCursor,
-        total: page.total,
-        itemCount: page.items.length,
-      });
-    } catch {
-      if (!alive || token !== sessionLoad || epoch !== sourceEpoch) {
-        return;
-      }
-      state.loadError = loadErrorLabel("load sessions");
+    const beforeExchangeKey = mode === "earlier" ? state.conversationBeforeExchangeKey : null;
+    const aroundExchangeKey = mode === "around" ? anchorExchangeKey : null;
+    if (mode === "earlier" && !beforeExchangeKey) {
+      return false;
     }
-  };
-
-  const loadExchanges = async (): Promise<void> => {
-    if (!state.selectedSessionKey) {
-      state.exchanges = [];
-      state.exchangePaging = resetPaging();
-      return;
-    }
-    const sessionKey = state.selectedSessionKey;
-    const token = ++exchangeLoad;
-    const epoch = sourceEpoch;
+    state.conversationLoading = true;
+    paintMiddle();
     try {
-      const page = await api.listExchanges(
-        sessionKey,
-        state.exchangePaging.cursor,
-        state.exchangePaging.limit,
+      const page = await api.getConversationPage(
+        beforeExchangeKey,
+        aroundExchangeKey,
+        CONVERSATION_PAGE_LIMIT,
       );
-      if (
-        !alive ||
-        token !== exchangeLoad ||
-        epoch !== sourceEpoch ||
-        state.selectedSessionKey !== sessionKey
-      ) {
-        return;
+      if (!alive || token !== conversationLoad || epoch !== sourceEpoch) {
+        return false;
       }
-      state.exchanges = page.items;
-      state.exchangePaging = applyPageResult(state.exchangePaging, {
-        nextCursor: page.nextCursor,
-        total: page.total,
-        itemCount: page.items.length,
-      });
+      const historyChanged =
+        state.conversationHistoryToken != null &&
+        state.conversationHistoryToken !== page.historyToken;
+      if (page.resetRequired || (historyChanged && mode !== "latest")) {
+        state.conversationResetRequired = true;
+        state.conversationLoading = false;
+        return false;
+      }
+      if (mode === "earlier") {
+        state.exchanges = mergeConversationPages(state.exchanges, page.items, "append").items;
+        state.conversationBeforeExchangeKey = page.nextBeforeExchangeKey;
+        state.conversationHasEarlier = page.hasEarlier;
+      } else if (mode === "refresh" && !historyChanged) {
+        const refreshed = mergeConversationPages(state.exchanges, page.items, "refresh");
+        state.exchanges = refreshed.items;
+        state.conversationBeforeExchangeKey = refreshed.keptEarlier
+          ? state.conversationBeforeExchangeKey
+          : page.nextBeforeExchangeKey;
+        state.conversationHasEarlier = refreshed.keptEarlier
+          ? state.conversationHasEarlier
+          : page.hasEarlier;
+        state.conversationHasNewer = false;
+      } else {
+        state.exchanges = page.items;
+        state.conversationBeforeExchangeKey = page.nextBeforeExchangeKey;
+        state.conversationHasEarlier = page.hasEarlier;
+        state.conversationHasNewer = page.hasNewer;
+      }
+      state.conversationHistoryToken = page.historyToken;
+      state.conversationTotal = page.totalExchanges;
+      state.conversationResetRequired = false;
+      state.conversationLoading = false;
+      state.loadError = null;
+      return true;
     } catch {
-      if (!alive || token !== exchangeLoad || epoch !== sourceEpoch) {
-        return;
+      if (!alive || token !== conversationLoad || epoch !== sourceEpoch) {
+        return false;
       }
-      state.loadError = loadErrorLabel("load exchanges");
+      state.conversationLoading = false;
+      state.loadError = loadErrorLabel("load the conversation");
+      return false;
     }
   };
 
@@ -620,7 +628,6 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     }
     state.event = applied.event;
     state.selectedEventKey = applied.event.eventKey;
-    state.selectedSessionKey = applied.event.sessionKey;
     state.selectedExchangeKey = applied.event.exchangeKey;
     state.eventLoading = false;
     state.eventError = null;
@@ -657,9 +664,11 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       const exchangeVisible = state.exchanges.some(
         (item) => item.exchangeKey === state.selectedExchangeKey,
       );
-      if (state.selectedSessionKey && !exchangeVisible && !isSearchActive(state.search.query)) {
-        state.exchangePaging = resetPaging();
-        await loadExchanges();
+      state.search = createSearchState();
+      state.searchHits = [];
+      timeline.input.value = "";
+      if (state.selectedExchangeKey && !exchangeVisible) {
+        await loadConversation("around", state.selectedExchangeKey);
       }
     } catch {
       if (!alive) {
@@ -738,46 +747,31 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     if (!alive || !content || state.selectedEventKey !== eventKey) {
       return;
     }
-    const needsExchangeLoad =
-      !isSearchActive(state.search.query) &&
-      (state.selectedSessionKey !== content.sessionKey ||
-        !state.exchanges.some((item) => item.exchangeKey === content.exchangeKey));
-    state.selectedSessionKey = content.sessionKey;
+    const needsConversationLoad = !state.exchanges.some(
+      (item) => item.exchangeKey === content.exchangeKey,
+    );
     state.selectedExchangeKey = content.exchangeKey;
-    if (needsExchangeLoad) {
-      state.exchangePaging = resetPaging();
-      await loadExchanges();
+    state.search = createSearchState();
+    state.searchHits = [];
+    timeline.input.value = "";
+    if (needsConversationLoad) {
+      await loadConversation("around", content.exchangeKey);
     }
     if (alive && state.selectedEventKey === eventKey) {
       paint();
     }
   };
 
-  const selectSession = async (sessionKey: string): Promise<void> => {
-    state.selectedSessionKey = sessionKey;
-    state.exchangePaging = resetPaging();
-    state.selectedExchangeKey = null;
-    if (!isSearchActive(state.search.query)) {
-      state.selectedEventKey = null;
-      state.event = null;
-      state.eventError = null;
-    }
-    await loadExchanges();
-    paint();
-  };
-
   const selectExchangeMessage = async (
     exchange: ExchangeSummary,
     eventKey: string,
   ): Promise<void> => {
-    state.selectedSessionKey = exchange.sessionKey;
     state.selectedExchangeKey = exchange.exchangeKey;
     await loadEvent(eventKey);
     paint();
   };
 
   const selectSearchHit = async (hit: SearchHit): Promise<void> => {
-    state.selectedSessionKey = hit.sessionKey;
     state.selectedExchangeKey = hit.exchangeKey;
     await loadEvent(hit.eventKey);
     paint();
@@ -793,10 +787,11 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     const plan = reload === "none" ? dataRefreshPlan(previous, status) : reload;
     if (plan === "reset") {
       resetLists();
-      await loadSessions();
+      await loadConversation("latest");
     } else if (plan === "refresh") {
-      await loadSessions();
-      await loadExchanges();
+      if (!state.conversationHasNewer && !state.conversationResetRequired) {
+        await loadConversation("refresh");
+      }
       if (isSearchActive(state.search.query)) {
         await loadSearch();
       }
@@ -862,7 +857,19 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     state.search = next;
     state.searchHits = [];
     if (!isSearchActive(next.query)) {
-      paintMiddle();
+      const selectedExchangeKey = state.selectedExchangeKey;
+      const selectedVisible = state.exchanges.some(
+        (exchange) => exchange.exchangeKey === selectedExchangeKey,
+      );
+      if (selectedExchangeKey && !selectedVisible) {
+        void loadConversation("around", selectedExchangeKey).then(() => {
+          if (alive) {
+            paintMiddle();
+          }
+        });
+      } else {
+        paintMiddle();
+      }
       return;
     }
     void loadSearch().then(() => {
@@ -872,22 +879,6 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     });
   });
 
-  sessions.previous.addEventListener("click", () => {
-    const next = requestPreviousPage(state.sessionPaging);
-    if (!next) {
-      return;
-    }
-    state.sessionPaging = next;
-    void loadSessions().then(() => alive && paintSessions());
-  });
-  sessions.next.addEventListener("click", () => {
-    const next = requestNextPage(state.sessionPaging);
-    if (!next) {
-      return;
-    }
-    state.sessionPaging = next;
-    void loadSessions().then(() => alive && paintSessions());
-  });
   timeline.previous.addEventListener("click", () => {
     if (isSearchActive(state.search.query)) {
       const next = requestPreviousPage(state.search.paging);
@@ -898,12 +889,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       void loadSearch().then(() => alive && paintMiddle());
       return;
     }
-    const next = requestPreviousPage(state.exchangePaging);
-    if (!next) {
-      return;
-    }
-    state.exchangePaging = next;
-    void loadExchanges().then(() => alive && paintMiddle());
+    void loadConversation("earlier").then(() => alive && paintMiddle());
   });
   timeline.next.addEventListener("click", () => {
     if (isSearchActive(state.search.query)) {
@@ -915,12 +901,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       void loadSearch().then(() => alive && paintMiddle());
       return;
     }
-    const next = requestNextPage(state.exchangePaging);
-    if (!next) {
-      return;
-    }
-    state.exchangePaging = next;
-    void loadExchanges().then(() => alive && paintMiddle());
+    void loadConversation("latest").then(() => alive && paintMiddle("top"));
   });
 
   inspector.selectLog.addEventListener("click", () => {
@@ -1217,6 +1198,52 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   };
   window.addEventListener("pagehide", stop);
   return { stop };
+}
+
+function conversationSummary(state: DetailState): string {
+  if (state.conversationLoading && state.exchanges.length === 0) {
+    return "Loading conversation\u2026";
+  }
+  if (state.conversationTotal === 0) {
+    return "No exchanges";
+  }
+  const view = state.conversationHasNewer ? "Historical view" : "Latest messages";
+  return `${view} \u00b7 ${state.exchanges.length} of ${state.conversationTotal} exchanges`;
+}
+
+function mergeConversationPages(
+  current: readonly ExchangeSummary[],
+  incoming: readonly ExchangeSummary[],
+  mode: "append" | "refresh",
+): { items: ExchangeSummary[]; keptEarlier: boolean } {
+  if (mode === "append") {
+    return { items: uniqueExchanges([...current, ...incoming]), keptEarlier: true };
+  }
+  if (incoming.length === 0) {
+    return { items: [], keptEarlier: false };
+  }
+  const incomingKeys = new Set(incoming.map((exchange) => exchange.exchangeKey));
+  const hasOverlap = current.some((exchange) => incomingKeys.has(exchange.exchangeKey));
+  if (!hasOverlap) {
+    return { items: [...incoming], keptEarlier: false };
+  }
+  const keptEarlier = current.some((exchange) => !incomingKeys.has(exchange.exchangeKey));
+  return {
+    items: uniqueExchanges([...incoming, ...current]),
+    keptEarlier,
+  };
+}
+
+function uniqueExchanges(exchanges: readonly ExchangeSummary[]): ExchangeSummary[] {
+  const seen = new Set<string>();
+  const unique: ExchangeSummary[] = [];
+  for (const exchange of exchanges) {
+    if (!seen.has(exchange.exchangeKey)) {
+      seen.add(exchange.exchangeKey);
+      unique.push(exchange);
+    }
+  }
+  return unique;
 }
 
 function fillMonitorOptions(

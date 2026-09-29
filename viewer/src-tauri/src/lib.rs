@@ -31,6 +31,7 @@ pub fn run() {
             commands::open_widget_event,
             commands::list_sessions,
             commands::list_exchanges,
+            commands::get_conversation_page,
             commands::search_events,
             commands::get_event_content,
             commands::get_peer_health,

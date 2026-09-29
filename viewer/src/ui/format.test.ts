@@ -93,7 +93,8 @@ describe("formatting", () => {
   it("formats aggregate source counts and runtime health", () => {
     const watching = status();
     expect(formatSourceLine(watching)).toContain("1 source");
-    expect(formatSourceLine(watching)).toContain("2 sessions");
+    expect(formatSourceLine(watching)).not.toContain("sessions");
+    expect(formatSourceLine(watching)).toContain("5 exchanges");
     expect(formatRuntimeHealth(watching)).toBe(
       "Tray available. Underlay attached; Widget visible",
     );

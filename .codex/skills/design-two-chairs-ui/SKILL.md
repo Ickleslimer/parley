@@ -39,7 +39,7 @@ Apply the product-specific visual contract without changing Parley's data, IPC, 
 
 - Run deterministic contrast checks for every shipped text, boundary, and focus pairing.
 - Keep all ordinary interactive targets at least 44 by 44 CSS pixels.
-- Verify keyboard operation, visible focus, manual tabs, listbox semantics, and roving timeline focus.
+- Verify keyboard operation, visible focus, manual tabs, search-listbox semantics, and roving focus across the continuous timeline.
 - Verify focus and selection survive polling by stable keys.
 - Verify empty, loading, pending, error, unknown-agent, degraded, and missing-art states.
 - Verify the 480 by 420 minimum widget, the 720 by 560 default, the 960 by 720 large state, and the 840 px detail width without horizontal overflow.

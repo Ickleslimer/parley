@@ -175,6 +175,19 @@ pub struct ExchangePage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConversationPage {
+    pub history_token: String,
+    pub items: Vec<ExchangeSummary>,
+    pub next_before_exchange_key: Option<String>,
+    pub has_earlier: bool,
+    pub has_newer: bool,
+    pub total_exchanges: u64,
+    pub anchor_exchange_key: Option<String>,
+    pub reset_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchHit {
     pub event_key: String,
     pub exchange_key: String,

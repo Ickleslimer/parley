@@ -99,7 +99,7 @@ export function formatDiagnostics(diagnostics: Diagnostics): string {
 export function formatSourceLine(status: ViewerStatus): string {
   const base = formatSourceState(status.sourceState);
   const sources = `. ${formatCount(status.sources.length, "source")}`;
-  const counts = `; ${formatCount(status.sessionCount, "session")}; ${formatCount(status.exchangeCount, "exchange")}`;
+  const counts = `; ${formatCount(status.exchangeCount, "exchange")}`;
   return `${base}${sources}${counts}`;
 }
 

@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import type { ExchangeSummary, MessagePreview, SearchHit, SessionSummary } from "../contracts";
+import type { ExchangeSummary, MessagePreview, SearchHit } from "../contracts";
 
 import {
   exchangeStops,
@@ -11,7 +11,6 @@ import {
   moveTimelineStop,
   paintExchangeTimeline,
   paintSearchTimeline,
-  paintSessionRail,
 } from "./timeline";
 
 const HOSTILE = "<img src=x onerror=alert(1)>";
@@ -151,44 +150,9 @@ describe("timeline rendering", () => {
     expect(document.activeElement).toBe(input);
   });
 
-  it("moves session and search options with the keyboard and preserves exact hit text", () => {
-    const sessions = document.createElement("ul");
+  it("moves search options with the keyboard without exposing session diagnostics", () => {
     const results = document.createElement("div");
-    document.body.append(sessions, results);
-    const sessionRows: SessionSummary[] = [
-      {
-        sessionKey: "session:1",
-        sessionId: "one",
-        sourcePath: "synthetic://one",
-        exchangeCount: 1,
-        latestTimestampMs: 1,
-        latestSource: "codex",
-        latestTarget: "grok",
-        latestExcerpt: HOSTILE,
-        excerptExtracted: false,
-      },
-      {
-        sessionKey: "session:2",
-        sessionId: "two",
-        sourcePath: "synthetic://two",
-        exchangeCount: 1,
-        latestTimestampMs: 2,
-        latestSource: "grok",
-        latestTarget: "codex",
-        latestExcerpt: "Second session",
-        excerptExtracted: false,
-      },
-    ];
-    const selected: string[] = [];
-    paintSessionRail(sessions, sessionRows, null, (key) => selected.push(key));
-    const options = Array.from(sessions.querySelectorAll<HTMLElement>('[role="option"]'));
-    options[0]?.focus();
-    options[0]?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
-    expect(document.activeElement?.getAttribute("data-session-key")).toBe("session:2");
-    expect(options[0]?.getAttribute("aria-selected")).toBe("false");
-    document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    expect(selected).toEqual(["session:2"]);
-    expect(sessions.querySelector("img")).toBeNull();
+    document.body.append(results);
 
     const hits: SearchHit[] = [
       {
@@ -227,6 +191,8 @@ describe("timeline rendering", () => {
     document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true }));
     expect(chosen).toEqual(["event:hit-2"]);
     expect(results.textContent).toContain(HOSTILE);
+    expect(results.textContent).not.toContain("synthetic://one");
+    expect(results.textContent).not.toContain("session:1");
     expect(results.querySelector("img")).toBeNull();
   });
 });

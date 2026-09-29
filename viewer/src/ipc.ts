@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  ConversationPage,
   EventContent,
   ExchangePage,
   HandoffSelection,
@@ -29,6 +30,11 @@ export interface ViewerApi {
   retryInteractiveMode(): Promise<ViewerStatus>;
   listSessions(cursor: number | null, limit: number): Promise<SessionPage>;
   listExchanges(sessionKey: string, cursor: number | null, limit: number): Promise<ExchangePage>;
+  getConversationPage(
+    beforeExchangeKey: string | null,
+    aroundExchangeKey: string | null,
+    limit: number,
+  ): Promise<ConversationPage>;
   search(query: string, cursor: number | null, limit: number): Promise<SearchPage>;
   getEventContent(eventKey: string): Promise<EventContent | null>;
   getPeerHealth(): Promise<PeerHealthSnapshot>;
@@ -69,6 +75,12 @@ export const viewerApi: ViewerApi = {
     invoke<SessionPage>("list_sessions", { cursor, limit }),
   listExchanges: (sessionKey, cursor, limit) =>
     invoke<ExchangePage>("list_exchanges", { sessionKey, cursor, limit }),
+  getConversationPage: (beforeExchangeKey, aroundExchangeKey, limit) =>
+    invoke<ConversationPage>("get_conversation_page", {
+      beforeExchangeKey,
+      aroundExchangeKey,
+      limit,
+    }),
   search: (query, cursor, limit) =>
     invoke<SearchPage>("search_events", { query, cursor, limit }),
   getEventContent: (eventKey) =>

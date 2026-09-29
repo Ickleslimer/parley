@@ -35,7 +35,6 @@ import {
   type PeerHandoffItem,
   type PeerIncident,
   type SearchHit,
-  type SessionSummary,
   type ViewerSettings,
   type ViewerStatus,
 } from "../contracts";
@@ -221,33 +220,6 @@ function activity(): PeerActivitySnapshot {
   };
 }
 
-function sessions(): SessionSummary[] {
-  return [
-    {
-      sessionKey: "session:1",
-      sessionId: "alpha",
-      sourcePath: "synthetic://events.jsonl",
-      exchangeCount: 1,
-      latestTimestampMs: 1_700_000_000_000,
-      latestSource: "codex",
-      latestTarget: "grok",
-      latestExcerpt: HOSTILE,
-      excerptExtracted: false,
-    },
-    {
-      sessionKey: "session:2",
-      sessionId: "beta",
-      sourcePath: "synthetic://events.jsonl",
-      exchangeCount: 1,
-      latestTimestampMs: 1_700_000_100_000,
-      latestSource: "grok",
-      latestTarget: "codex",
-      latestExcerpt: "Second session",
-      excerptExtracted: false,
-    },
-  ];
-}
-
 function content(eventKey: string): EventContent {
   const secondSession = eventKey.includes("session-2");
   return {
@@ -274,7 +246,10 @@ function content(eventKey: string): EventContent {
   };
 }
 
-function createApi(statusOverrides: Partial<ViewerStatus> = {}) {
+function createApi(
+  statusOverrides: Partial<ViewerStatus> = {},
+  options: { pagedConversation?: boolean } = {},
+) {
   const calls = {
     acknowledge: [] as string[],
     mute: [] as boolean[],
@@ -288,9 +263,38 @@ function createApi(statusOverrides: Partial<ViewerStatus> = {}) {
     launchAtLogin: [] as boolean[],
     savedSettings: [] as ViewerSettings[],
     retryInteractive: 0,
+    conversation: [] as Array<{
+      beforeExchangeKey: string | null;
+      aroundExchangeKey: string | null;
+    }>,
   };
   let bytesRead = 100;
   let currentHealth = health(1);
+  const conversation = [
+    exchange({ sessionKey: "session:1" }),
+    exchange({
+      exchangeKey: "exchange:2",
+      sessionKey: "session:2",
+      exchangeId: "exchange-2",
+      sessionId: "beta",
+      timestampMs: 1_700_000_100_000,
+      request: preview({
+        eventKey: "event:session-2-request",
+        eventId: "session-2-request",
+        timestampMs: 1_700_000_100_000,
+        excerpt: "Second-session request",
+      }),
+      completion: preview({
+        eventKey: "event:session-2-completion",
+        eventId: "session-2-completion",
+        eventType: "response",
+        speaker: "grok",
+        recipient: "codex",
+        timestampMs: 1_700_000_100_500,
+        excerpt: "Second-session completion",
+      }),
+    }),
+  ].reverse();
   const api: ViewerApi = {
     getStatus: async () => status({ ...statusOverrides, bytesRead }),
     getWidgetFeed: async () => ({
@@ -316,37 +320,30 @@ function createApi(statusOverrides: Partial<ViewerStatus> = {}) {
         desktopFallbackReason: null,
       });
     },
-    listSessions: async () => ({ items: sessions(), nextCursor: null, total: 2 }),
-    listExchanges: async (sessionKey) => ({
-      items:
-        sessionKey === "session:1"
-          ? [exchange({ sessionKey })]
-          : sessionKey === "session:2"
-            ? [
-                exchange({
-                  exchangeKey: "exchange:2",
-                  sessionKey,
-                  exchangeId: "exchange-2",
-                  sessionId: "beta",
-                  request: preview({
-                    eventKey: "event:session-2-request",
-                    eventId: "session-2-request",
-                    excerpt: "Second-session request",
-                  }),
-                  completion: preview({
-                    eventKey: "event:session-2-completion",
-                    eventId: "session-2-completion",
-                    eventType: "response",
-                    speaker: "grok",
-                    recipient: "codex",
-                    excerpt: "Second-session completion",
-                  }),
-                }),
-              ]
-            : [],
-      nextCursor: null,
-      total: sessionKey === "session:1" || sessionKey === "session:2" ? 1 : 0,
-    }),
+    listSessions: async () => ({ items: [], nextCursor: null, total: 0 }),
+    listExchanges: async () => ({ items: [], nextCursor: null, total: 0 }),
+    getConversationPage: async (beforeExchangeKey, aroundExchangeKey) => {
+      calls.conversation.push({ beforeExchangeKey, aroundExchangeKey });
+      const paged = options.pagedConversation === true;
+      const items = aroundExchangeKey
+        ? conversation.filter((item) => item.exchangeKey === aroundExchangeKey)
+        : beforeExchangeKey === "exchange:2"
+          ? conversation.slice(1)
+          : paged
+            ? conversation.slice(0, 1)
+            : conversation;
+      return {
+        historyToken: "conversation-v1",
+        items,
+        nextBeforeExchangeKey:
+          paged && !aroundExchangeKey && !beforeExchangeKey ? "exchange:2" : null,
+        hasEarlier: paged && !aroundExchangeKey && !beforeExchangeKey,
+        hasNewer: aroundExchangeKey === "exchange:1" || beforeExchangeKey != null,
+        totalExchanges: conversation.length,
+        anchorExchangeKey: aroundExchangeKey,
+        resetRequired: false,
+      };
+    },
     search: async () => ({
       items: [
         hit("event:hit-1"),
@@ -467,7 +464,7 @@ describe("conversation studio detail", () => {
       configurable: true,
       value: {},
     });
-    const harness = createApi();
+    const harness = createApi({}, { pagedConversation: true });
     const root = document.createElement("div");
     document.body.append(root);
     stop = mountDetail(root, harness.api).stop;
@@ -476,27 +473,59 @@ describe("conversation studio detail", () => {
 
     const handler = tauriEvents.handlers.get("widget-open-exchange");
     expect(handler).toBeDefined();
-    handler?.({ payload: { eventKey: "event:session-2-completion" } });
+    handler?.({ payload: { eventKey: "event:request" } });
     await settle();
     await Promise.resolve();
 
-    expect(harness.calls.content.at(-1)).toBe("event:session-2-completion");
-    expect(
-      root.querySelector('[data-session-key="session:2"]')?.getAttribute("aria-selected"),
-    ).toBe("true");
+    expect(harness.calls.content.at(-1)).toBe("event:request");
+    expect(harness.calls.conversation.at(-1)).toEqual({
+      beforeExchangeKey: null,
+      aroundExchangeKey: "exchange:1",
+    });
+    expect(root.querySelector('[aria-label="Sessions"]')).toBeNull();
     expect(
       root
-        .querySelector('[data-event-key="event:session-2-completion"]')
+        .querySelector('[data-event-key="event:request"]')
         ?.getAttribute("aria-pressed"),
     ).toBe("true");
     expect(root.querySelector('[data-region="studio-tab-event"]')?.getAttribute("aria-selected"))
       .toBe("true");
     expect(root.querySelector(".event-body")?.textContent).toContain(
-      "Exact second-session completion body",
+      "Exact request",
     );
   });
 
-  it("keeps hostile session text escaped and moves the session rail by keyboard", async () => {
+  it("appends earlier exchanges without restoring a session boundary or scroll position", async () => {
+    vi.useFakeTimers();
+    const harness = createApi({}, { pagedConversation: true });
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, harness.api).stop;
+    await settle();
+
+    const timeline = root.querySelector<HTMLElement>('[data-region="studio-timeline"]');
+    expect(timeline?.textContent).not.toContain(HOSTILE);
+    const loadEarlier = Array.from(timeline?.querySelectorAll<HTMLButtonElement>("button") ?? []).find(
+      (button) => button.textContent === "Load earlier messages",
+    );
+    expect(loadEarlier?.disabled).toBe(false);
+    const thread = timeline?.querySelector<HTMLElement>('[aria-label="Exchanges"]');
+    expect(thread).not.toBeNull();
+    if (thread) {
+      thread.scrollTop = 73;
+    }
+    loadEarlier?.click();
+    await settle();
+
+    const text = timeline?.textContent ?? "";
+    expect(text).toContain(HOSTILE);
+    expect(text).toContain("Second-session request");
+    expect(text.indexOf("Second-session request")).toBeLessThan(text.indexOf(HOSTILE));
+    expect(thread?.scrollTop).toBe(73);
+    expect(root.querySelector('[aria-label="Sessions"]')).toBeNull();
+  });
+
+  it("renders every session as one escaped newest-first conversation", async () => {
     vi.useFakeTimers();
     const harness = createApi();
     const root = document.createElement("div");
@@ -505,19 +534,19 @@ describe("conversation studio detail", () => {
     await settle();
 
     expect(root.querySelector("img.studio-logo")).not.toBeNull();
-    expect(root.querySelector('[data-session-key="session:1"] img')).toBeNull();
-    expect(root.textContent).toContain(HOSTILE);
-    const first = root.querySelector<HTMLElement>('[data-session-key="session:1"]');
-    const second = root.querySelector<HTMLElement>('[data-session-key="session:2"]');
-    first?.focus();
-    first?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
-    expect(document.activeElement).toBe(second);
-    expect(first?.getAttribute("aria-selected")).toBe("false");
-    second?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    await settle();
-    expect(root.querySelector('[data-session-key="session:2"]')?.getAttribute("aria-selected")).toBe(
-      "true",
+    const timeline = root.querySelector<HTMLElement>('[data-region="studio-timeline"]');
+    expect(timeline?.querySelector("img")).toBeNull();
+    expect(timeline?.textContent).toContain(HOSTILE);
+    expect(timeline?.textContent).toContain("Second-session request");
+    const timelineText = timeline?.textContent ?? "";
+    expect(timelineText.indexOf("Second-session request")).toBeLessThan(timelineText.indexOf(HOSTILE));
+    expect(timelineText.indexOf("Second-session request")).toBeLessThan(
+      timelineText.indexOf("Second-session completion"),
     );
+    expect(timeline?.textContent).not.toContain("alpha");
+    expect(timeline?.textContent).not.toContain("beta");
+    expect(timeline?.textContent).not.toContain("synthetic://events.jsonl");
+    expect(root.querySelector('[aria-label="Sessions"]')).toBeNull();
   });
 
   it("searches from the timeline, retains focus across a refresh, and does not leave the search field", async () => {
@@ -713,7 +742,7 @@ describe("studio presentation contract", () => {
     expect(css).toContain("min-height: var(--target-min)");
     expect(css).toContain("font-family: var(--exact-font)");
     expect(css).toContain("@container (max-width: 53em)");
-    expect(css).toContain("grid-column: 1 / -1");
+    expect(css).toContain("grid-template-columns: minmax(0, 1fr) minmax(18rem, 26rem)");
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
     expect(css).not.toMatch(/infinite/i);
     expect(css).not.toMatch(/uppercase/);

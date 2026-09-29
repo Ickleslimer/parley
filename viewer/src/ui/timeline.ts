@@ -1,9 +1,9 @@
-import type { ExchangeSummary, SearchHit, SessionSummary } from "../contracts";
+import type { ExchangeSummary, SearchHit } from "../contracts";
 
 import { messageBubble, pendingBubble } from "./attribution";
 import { el } from "./dom";
 import { presentExchange, searchHitHeading, type PresentedMessage } from "./excerpt";
-import { formatRoute, formatTimestamp } from "./format";
+import { formatTimestamp } from "./format";
 import { LANDMARKS } from "./landmarks";
 
 export type TimelineSide = "request" | "completion";
@@ -136,14 +136,6 @@ export function moveSearchStop(count: number, currentIndex: number, key: Timelin
   return currentIndex;
 }
 
-export interface SessionRailNodes {
-  region: HTMLElement;
-  list: HTMLUListElement;
-  meta: HTMLParagraphElement;
-  previous: HTMLButtonElement;
-  next: HTMLButtonElement;
-}
-
 export interface TimelineNodes {
   region: HTMLElement;
   title: HTMLHeadingElement;
@@ -154,26 +146,6 @@ export interface TimelineNodes {
   next: HTMLButtonElement;
   empty: HTMLParagraphElement;
   list: HTMLDivElement;
-}
-
-export function buildSessionRail(): SessionRailNodes {
-  const list = el("ul", {
-    className: "studio-session-list",
-    attrs: { role: "listbox", "aria-label": "Sessions" },
-  });
-  const meta = el("p", { className: "studio-pager-meta" });
-  const previous = pagerButton("Previous");
-  const next = pagerButton("Next");
-  const region = el("section", {
-    className: "studio-rail",
-    attrs: { "data-region": LANDMARKS.studioSessions, "aria-label": "Sessions" },
-    children: [
-      el("h2", { className: "studio-rail-title", text: "Sessions" }),
-      list,
-      el("div", { className: "studio-pager", children: [previous, meta, next] }),
-    ],
-  });
-  return { region, list, meta, previous, next };
 }
 
 export function buildTimeline(): TimelineNodes {
@@ -218,57 +190,6 @@ export function buildTimeline(): TimelineNodes {
     ],
   });
   return { region, title, form, input, meta, previous, next, empty, list };
-}
-
-export function paintSessionRail(
-  list: HTMLUListElement,
-  sessions: readonly SessionSummary[],
-  selectedKey: string | null,
-  onSelect: (sessionKey: string) => void,
-): void {
-  const restoreKey = focusedAttribute(list, "[data-session-key]", "data-session-key");
-  const preferred = preferredKey(
-    sessions.map((session) => session.sessionKey),
-    selectedKey,
-    restoreKey,
-  );
-  list.replaceChildren();
-  for (const session of sessions) {
-    const selected = session.sessionKey === selectedKey;
-    const option = el("li", {
-      className: selected ? "studio-session is-selected" : "studio-session",
-      attrs: {
-        role: "option",
-        tabindex: session.sessionKey === preferred ? "0" : "-1",
-        "aria-selected": selected ? "true" : "false",
-        "data-session-key": session.sessionKey,
-      },
-    });
-    option.append(
-      el("span", { className: "studio-session-id", text: session.sessionId }),
-      el("span", {
-        className: "studio-session-meta",
-        text: `${formatRoute(session.latestSource, session.latestTarget)}; ${session.exchangeCount} exchanges`,
-      }),
-      el("span", { className: "studio-session-source", text: session.sourcePath }),
-      el("span", { className: "studio-excerpt", text: session.latestExcerpt }),
-    );
-    if (session.excerptExtracted) {
-      option.append(el("span", { className: "studio-flag", text: "Extracted task" }));
-    }
-    option.addEventListener("click", () => {
-      option.focus();
-      onSelect(session.sessionKey);
-    });
-    list.append(option);
-  }
-  bindOptionKeys(list, (option) => {
-    const key = option.getAttribute("data-session-key");
-    if (key) {
-      onSelect(key);
-    }
-  });
-  restoreAttribute(list, "[data-session-key]", "data-session-key", restoreKey);
 }
 
 export function paintExchangeTimeline(
@@ -332,11 +253,6 @@ export function paintSearchTimeline(
         className: "studio-message-heading",
         text: `${searchHitHeading(hit.eventType)}, ${formatTimestamp(hit.timestampMs)}`,
       }),
-      el("span", {
-        className: "studio-session-meta",
-        text: `${hit.sessionId}; match offset ${Math.trunc(hit.matchOffset)}`,
-      }),
-      el("span", { className: "studio-session-source", text: hit.sourcePath }),
       el("span", { className: "studio-excerpt", text: hit.excerpt }),
     );
     option.addEventListener("click", () => {
@@ -369,9 +285,8 @@ function renderExchange(
   article.append(
     el("p", {
       className: "studio-exchange-meta",
-      text: `${formatTimestamp(exchange.timestampMs)}; ${exchange.exchangeId}`,
+      text: formatTimestamp(exchange.timestampMs),
     }),
-    el("p", { className: "studio-exchange-source", text: exchange.sourcePath }),
   );
   if (presented.request) {
     article.append(

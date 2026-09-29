@@ -10,7 +10,6 @@ export const LANDMARKS = {
   widgetFeedJumpLive: "widget-feed-jump-live",
   widgetFeedLoadEarlier: "widget-feed-load-earlier",
   widgetFeedOpenTranscript: "widget-feed-open-transcript",
-  studioSessions: "studio-sessions",
   studioTimeline: "studio-timeline",
   studioSearch: "studio-search",
   studioInspector: "studio-inspector",

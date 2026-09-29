@@ -208,6 +208,16 @@ impl Store {
             .collect()
     }
 
+    pub(crate) fn all_exact_exchange_summaries(
+        &self,
+        keys: KeyContext<'_>,
+    ) -> Vec<ExchangeSummary> {
+        self.exchanges
+            .values()
+            .map(|exchange| self.exchange_summary(exchange, keys))
+            .collect()
+    }
+
     pub(crate) fn widget_feed_ranks(&self, keys: KeyContext<'_>) -> Vec<WidgetFeedRank> {
         self.exchanges
             .values()
