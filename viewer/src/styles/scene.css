@@ -46,6 +46,7 @@
   width: 100%;
   height: 100%;
   overflow: hidden;
+  border-radius: var(--radius-paper);
   background: var(--paper);
   color: var(--ink);
 }
@@ -114,7 +115,7 @@
   min-width: 44px;
   min-height: 44px;
   border-width: 0 0 1px;
-  border-radius: 0;
+  border-radius: calc(var(--radius-paper) - 2px) calc(var(--radius-paper) - 2px) 0 0;
 }
 
 .widget-surface-button.widget-feed-target {
@@ -216,7 +217,7 @@
   align-items: center;
   justify-content: center;
   border: 2px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius-paper);
   background: var(--paper-dim);
 }
 
@@ -389,6 +390,7 @@
   min-height: 2rem;
   padding: 0.3rem 0.7rem 0.45rem;
   border-top: 1px solid var(--line-soft);
+  border-radius: 0 0 calc(var(--radius-paper) - 2px) calc(var(--radius-paper) - 2px);
   background: var(--paper);
   color: var(--ink);
 }

@@ -67,7 +67,7 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 
 - Solid paper surfaces carry exact text.
 - Restrained short shadows may separate physical paper layers.
-- Corners are modest and functional. Controls are not pills by default.
+- Corners use one modest paper radius: freestanding slips and controls use it on every corner, edge bands use it only where they meet the sheet edge, and shared seams stay square. Controls are not pills by default.
 - Whitespace separates evidence and establishes rhythm.
 - The repeated identity motif is a shared paper workbench with two distinct robot silhouettes.
 - Do not use cyan-purple glow meshes, glass panels, dashboard-card repetition, background grids, or generic AI ornaments.

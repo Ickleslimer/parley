@@ -632,6 +632,14 @@ describe("widget feed", () => {
     });
     await bodyFor(mounted.root, "request-1");
     expect(css).toMatch(/\.widget-feed-load-earlier\s*\{[^}]*min-width:\s*44px;[^}]*min-height:\s*44px/);
+    expect(css).toMatch(
+      /\.widget-feed-load-earlier\s*\{[^}]*border-radius:\s*calc\(var\(--radius-paper\) - 2px\) calc\(var\(--radius-paper\) - 2px\) 0 0/,
+    );
+    expect(css).toMatch(
+      /\.widget-feed-status\s*\{[^}]*border-radius:\s*0 0 calc\(var\(--radius-paper\) - 2px\) calc\(var\(--radius-paper\) - 2px\)/,
+    );
+    expect(css).toMatch(/\.widget-feed-device\s*\{[^}]*border-radius:\s*var\(--radius-paper\)/);
+    expect(css).toMatch(/\.widget-surface-shell\s*\{[^}]*border-radius:\s*var\(--radius-paper\)/);
     expect(css).toMatch(/\.widget-surface-button\.widget-feed-target\s*\{[^}]*min-width:\s*44px;[^}]*min-height:\s*44px/);
     expect(css).toMatch(/\.widget-feed-scroll\s*\{[^}]*overflow-y:\s*scroll/);
     expect(mounted.root.textContent).not.toContain("Older");
