@@ -40,6 +40,7 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 
 - The taskbar-free interactive surface is a lab-themed chronological chat, not a workshop wallpaper or dashboard.
 - Codex and Grok appear as compact robot-at-device avatars beside their own messages. Unknown agents use a neutral device avatar.
+- Both robot poses face inward toward the conversation column; presentation may mirror a source asset rather than duplicate it.
 - The feed combines configured sources globally and groups each request before its completion, error, or pending state.
 - Quiet `New conversation` dividers mark session changes without exposing paths or identifiers.
 - The underlay remains a neutral, accessibility-hidden lab-paper geometry host with no transcript or large workshop illustration.

@@ -92,6 +92,16 @@ describe("widget avatar", () => {
     }
   });
 
+  it("mirrors only Grok toward the conversation column", () => {
+    const rules = topLevelRules(css);
+    const mirror = rules.find(
+      (rule) => rule.prelude === '.widget-feed-avatar-slot[data-agent="grok"]',
+    );
+    expect(mirror?.body).toMatch(/transform\s*:\s*scaleX\(-1\)/);
+    expect(declarations(mirror?.body ?? "")).toEqual(["transform"]);
+    expect(css).not.toMatch(/\[data-agent="codex"\][^{]*\{[^}]*scaleX\(-1\)/s);
+  });
+
   it("renders neutral as a decorative device with no image", () => {
     for (const working of [false, true]) {
       const node = createWidgetAvatar({ agent: "neutral", working });

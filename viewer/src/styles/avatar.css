@@ -7,6 +7,10 @@
   user-select: none;
 }
 
+.widget-feed-avatar-slot[data-agent="grok"] {
+  transform: scaleX(-1);
+}
+
 .widget-feed-avatar-slot > .widget-feed-avatar {
   display: block;
   width: 100%;
