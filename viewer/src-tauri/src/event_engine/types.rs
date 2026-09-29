@@ -223,6 +223,7 @@ pub struct EventContent {
 pub enum WidgetFeedProjection {
     Exact,
     CurrentRequest,
+    Speech,
     Withheld,
 }
 

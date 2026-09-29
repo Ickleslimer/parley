@@ -160,7 +160,7 @@ export interface ContextDiagnostics {
   recovery: string | null;
 }
 
-export type WidgetFeedProjection = "exact" | "current-request" | "withheld";
+export type WidgetFeedProjection = "exact" | "current-request" | "speech" | "withheld";
 
 export interface WidgetFeedMessage {
   eventKey: string;

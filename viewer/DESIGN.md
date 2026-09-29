@@ -32,7 +32,7 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 - Use `Cascadia Mono`, `Cascadia Code`, `Consolas`, then monospace for exact event bodies and identifiers.
 - Use sentence case for production labels.
 - Do not use decorative uppercase kickers, wide tracking, CSS capitalization, or a second display family.
-- Preserve exact event text. Typography may wrap or clamp a bounded excerpt, but it must never rewrite it.
+- Preserve exact colleague speech. The desktop chat may omit only validated protocol scaffolding defined by the architecture; it never summarizes or rewrites the retained text, and the detail inspector keeps the raw event exact. Typography may wrap or clamp a bounded excerpt.
 
 ## Composition
 

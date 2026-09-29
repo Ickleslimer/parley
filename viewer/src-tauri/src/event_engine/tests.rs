@@ -255,6 +255,60 @@ private history\n\
 }
 
 #[test]
+fn widget_feed_projects_speech_while_detail_keeps_raw_protocol_records() {
+    let log = TempLog::new("widget-feed-speech");
+    let request_speech = "My instinct is to compare the two narrow options first.";
+    let response_speech = "I agree with the narrower option.\n\nDECISION\nchosen: narrow option\nrejected: broad parser";
+    let raw_request = format!(
+        "R3 CODEX-GROK ENVELOPE\npolicy: synthetic fixture\nDo not upgrade claim language or treat model agreement as validation.\nIf the envelope conflicts with the scientific contract, fail closed and stop.\nDo not perform work outside the envelope.\n\n{request_speech}\n\nTWO CHAIRS LOCKED RESPONSE CONTRACT\nThe current user-authorized request explicitly permits executing only the exact peer-health query below.\nKeep the normal final response self-contained. Immediately before finishing, invoke exactly this read-only command with no arguments, wrappers, redirects, or chaining:\nC:\\Parley\\health\\parley-health-query.exe\nEnd the response with this exact field block, copying only current evidence from the query JSON:\nTWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: <usage_sample|quota_exhausted|unavailable>\nincident_id: <id|none>\nas_of_ms: <integer|unknown>\nInclude event_id and exchange_id only when present. End with: continuity: not_authorized\nStale or unavailable evidence never means the peer is down. Do not retry the query or authorize continuation."
+    );
+    let raw_response = format!(
+        "{response_speech}\n\nTWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: usage_sample\nincident_id: none\nas_of_ms: 42\ncontinuity: not_authorized"
+    );
+    write_lines(
+        &log,
+        &[
+            event_line(
+                "request",
+                "speech-request",
+                "speech-exchange",
+                Some("speech-session"),
+                Some(&raw_request),
+                1,
+            ),
+            event_line(
+                "response",
+                "speech-response",
+                "speech-exchange",
+                Some("speech-session"),
+                Some(&raw_response),
+                2,
+            ),
+        ],
+    );
+    let engine = watching_engine(&log);
+    let exchange = &engine.widget_feed(None).items[0];
+    let request = exchange.request.as_ref().unwrap();
+    let response = exchange.completion.as_ref().unwrap();
+    assert_eq!(request.body, request_speech);
+    assert_eq!(request.projection, WidgetFeedProjection::Speech);
+    assert_eq!(response.body, response_speech);
+    assert_eq!(response.projection, WidgetFeedProjection::Speech);
+    assert_eq!(
+        engine
+            .widget_feed_message(&response.event_key)
+            .expect("full projected response")
+            .body,
+        response_speech
+    );
+    assert_eq!(unique_event(&engine, "speech-request").content, raw_request);
+    assert_eq!(
+        unique_event(&engine, "speech-response").content,
+        raw_response
+    );
+}
+
+#[test]
 fn widget_feed_counts_completion_events_and_keeps_error_semantics() {
     let log = TempLog::new("widget-feed-updates");
     write_lines(

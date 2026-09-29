@@ -447,11 +447,8 @@ impl Store {
     ) -> WidgetFeedMessage {
         let event = &self.events[idx];
         let (speaker, recipient) = speakers(event.event_type, &event.source, &event.target);
-        let projected = widget_projection(
-            preview_text(event),
-            event.event_type == EventType::Request,
-            &event.exchange_id,
-        );
+        let projected =
+            widget_projection(preview_text(event), event.event_type, &event.exchange_id);
         let full_character_length = projected.text.chars().count();
         let truncated = bounded && full_character_length > WIDGET_FEED_BODY_LIMIT;
         let body = if bounded {

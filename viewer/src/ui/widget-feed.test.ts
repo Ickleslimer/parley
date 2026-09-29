@@ -460,6 +460,25 @@ describe("widget feed", () => {
     mounted.stop();
   });
 
+  it("renders a speech projection without adding protocol diagnostics", async () => {
+    const mounted = mountFeed({
+      items: [
+        exchange(1, {
+          requestBody: "My instinct is to compare the two options first.",
+          projection: "speech",
+        }),
+      ],
+    });
+    await vi.waitFor(() => {
+      expect(mounted.root.textContent).toContain("My instinct is to compare the two options first.");
+    });
+    const request = row(mounted.root, "request-1");
+    expect(request.dataset.projection).toBe("speech");
+    expect(request.textContent).not.toContain("Message withheld");
+    expect(request.textContent).not.toContain("Earlier context omitted");
+    mounted.stop();
+  });
+
   it("opens the message event, or the newest completion, error, or request", async () => {
     const openWidgetEvent = vi.fn(async () => undefined);
     const completed = mountFeed({ items: [exchange(1)], openWidgetEvent });
