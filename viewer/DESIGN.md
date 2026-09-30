@@ -58,11 +58,13 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 
 - The timeline is one continuous reverse-chronological conversation across every configured source and native session, with the newest exchange first while each request remains above its reply.
 - Native session changes create no divider, label, grouping, or accessibility boundary. The conversation itself exposes no session or source identifiers; selected-event and source-management diagnostics retain them where needed.
-- The timeline is the primary focal point and presents paired exchanges with anchored `Load earlier messages` and `Jump to latest` controls.
-- The inspector explains selected evidence through Event, Activity, Sources, and Settings tabs.
-- Activity may include one calm `Direct with Grok` emergency workbench. It explains the current Codex-published task and exact writable scope in human terms, accepts only bounded message text, and keeps receipt distinct from review. It is not a dashboard card, ordinary chat launcher, session picker, path editor, permission editor, or command console.
-- Exit and degraded-state notices remain outside tabs.
-- At the content-driven compact breakpoint, the inspector stacks beneath the timeline without removing controls.
+- The transcript is the primary focal point. Quiet date separators and light message rows carry speaker, role, time, and a bounded exact excerpt; only the selected message receives the strong outline.
+- `Load earlier messages` sits at the older-history end. `Jump to latest` appears whenever the newest exchange is outside the transcript viewport and never opens evidence automatically.
+- A compact header carries the title, one quiet watching-count line, `Utilities`, and Exit. Degraded, tray, widget, continuation, and peer-health failures remain explicit banners or utility content rather than entering that quiet line.
+- Exact evidence opens only after explicit click, Enter, or Space activation. Arrow navigation changes focus without opening or fetching evidence.
+- The evidence drawer is closed by default. Exact raw text comes first; technical metadata is collapsed by default. Wide layouts use an in-flow complementary column, while the content-driven compact layout uses a labelled modal sheet with inert background and focus trapping.
+- `Utilities` opens Activity, Sources, or Settings in the same drawer. Polling never opens the menu or drawer and never moves focus.
+- One calm `Direct with Grok` emergency composer sits beneath the transcript. It explains the Codex-published task and exact writable scope in human terms, accepts only bounded message text, and keeps display receipt distinct from review. It is not an ordinary chat launcher, session picker, path editor, permission editor, or command console.
 
 ## Material Language
 
@@ -110,7 +112,7 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 - Paper surfaces behind text guarantee stable contrast independent of the illustration.
 - Distinct robot hues support attribution, while dark marks carry accessible boundaries.
 - Finite reactions acknowledge meaningful changes without turning the viewer into ambient noise.
-- The inspector tabs keep secondary operational evidence available without competing with the conversation.
+- The closed-by-default evidence drawer and utility menu keep secondary operational evidence available without competing with the conversation.
 
 ## Provenance
 
