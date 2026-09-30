@@ -3,10 +3,14 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { ContinuationEvidence, ContinuationStatus } from "../contracts";
+import type { ContinuationEvidence, ContinuationStatus, ExchangeSummary } from "../contracts";
 import type { ViewerApi } from "../ipc";
 
-import { buildContinuationSection } from "./continuation";
+import {
+  buildContinuationSection,
+  isContinuationReceiptPresented,
+  resolveContinuationReceiptEventKey,
+} from "./continuation";
 
 const ID = "123e4567-e89b-12d3-a456-426614174000";
 const HASH = "a".repeat(64);
@@ -23,6 +27,10 @@ describe("direct Grok continuation", () => {
     await vi.waitFor(() => {
       expect(view.section.textContent).toContain("No task is currently published");
     });
+    expect(view.section.querySelector<HTMLDetailsElement>(".continuation-dock")?.open).toBe(false);
+    expect(view.section.querySelector("summary")?.textContent).toContain(
+      "No task is currently published",
+    );
     expect(view.section.querySelector<HTMLTextAreaElement>("textarea")?.disabled).toBe(true);
     expect(view.section.querySelector<HTMLButtonElement>(".continuation-send")?.disabled).toBe(
       true,
@@ -49,7 +57,7 @@ describe("direct Grok continuation", () => {
     view.stop();
   });
 
-  it("renders hostile reply text literally before recording receipt", async () => {
+  it("keeps exact prompt and reply in the transcript and receipts only on request", async () => {
     const hostile = "<img src=x onerror=alert(1)> exact reply";
     const unreceived = completedStatus({ reply: hostile, userReceived: false });
     const received = completedStatus({ reply: hostile, userReceived: true });
@@ -57,33 +65,54 @@ describe("direct Grok continuation", () => {
     const api = continuationApi(unreceived, { receiveContinuation: receive });
     const view = mount(api);
     await vi.waitFor(() => {
-      expect(view.section.querySelector(".continuation-reply")?.textContent).toBe(hostile);
-      expect(receive).toHaveBeenCalledWith(ID, HASH);
+      expect(view.receiptCandidate()).toEqual({
+        continuationId: ID,
+        evidenceHash: HASH,
+        completionEventId: "response-1",
+      });
     });
+    expect(view.section.textContent).not.toContain(hostile);
+    expect(view.section.textContent).not.toContain("Finish the task.");
     expect(view.section.querySelector("img")).toBeNull();
+    expect(receive).not.toHaveBeenCalled();
+    view.recordVisibleReceipt(view.receiptCandidate()!);
     await vi.waitFor(() => {
+      expect(receive).toHaveBeenCalledWith(ID, HASH);
       expect(view.section.textContent).toContain("Displayed and receipted");
     });
     view.stop();
   });
 
-  it("does not record receipt while the Activity panel is hidden", async () => {
-    const receive = vi.fn(async () => completedStatus({ userReceived: true }));
+  it("makes only one receipt attempt for an evidence hash", async () => {
+    const receive = vi.fn(async () => {
+      throw new Error("offline");
+    });
     const api = continuationApi(completedStatus({ userReceived: false }), {
       receiveContinuation: receive,
     });
-    const panel = document.createElement("div");
-    panel.setAttribute("role", "tabpanel");
-    panel.hidden = true;
-    const controller = buildContinuationSection(api);
-    panel.append(controller.section);
-    document.body.append(panel);
-    controller.start();
+    const view = mount(api);
     await vi.waitFor(() => {
-      expect(controller.section.querySelector(".continuation-reply")?.textContent).toBe("Done.");
+      expect(view.receiptCandidate()).not.toBeNull();
     });
-    expect(receive).not.toHaveBeenCalled();
-    controller.stop();
+    const candidate = view.receiptCandidate()!;
+    view.recordVisibleReceipt(candidate);
+    await vi.waitFor(() => {
+      expect(view.section.textContent).toContain("could not be recorded");
+    });
+    view.recordVisibleReceipt(candidate);
+    expect(receive).toHaveBeenCalledTimes(1);
+    view.stop();
+  });
+
+  it("retains bounded scope and validation metadata behind disclosure", async () => {
+    const view = mount(continuationApi(completedStatus()));
+    await vi.waitFor(() => {
+      expect(view.section.textContent).toContain("src/bounded/file.rs");
+    });
+    const details = view.section.querySelector<HTMLDetailsElement>(".continuation-latest");
+    expect(details?.open).toBe(false);
+    expect(details?.textContent).toContain("Codex must run tests during review");
+    view.stop();
   });
 
   it("cancels only the running continuation reported by Rust", async () => {
@@ -99,6 +128,79 @@ describe("direct Grok continuation", () => {
     view.section.querySelector<HTMLButtonElement>(".continuation-cancel")?.click();
     await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith(ID));
     view.stop();
+  });
+});
+
+describe("continuation receipt presentation", () => {
+  const candidate = {
+    continuationId: ID,
+    evidenceHash: HASH,
+    completionEventId: "response-1",
+  };
+
+  it("binds a raw completion id to exactly one opaque event key", () => {
+    expect(resolveContinuationReceiptEventKey([exchange("event-a")], candidate)).toBe("event-a");
+    expect(
+      resolveContinuationReceiptEventKey(
+        [exchange("event-a"), exchange("event-b", "exchange-b")],
+        candidate,
+      ),
+    ).toBeNull();
+    expect(
+      resolveContinuationReceiptEventKey(
+        [exchange("event-a", "exchange-a", "different-response")],
+        candidate,
+      ),
+    ).toBeNull();
+  });
+
+  it("requires latest view and visible terminal evidence", () => {
+    const row = document.createElement("article");
+    const scrollport = document.createElement("div");
+    vi.spyOn(row, "getBoundingClientRect").mockReturnValue(rect(76, 124));
+    vi.spyOn(scrollport, "getBoundingClientRect").mockReturnValue(rect(0, 100));
+    const base = {
+      mode: "latest" as const,
+      documentVisible: true,
+      matchingEventKey: "event-a",
+      modalEventKey: null,
+      row,
+      scrollport,
+    };
+    expect(isContinuationReceiptPresented(base)).toBe(true);
+    expect(isContinuationReceiptPresented({ ...base, mode: "search" })).toBe(false);
+    expect(isContinuationReceiptPresented({ ...base, documentVisible: false })).toBe(false);
+    expect(isContinuationReceiptPresented({ ...base, row: null })).toBe(false);
+  });
+
+  it("accepts full visibility for short rows and an exact matching modal", () => {
+    const row = document.createElement("article");
+    const scrollport = document.createElement("div");
+    vi.spyOn(row, "getBoundingClientRect").mockReturnValue(rect(90, 100));
+    vi.spyOn(scrollport, "getBoundingClientRect").mockReturnValue(rect(0, 100));
+    const base = {
+      mode: "latest" as const,
+      documentVisible: true,
+      matchingEventKey: "event-a",
+      modalEventKey: null,
+      row,
+      scrollport,
+    };
+    expect(isContinuationReceiptPresented(base)).toBe(true);
+    expect(
+      isContinuationReceiptPresented({
+        ...base,
+        row: null,
+        modalEventKey: "event-a",
+      }),
+    ).toBe(true);
+    expect(
+      isContinuationReceiptPresented({
+        ...base,
+        row: null,
+        modalEventKey: "event-b",
+      }),
+    ).toBe(false);
   });
 });
 
@@ -180,4 +282,47 @@ function completedStatus(
       ...evidenceOverrides,
     },
   });
+}
+
+function exchange(
+  eventKey: string,
+  exchangeKey = "exchange-a",
+  eventId = "response-1",
+): ExchangeSummary {
+  return {
+    exchangeKey,
+    sessionKey: "session-a",
+    exchangeId: exchangeKey,
+    sessionId: "session-a",
+    sourcePath: "synthetic.jsonl",
+    timestampMs: 1_800_000_000_000,
+    request: null,
+    completion: {
+      eventKey,
+      eventId,
+      eventType: "response",
+      speaker: "grok",
+      recipient: "codex",
+      timestampMs: 1_800_000_000_000,
+      status: "ok",
+      excerpt: "Done.",
+      excerptExtracted: false,
+      contentLength: 5,
+    },
+    pendingLabel: null,
+  };
+}
+
+function rect(top: number, bottom: number): DOMRect {
+  return {
+    x: 0,
+    y: top,
+    top,
+    bottom,
+    left: 0,
+    right: 100,
+    width: 100,
+    height: bottom - top,
+    toJSON: () => ({}),
+  } as DOMRect;
 }

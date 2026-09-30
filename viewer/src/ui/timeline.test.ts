@@ -6,11 +6,13 @@ import { describe, expect, it } from "vitest";
 import type { ExchangeSummary, MessagePreview, SearchHit } from "../contracts";
 
 import {
+  exchangeTranscriptRows,
   exchangeStops,
   moveSearchStop,
   moveTimelineStop,
   paintExchangeTimeline,
   paintSearchTimeline,
+  searchTranscriptRows,
 } from "./timeline";
 
 const HOSTILE = "<img src=x onerror=alert(1)>";
@@ -90,6 +92,73 @@ describe("timeline movement", () => {
     expect(moveSearchStop(3, 1, "ArrowLeft")).toBe(1);
     expect(moveSearchStop(3, 1, "Home")).toBe(0);
     expect(moveSearchStop(3, 0, "End")).toBe(2);
+  });
+});
+
+describe("studio transcript projection", () => {
+  it("projects request, completion, and pending rows without source diagnostics", () => {
+    const complete = exchange();
+    const pending = exchange({
+      exchangeKey: "exchange:pending",
+      request: preview({
+        eventKey: "event:pending-request",
+        speaker: "codex",
+        recipient: "grok",
+      }),
+      completion: null,
+      pendingLabel: "Request logged; no response event yet",
+    });
+    const rows = exchangeTranscriptRows([complete, pending]);
+    expect(rows).toHaveLength(4);
+    expect(rows[0]).toMatchObject({
+      kind: "message",
+      eventKey: "event:request",
+      side: "request",
+      speaker: "codex",
+      recipient: "grok",
+    });
+    expect(rows[1]).toMatchObject({
+      kind: "message",
+      eventKey: "event:completion",
+      side: "completion",
+      speaker: "grok",
+      recipient: "codex",
+    });
+    expect(rows[3]).toMatchObject({
+      kind: "pending",
+      eventKey: null,
+      speaker: "grok",
+      recipient: "codex",
+      excerpt: "Request logged; no response event yet",
+    });
+    expect(JSON.stringify(rows)).not.toContain("synthetic://events.jsonl");
+    expect(JSON.stringify(rows)).not.toContain("session:1");
+  });
+
+  it("projects search results as flat event rows", () => {
+    const rows = searchTranscriptRows([
+      {
+        eventKey: "event:hit",
+        exchangeKey: "exchange:hit",
+        sessionKey: "session:hit",
+        eventId: "hit",
+        exchangeId: "exchange-hit",
+        sessionId: "session-hit",
+        sourcePath: "synthetic://one",
+        eventType: "error",
+        timestampMs: 2,
+        excerpt: HOSTILE,
+        matchOffset: 0,
+      },
+    ]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      kind: "search",
+      eventKey: "event:hit",
+      side: "completion",
+      roleLabel: "Parley execution error",
+      excerpt: HOSTILE,
+    });
   });
 });
 

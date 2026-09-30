@@ -54,6 +54,7 @@ $fixtures = @(
     @{ File = "surface-text-scale-200-720x560.png"; Query = "view=widget-surface&fixture=live&text-scale=2"; Width = 720; Height = 560 },
     @{ File = "surface-minimum-480x420.png"; Query = "view=widget-surface&fixture=live"; Width = 480; Height = 420 },
     @{ File = "surface-large-960x720.png"; Query = "view=widget-surface&fixture=live"; Width = 960; Height = 720 },
+    @{ File = "detail-closed-1120x760.png"; Query = "view=detail&fixture=short-exchange"; Width = 1120; Height = 760 },
     @{ File = "detail-event-1120x760.png"; Query = "view=detail&fixture=short-exchange&tab=event"; Width = 1120; Height = 760 },
     @{ File = "detail-activity-840x560.png"; Query = "view=detail&fixture=short-exchange&tab=activity"; Width = 840; Height = 560 },
     @{ File = "detail-sources-search-1120x760.png"; Query = "view=detail&fixture=search-results&tab=sources"; Width = 1120; Height = 760 },

@@ -1,9 +1,11 @@
-import type { ContinuationEvidence, ContinuationStatus } from "../contracts";
+import type { ContinuationEvidence, ContinuationStatus, ExchangeSummary } from "../contracts";
 import type { ViewerApi } from "../ipc";
 
 import { el, labelledControl, setText } from "./dom";
 import { formatTimestamp } from "./format";
+import { LANDMARKS } from "./landmarks";
 import { createSingleFlightPoller } from "./poll";
+import type { TranscriptMode } from "./studio-seam";
 
 const MAX_MESSAGE_CHARS = 8_000;
 const CONTINUATION_POLL_MS = 1_500;
@@ -12,9 +14,33 @@ export interface ContinuationController {
   section: HTMLElement;
   start: () => void;
   stop: () => void;
+  receiptCandidate: () => ContinuationReceiptCandidate | null;
+  recordVisibleReceipt: (candidate: ContinuationReceiptCandidate) => void;
 }
 
-export function buildContinuationSection(api: ViewerApi): ContinuationController {
+export interface ContinuationReceiptCandidate {
+  continuationId: string;
+  evidenceHash: string;
+  completionEventId: string;
+}
+
+export interface ContinuationSectionOptions {
+  onStatusChange?: () => void;
+}
+
+export interface ContinuationReceiptPresentation {
+  mode: TranscriptMode;
+  documentVisible: boolean;
+  matchingEventKey: string | null;
+  modalEventKey: string | null;
+  row: HTMLElement | null;
+  scrollport: HTMLElement;
+}
+
+export function buildContinuationSection(
+  api: ViewerApi,
+  options: ContinuationSectionOptions = {},
+): ContinuationController {
   let status: ContinuationStatus | null = null;
   let error: string | null = null;
   let submitPending = false;
@@ -23,7 +49,7 @@ export function buildContinuationSection(api: ViewerApi): ContinuationController
   let latestRevision: string | null = null;
   const receiptAttempts = new Set<string>();
 
-  const availability = el("p", {
+  const availability = el("span", {
     className: "continuation-availability",
     attrs: { role: "status", "aria-live": "polite" },
   });
@@ -38,41 +64,21 @@ export function buildContinuationSection(api: ViewerApi): ContinuationController
   });
   actionError.hidden = true;
 
-  const latestHeading = el("h3", {
-    className: "continuation-latest-title",
-    text: "Latest direct exchange",
-  });
+  const latestSummary = el("summary", { text: "Latest direct-turn evidence" });
   const latestMeta = el("p", { className: "continuation-meta" });
-  const latestPrompt = el("pre", {
-    className: "continuation-message exact-body",
-    attrs: { tabindex: "0", "aria-label": "Your exact direct message" },
-  });
-  const latestReply = el("pre", {
-    className: "continuation-reply exact-body",
-    attrs: { tabindex: "0", "aria-label": "Grok's exact direct reply" },
-  });
-  const latestError = el("p", {
-    className: "continuation-result-error",
-    attrs: { role: "status" },
-  });
+  const latestOutcome = el("p", { className: "continuation-meta" });
   const latestChanges = el("ul", {
     className: "continuation-changes",
     attrs: { "aria-label": "Changed paths reported by the continuation broker" },
   });
   const latestValidation = el("p", { className: "continuation-meta" });
   const latestReceipt = el("p", { className: "continuation-meta" });
-  const promptDetails = el("details", {
-    className: "continuation-prompt-details",
-    children: [el("summary", { text: "Your exact message" }), latestPrompt],
-  });
-  const latest = el("article", {
+  const latest = el("details", {
     className: "continuation-latest",
     children: [
-      latestHeading,
+      latestSummary,
       latestMeta,
-      promptDetails,
-      latestReply,
-      latestError,
+      latestOutcome,
       latestChanges,
       latestValidation,
       latestReceipt,
@@ -114,22 +120,38 @@ export function buildContinuationSection(api: ViewerApi): ContinuationController
     ],
   });
 
+  const composer = el("details", {
+    className: "continuation-dock",
+    children: [
+      el("summary", {
+        children: [
+          el("span", { className: "continuation-title", text: "Direct with Grok" }),
+          availability,
+        ],
+      }),
+      el("div", {
+        className: "continuation-body",
+        children: [
+          el("p", {
+            className: "continuation-caption",
+            text: "Emergency continuation for the current published task. Grok keeps the same conversation and can edit only the paths Codex granted. Your receipt confirms display, not Codex review.",
+          }),
+          scope,
+          grants,
+          actionError,
+          latest,
+          form,
+        ],
+      }),
+    ],
+  });
   const section = el("section", {
     className: "panel panel-continuation",
-    attrs: { "aria-label": "Direct with Grok" },
-    children: [
-      el("h2", { text: "Direct with Grok" }),
-      el("p", {
-        className: "continuation-caption",
-        text: "Emergency continuation for the current published task. Grok keeps the same conversation and can edit only the paths Codex granted. Your receipt confirms display, not Codex review.",
-      }),
-      availability,
-      scope,
-      grants,
-      actionError,
-      latest,
-      form,
-    ],
+    attrs: {
+      "aria-label": "Direct with Grok",
+      "data-region": LANDMARKS.studioComposer,
+    },
+    children: [composer],
   });
 
   const paint = (): void => {
@@ -168,11 +190,12 @@ export function buildContinuationSection(api: ViewerApi): ContinuationController
         latestMeta,
         `${resultLabel(evidence.state)} · ${formatTimestamp(evidence.completedAtMs)}`,
       );
-      setText(latestPrompt, evidence.prompt);
-      latestReply.hidden = evidence.reply == null;
-      setText(latestReply, evidence.reply ?? "");
-      latestError.hidden = evidence.error == null;
-      setText(latestError, evidence.error ?? "");
+      setText(
+        latestOutcome,
+        evidence.error != null
+          ? "The exact failure record is available in the transcript."
+          : "The exact reply is available in the transcript.",
+      );
       latestChanges.hidden = evidence.changedPaths.length === 0;
       latestChanges.replaceChildren(
         ...evidence.changedPaths.map((path) => el("li", { text: path })),
@@ -187,33 +210,54 @@ export function buildContinuationSection(api: ViewerApi): ContinuationController
         latestReceipt,
         evidence.userReceived
           ? "Displayed and receipted by the user interface. Codex review is still separate."
-          : "Displayed. Recording user receipt…",
+          : "Receipt waits until the matching terminal message is visibly presented.",
       );
     }
-    if (
-      !evidence.userReceived &&
-      isResultPresented(section) &&
-      !receiptAttempts.has(evidence.evidenceHash)
-    ) {
-      receiptAttempts.add(evidence.evidenceHash);
-      void api
-        .receiveContinuation(evidence.continuationId, evidence.evidenceHash)
-        .then((next) => {
-          if (stopped) {
-            return;
-          }
-          status = next;
-          error = null;
-          paint();
-        })
-        .catch(() => {
-          if (stopped) {
-            return;
-          }
-          error = "The reply is visible, but its user receipt could not be recorded.";
-          paint();
-        });
+  };
+
+  const receiptCandidate = (): ContinuationReceiptCandidate | null => {
+    const evidence = status?.latest;
+    if (!evidence || evidence.userReceived || !evidence.completionEventId) {
+      return null;
     }
+    return {
+      continuationId: evidence.continuationId,
+      evidenceHash: evidence.evidenceHash,
+      completionEventId: evidence.completionEventId,
+    };
+  };
+
+  const recordVisibleReceipt = (candidate: ContinuationReceiptCandidate): void => {
+    const current = receiptCandidate();
+    if (
+      !current ||
+      current.continuationId !== candidate.continuationId ||
+      current.evidenceHash !== candidate.evidenceHash ||
+      current.completionEventId !== candidate.completionEventId ||
+      receiptAttempts.has(candidate.evidenceHash)
+    ) {
+      return;
+    }
+    receiptAttempts.add(candidate.evidenceHash);
+    void api
+      .receiveContinuation(candidate.continuationId, candidate.evidenceHash)
+      .then((next) => {
+        if (stopped) {
+          return;
+        }
+        status = next;
+        error = null;
+        paint();
+        options.onStatusChange?.();
+      })
+      .catch(() => {
+        if (stopped) {
+          return;
+        }
+        error = "The reply is visible, but its user receipt could not be recorded.";
+        paint();
+        options.onStatusChange?.();
+      });
   };
 
   const refresh = async (): Promise<void> => {
@@ -231,6 +275,7 @@ export function buildContinuationSection(api: ViewerApi): ContinuationController
       error = "Direct continuation status is unavailable.";
     }
     paint();
+    options.onStatusChange?.();
   };
 
   textarea.addEventListener("input", () => {
@@ -305,12 +350,56 @@ export function buildContinuationSection(api: ViewerApi): ContinuationController
       stopped = true;
       poller.stop();
     },
+    receiptCandidate,
+    recordVisibleReceipt,
   };
 }
 
-function isResultPresented(section: HTMLElement): boolean {
-  const panel = section.closest<HTMLElement>('[role="tabpanel"]');
-  return !document.hidden && (panel == null || !panel.hidden);
+export function resolveContinuationReceiptEventKey(
+  exchanges: readonly ExchangeSummary[],
+  candidate: ContinuationReceiptCandidate,
+): string | null {
+  const matches = exchanges
+    .map((exchange) => exchange.completion)
+    .filter(
+      (completion) =>
+        completion != null &&
+        completion.eventType !== "request" &&
+        completion.eventId === candidate.completionEventId,
+    );
+  return matches.length === 1 ? (matches[0]?.eventKey ?? null) : null;
+}
+
+export function isContinuationReceiptPresented(
+  presentation: ContinuationReceiptPresentation,
+): boolean {
+  if (
+    presentation.mode !== "latest" ||
+    !presentation.documentVisible ||
+    !presentation.matchingEventKey
+  ) {
+    return false;
+  }
+  if (presentation.modalEventKey === presentation.matchingEventKey) {
+    return true;
+  }
+  if (!presentation.row) {
+    return false;
+  }
+  const rowRect = presentation.row.getBoundingClientRect();
+  const scrollRect = presentation.scrollport.getBoundingClientRect();
+  if (rowRect.height <= 0 || rowRect.width <= 0) {
+    return false;
+  }
+  const visibleHeight = Math.max(
+    0,
+    Math.min(rowRect.bottom, scrollRect.bottom) - Math.max(rowRect.top, scrollRect.top),
+  );
+  const visibleWidth = Math.max(
+    0,
+    Math.min(rowRect.right, scrollRect.right) - Math.max(rowRect.left, scrollRect.left),
+  );
+  return visibleWidth > 0 && visibleHeight >= Math.min(24, rowRect.height);
 }
 
 function availabilityLabel(status: ContinuationStatus | null, error: string | null): string {

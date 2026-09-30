@@ -16,31 +16,32 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { el, labelledControl, setText } from "./dom";
 import { exactEventBody } from "./excerpt";
-import { buildContinuationSection } from "./continuation";
+import {
+  buildContinuationSection,
+  isContinuationReceiptPresented,
+  resolveContinuationReceiptEventKey,
+} from "./continuation";
 import {
   formatCharacterCount,
   formatDiagnostics,
   formatDuration,
   formatEventType,
   formatRoute,
-  formatRuntimeHealth,
   formatSourceLine,
   formatSourceState,
   formatTimestamp,
 } from "./format";
 import {
-  activityAttentionLabel,
   buildInspector,
+  buildStudioDrawerController,
   pendingHandoffCount,
   unreadIncidentCount,
 } from "./inspector-tabs";
 import { degradedBanner, loadErrorLabel } from "./labels";
-import { LANDMARKS } from "./landmarks";
 import {
   applyPageResult,
   dataRefreshPlan,
   requestNextPage,
-  requestPreviousPage,
 } from "./paging";
 import {
   applyOpenHandoff,
@@ -64,8 +65,11 @@ import {
   submitSearch,
   type SearchViewState,
 } from "./search";
-import { isFocusLocked } from "./timeline";
-import { buildTimeline, paintExchangeTimeline, paintSearchTimeline } from "./timeline";
+import { createStudioDrawer } from "./studio-drawer-chrome";
+import { createStudioHeader } from "./studio-header";
+import type { DrawerLayout, TranscriptMode, UtilityId } from "./studio-seam";
+import { createStudioTranscript } from "./studio-transcript-view";
+import { exchangeTranscriptRows, isFocusLocked, searchTranscriptRows } from "./timeline";
 
 const CORNERS: Array<ViewerSettings["corner"]> = [
   "top-left",
@@ -115,7 +119,15 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   root.className = "detail-shell";
   root.removeAttribute("aria-live");
 
-  const timeline = buildTimeline();
+  let requestExit = (): void => undefined;
+  let openUtility = (_utility: UtilityId): void => undefined;
+  let handleSearch = (_query: string): void => undefined;
+  let handleLoadEarlier = (): void => undefined;
+  let handleJumpLatest = (): void => undefined;
+  let handleTranscriptFocus = (_eventKey: string): void => undefined;
+  let handleTranscriptActivate = (_eventKey: string, _exchangeKey: string): void => undefined;
+  let evaluateContinuationReceipt = (): void => undefined;
+
   const inspector = buildInspector();
   const desktopMode = el("select", {
     attrs: { id: "desktop-mode", "aria-label": "Desktop interaction mode" },
@@ -145,51 +157,55 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   );
   const peerActivity = buildPeerActivitySection();
   const peerHealth = buildPeerHealthSection();
-  const continuation = buildContinuationSection(api);
-  inspector.activityHost.append(continuation.section, peerActivity.section, peerHealth.section);
+  const continuation = buildContinuationSection(api, {
+    onStatusChange: () => evaluateContinuationReceipt(),
+  });
+  inspector.activityHost.append(peerActivity.section, peerHealth.section);
 
-  const sourceLine = el("p", { className: "studio-status", id: "source-status" });
-  const healthLine = el("p", { className: "studio-health" });
-  const exit = el("button", {
-    className: "studio-action studio-exit",
-    text: "Exit",
-    attrs: {
-      type: "button",
-      "data-region": LANDMARKS.studioExit,
-      "aria-label": "Exit Parley Conversation Viewer",
+  const header = createStudioHeader({
+    onExit: () => requestExit(),
+    onUtility: (utility) => {
+      queueMicrotask(() => openUtility(utility));
     },
   });
-  const logo = el("img", {
-    className: "studio-logo",
-    attrs: { src: "/parley-icon.ico", alt: "", width: "28", height: "28" },
+  header.status.id = "source-status";
+  header.banner.setAttribute("role", "alert");
+  const transcript = createStudioTranscript({
+    onSearch: (query) => handleSearch(query),
+    onLoadEarlier: () => handleLoadEarlier(),
+    onJumpLatest: () => handleJumpLatest(),
+    onFocus: (eventKey) => handleTranscriptFocus(eventKey),
+    onActivate: (eventKey, exchangeKey) => handleTranscriptActivate(eventKey, exchangeKey),
   });
-  logo.setAttribute("aria-hidden", "true");
-  const title = el("h1", { className: "studio-title", text: "Conversation studio" });
-  const banner = el("p", {
-    className: "studio-banner",
-    attrs: { role: "alert", "data-region": LANDMARKS.studioBanner },
-  });
-  banner.hidden = true;
-  const loadError = el("p", { className: "studio-load-error", attrs: { role: "status" } });
+  transcript.scrollport.tabIndex = -1;
+  const drawer = createStudioDrawer();
+  drawer.exactBody.tabIndex = 0;
+  drawer.exactBody.setAttribute("aria-label", "Exact event content");
+
+  for (const utility of ["activity", "sources", "settings"] satisfies UtilityId[]) {
+    const panel = inspector.panels[utility];
+    panel.removeAttribute("role");
+    panel.removeAttribute("id");
+    panel.removeAttribute("aria-labelledby");
+    panel.classList.add("studio-focus-utility-panel");
+    panel.dataset.utility = utility;
+    panel.hidden = true;
+    drawer.utilityHost.append(panel);
+  }
+
+  const loadError = el("p", { className: "studio-load-error", attrs: { role: "alert" } });
   loadError.hidden = true;
+  const transcriptColumn = el("main", {
+    className: "studio-focus-main",
+    children: [transcript.region, continuation.section],
+  });
+  const workspace = el("div", {
+    className: "studio-focus-workspace",
+    children: [transcriptColumn, drawer.region],
+  });
   const shell = el("div", {
     className: "studio",
-    children: [
-      el("header", {
-        className: "studio-bar",
-        children: [
-          el("div", { className: "studio-brand", children: [logo, title] }),
-          el("div", { className: "studio-bar-copy", children: [sourceLine, healthLine] }),
-          exit,
-        ],
-      }),
-      banner,
-      loadError,
-      el("div", {
-        className: "studio-body",
-        children: [timeline.region, inspector.region],
-      }),
-    ],
+    children: [header.region, loadError, workspace],
   });
   root.replaceChildren(shell);
 
@@ -235,24 +251,46 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   let searchLoad = 0;
   let healthLoad = 0;
   let activityLoad = 0;
+  let focusedEventKey: string | null = null;
+  let transcriptAwayFromLatest = false;
+  let renderedEventKey: string | null = null;
+  let drawerResizeObserver: ResizeObserver | null = null;
 
-  const paintAttention = (): void => {
-    inspector.setActivityAttention(
-      activityAttentionLabel(
-        unreadIncidentCount(state.peerHealth),
-        pendingHandoffCount(state.peerActivity),
-      ),
-    );
+  const compactDrawerQuery =
+    typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 53em)") : null;
+  const preferredDrawerLayout = (): Exclude<DrawerLayout, "closed"> => {
+    const width = root.getBoundingClientRect().width;
+    const fontSize = Number.parseFloat(window.getComputedStyle(root).fontSize);
+    if (width > 0 && Number.isFinite(fontSize) && fontSize > 0) {
+      return width <= 53 * fontSize ? "compact" : "wide";
+    }
+    return compactDrawerQuery?.matches === true ? "compact" : "wide";
   };
+  const resolveTranscriptEvent = (eventKey: string): HTMLElement | null =>
+    Array.from(transcript.list.querySelectorAll<HTMLElement>("[data-event-key]")).find(
+      (node) => node.dataset.eventKey === eventKey,
+    ) ?? null;
+  const drawerController = buildStudioDrawerController({
+    nodes: drawer,
+    background: [header.region, loadError, transcriptColumn],
+    resolveEventFocus: resolveTranscriptEvent,
+    utilitiesButton: header.utilities.button,
+    transcriptFallback: transcript.scrollport,
+  });
 
   const paintChrome = (): void => {
     const bannerText = degradedBanner(state.status);
-    banner.hidden = bannerText == null;
-    setText(banner, bannerText ?? "");
-    setText(sourceLine, state.status ? formatSourceLine(state.status) : "Connecting\u2026");
-    setText(
-      healthLine,
-      state.status ? formatRuntimeHealth(state.status) : "Tray unknown. Underlay unknown",
+    const unread = unreadIncidentCount(state.peerHealth);
+    const pending = pendingHandoffCount(state.peerActivity);
+    header.paint({
+      status: state.status ? formatSourceLine(state.status) : "Connecting\u2026",
+      banner: bannerText,
+      unreadCount: unread,
+      pendingCount: pending,
+    });
+    header.utilities.button.setAttribute(
+      "aria-label",
+      utilityAttentionLabel(unread, pending),
     );
     setText(
       inspector.diagnostics,
@@ -283,73 +321,70 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       state.settings.desktopMode !== "interactive" ||
       state.status?.desktopRuntimeState !== "passive-fallback";
     setText(desktopRuntime, desktopRuntimeLabel(state.status));
-    exit.disabled = state.exiting;
+    header.exit.disabled = state.exiting;
     if (!state.settingsDirty) {
       syncSettingsForm();
     }
   };
 
   const paintMiddle = (scroll: "preserve" | "top" = "preserve"): void => {
-    const previousScrollTop = timeline.list.scrollTop;
-    const restoreScroll = (): void => {
-      timeline.list.scrollTop = scroll === "top" ? 0 : previousScrollTop;
-    };
+    const previousScrollTop = transcript.scrollport.scrollTop;
+    const active = document.activeElement;
+    const activeRow =
+      active instanceof HTMLElement && transcript.list.contains(active)
+        ? active.closest<HTMLElement>("[data-event-key]")
+        : null;
+    const restoreFocusKey = activeRow?.dataset.eventKey ?? null;
     const searching = isSearchActive(state.search.query);
-    setText(timeline.title, searching ? "Search results" : "Conversation");
     const paging = searchCanPage(state.search);
-    setText(timeline.previous, searching ? "Previous" : "Load earlier messages");
-    setText(
-      timeline.next,
-      searching ? "Next" : state.conversationResetRequired ? "Reload latest" : "Jump to latest",
-    );
-    timeline.previous.disabled = searching
-      ? !paging.previous || state.search.loading
-      : !state.conversationHasEarlier || state.conversationLoading;
-    timeline.next.disabled = searching
+    const mode: TranscriptMode = searching
+      ? "search"
+      : state.conversationHasNewer || state.conversationResetRequired
+        ? "historical"
+        : "latest";
+    let emptyMessage: string | null = null;
+    if (searching && state.searchHits.length === 0) {
+      emptyMessage = searchSummary(state.search);
+    } else if (state.conversationResetRequired) {
+      emptyMessage = "Conversation history changed. Reload latest to continue safely";
+    } else if (!searching && state.exchanges.length === 0) {
+      emptyMessage = state.conversationLoading ? "Loading conversation\u2026" : "No exchanges yet";
+    }
+    transcript.loadEarlier.textContent = searching
+      ? "More search results"
+      : "Load earlier messages";
+    transcript.loadEarlier.disabled = searching
       ? !paging.next || state.search.loading
-      : (!state.conversationHasNewer && !state.conversationResetRequired) ||
-        state.conversationLoading;
-    setText(timeline.meta, searching ? searchSummary(state.search) : conversationSummary(state));
-    if (searching) {
-      const showEmpty = state.searchHits.length === 0;
-      timeline.empty.hidden = !showEmpty;
-      setText(timeline.empty, showEmpty ? searchSummary(state.search) : "");
-      paintSearchTimeline(timeline.list, state.searchHits, state.selectedEventKey, (hit) => {
-        void selectSearchHit(hit);
-      });
-      restoreScroll();
-      return;
+      : !state.conversationHasEarlier || state.conversationLoading;
+    const showJumpLatest = searching
+      ? true
+      : state.conversationResetRequired ||
+        state.conversationHasNewer ||
+        transcriptAwayFromLatest;
+    transcript.paint({
+      mode,
+      rows: searching ? searchTranscriptRows(state.searchHits) : exchangeTranscriptRows(state.exchanges),
+      selectedEventKey: state.selectedEventKey,
+      focusedEventKey,
+      meta: searching ? searchSummary(state.search) : conversationSummary(state),
+      emptyMessage,
+      hasEarlier: searching ? paging.next : state.conversationHasEarlier,
+      showJumpLatest,
+      jumpLatestLabel: searching
+        ? "Back to conversation"
+        : state.conversationResetRequired
+          ? "Reload latest"
+          : "Jump to latest",
+    });
+    if (scroll === "top") {
+      transcript.scrollport.scrollTop = 0;
+    } else if (transcript.scrollport.scrollTop !== previousScrollTop) {
+      transcript.scrollport.scrollTop = previousScrollTop;
     }
-    if (state.conversationResetRequired) {
-      timeline.empty.hidden = false;
-      setText(timeline.empty, "Conversation history changed. Reload latest to continue safely");
-      paintExchangeTimeline(timeline.list, state.exchanges, state.selectedEventKey, (exchange, eventKey) => {
-        void selectExchangeMessage(exchange, eventKey);
-      });
-      restoreScroll();
-      return;
+    if (restoreFocusKey) {
+      resolveTranscriptEvent(restoreFocusKey)?.focus();
     }
-    if (state.exchanges.length === 0) {
-      timeline.empty.hidden = false;
-      setText(
-        timeline.empty,
-        state.conversationLoading ? "Loading conversation\u2026" : "No exchanges yet",
-      );
-      paintExchangeTimeline(timeline.list, [], state.selectedEventKey, () => undefined);
-      restoreScroll();
-      return;
-    }
-    timeline.empty.hidden = true;
-    setText(timeline.empty, "");
-    paintExchangeTimeline(
-      timeline.list,
-      state.exchanges,
-      state.selectedEventKey,
-      (exchange, eventKey) => {
-        void selectExchangeMessage(exchange, eventKey);
-      },
-    );
-    restoreScroll();
+    evaluateContinuationReceipt();
   };
 
   const paintPeerHealth = (): void => {
@@ -367,7 +402,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
         void acknowledgeIncident(incidentId);
       },
     );
-    paintAttention();
+    paintChrome();
   };
 
   const paintPeerActivity = (): void => {
@@ -379,35 +414,42 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
         loading: state.peerActivityLoading,
       }),
     );
-    paintAttention();
+    paintChrome();
   };
 
   const paintEvent = (): void => {
+    if (drawerController.selected() != null && drawerController.selected() !== "event") {
+      return;
+    }
+    drawer.utilityHost.hidden = true;
+    drawer.exactBody.hidden = false;
     if (state.eventLoading) {
-      setText(inspector.eventEmpty, "Loading exact event content\u2026");
-      inspector.eventEmpty.hidden = false;
-      inspector.eventMeta.replaceChildren();
-      setText(inspector.eventBody, "");
+      setText(drawer.exactBody, "Loading exact event content\u2026");
+      drawer.technicalDetails.hidden = true;
+      drawer.technicalContent.replaceChildren();
       return;
     }
     if (state.eventError) {
-      setText(inspector.eventEmpty, state.eventError);
-      inspector.eventEmpty.hidden = false;
-      inspector.eventMeta.replaceChildren();
-      setText(inspector.eventBody, "");
+      setText(drawer.exactBody, state.eventError);
+      drawer.technicalDetails.hidden = true;
+      drawer.technicalContent.replaceChildren();
       return;
     }
     if (!state.event) {
-      setText(inspector.eventEmpty, "Select a request, completion, or search hit");
-      inspector.eventEmpty.hidden = false;
-      inspector.eventMeta.replaceChildren();
-      setText(inspector.eventBody, "");
+      setText(drawer.exactBody, "Select a request, completion, or search hit");
+      drawer.technicalDetails.hidden = true;
+      drawer.technicalContent.replaceChildren();
       return;
     }
-    inspector.eventEmpty.hidden = true;
-    setText(inspector.eventEmpty, "");
-    renderEventMeta(inspector.eventMeta, state.event);
-    setText(inspector.eventBody, exactEventBody(state.event));
+    if (renderedEventKey !== state.event.eventKey) {
+      renderedEventKey = state.event.eventKey;
+      drawer.technicalDetails.open = false;
+    }
+    setText(drawer.exactBody, exactEventBody(state.event));
+    drawer.technicalDetails.hidden = false;
+    const metadata = el("dl", { className: "studio-event-meta" });
+    renderEventMeta(metadata, state.event);
+    drawer.technicalContent.replaceChildren(metadata);
   };
 
   const paint = (): void => {
@@ -416,6 +458,67 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     paintPeerHealth();
     paintMiddle();
     paintEvent();
+  };
+
+  const currentTranscriptMode = (): TranscriptMode =>
+    isSearchActive(state.search.query)
+      ? "search"
+      : state.conversationHasNewer || state.conversationResetRequired
+        ? "historical"
+        : "latest";
+
+  const showEventDrawer = (eventKey: string): void => {
+    for (const utility of ["activity", "sources", "settings"] satisfies UtilityId[]) {
+      inspector.panels[utility].hidden = true;
+    }
+    drawer.utilityHost.hidden = true;
+    drawer.exactBody.hidden = false;
+    drawer.technicalDetails.hidden = false;
+    drawer.region.dataset.eventKey = eventKey;
+    setText(drawer.heading, "Exact event evidence");
+    drawerController.open("event", preferredDrawerLayout(), { kind: "event", eventKey });
+    paintEvent();
+    evaluateContinuationReceipt();
+  };
+
+  const showUtilityDrawer = (utility: UtilityId): void => {
+    drawer.region.removeAttribute("data-event-key");
+    drawer.exactBody.hidden = true;
+    drawer.technicalDetails.hidden = true;
+    drawer.utilityHost.hidden = false;
+    for (const candidate of ["activity", "sources", "settings"] satisfies UtilityId[]) {
+      inspector.panels[candidate].hidden = candidate !== utility;
+    }
+    setText(drawer.heading, utilityHeading(utility));
+    drawerController.open(utility, preferredDrawerLayout(), { kind: "utilities" });
+  };
+  openUtility = showUtilityDrawer;
+
+  evaluateContinuationReceipt = (): void => {
+    const candidate = continuation.receiptCandidate();
+    if (!candidate) {
+      return;
+    }
+    const matchingEventKey = resolveContinuationReceiptEventKey(state.exchanges, candidate);
+    const exactModalReady =
+      matchingEventKey != null &&
+      !state.eventLoading &&
+      state.eventError == null &&
+      state.event?.eventKey === matchingEventKey;
+    const modalEventKey = exactModalReady ? drawerController.modalEventKey() : null;
+    const row = matchingEventKey ? resolveTranscriptEvent(matchingEventKey) : null;
+    if (
+      isContinuationReceiptPresented({
+        mode: currentTranscriptMode(),
+        documentVisible: document.visibilityState === "visible",
+        matchingEventKey,
+        modalEventKey,
+        row,
+        scrollport: transcript.scrollport,
+      })
+    ) {
+      continuation.recordVisibleReceipt(candidate);
+    }
   };
 
   const syncSettingsForm = (): void => {
@@ -450,7 +553,9 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     state.selectedEventKey = null;
     state.search = createSearchState();
     state.searchHits = [];
-    timeline.input.value = "";
+    transcript.searchInput.value = "";
+    focusedEventKey = null;
+    transcriptAwayFromLatest = false;
     state.event = null;
     state.eventLoading = false;
     state.eventError = null;
@@ -635,21 +740,6 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     state.eventError = null;
   };
 
-  const revealEvent = (): void => {
-    const active = document.activeElement;
-    const insideActivity = active instanceof Node && inspector.panels.activity.contains(active);
-    inspector.activate("event");
-    if (!insideActivity || isFocusLocked(active)) {
-      return;
-    }
-    const selected = timeline.list.querySelector<HTMLElement>('[aria-pressed="true"], [aria-selected="true"]');
-    if (selected) {
-      selected.focus();
-      return;
-    }
-    inspector.eventBody.focus();
-  };
-
   const openLatestHandoff = async (): Promise<void> => {
     if (state.peerHealthBusy) {
       return;
@@ -668,7 +758,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       );
       state.search = createSearchState();
       state.searchHits = [];
-      timeline.input.value = "";
+      transcript.searchInput.value = "";
       if (state.selectedExchangeKey && !exchangeVisible) {
         await loadConversation("around", state.selectedExchangeKey);
       }
@@ -683,8 +773,8 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
         paintPeerHealth();
         paintEvent();
         paintMiddle();
-        if (state.peerHealthError == null) {
-          revealEvent();
+        if (state.peerHealthError == null && state.selectedEventKey) {
+          showEventDrawer(state.selectedEventKey);
         }
       }
     }
@@ -719,7 +809,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     state.selectedEventKey = eventKey;
     state.eventLoading = true;
     state.eventError = null;
-    inspector.activate("event");
+    showEventDrawer(eventKey);
     paintEvent();
     paintMiddle();
     try {
@@ -731,6 +821,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       state.eventLoading = false;
       state.eventError = content ? null : "Event content is unavailable";
       paintEvent();
+      evaluateContinuationReceipt();
       return content;
     } catch {
       if (!alive || state.selectedEventKey !== eventKey) {
@@ -741,6 +832,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       state.eventError = loadErrorLabel("load event content");
     }
     paintEvent();
+    evaluateContinuationReceipt();
     return null;
   };
 
@@ -755,28 +847,13 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     state.selectedExchangeKey = content.exchangeKey;
     state.search = createSearchState();
     state.searchHits = [];
-    timeline.input.value = "";
+    transcript.searchInput.value = "";
     if (needsConversationLoad) {
       await loadConversation("around", content.exchangeKey);
     }
     if (alive && state.selectedEventKey === eventKey) {
       paint();
     }
-  };
-
-  const selectExchangeMessage = async (
-    exchange: ExchangeSummary,
-    eventKey: string,
-  ): Promise<void> => {
-    state.selectedExchangeKey = exchange.exchangeKey;
-    await loadEvent(eventKey);
-    paint();
-  };
-
-  const selectSearchHit = async (hit: SearchHit): Promise<void> => {
-    state.selectedExchangeKey = hit.exchangeKey;
-    await loadEvent(hit.eventKey);
-    paint();
   };
 
   const applyStatus = async (
@@ -853,9 +930,8 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     paint();
   };
 
-  timeline.form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const next = submitSearch(state.search, timeline.input.value);
+  handleSearch = (query): void => {
+    const next = submitSearch(state.search, query);
     state.search = next;
     state.searchHits = [];
     if (!isSearchActive(next.query)) {
@@ -879,21 +955,9 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
         paintMiddle();
       }
     });
-  });
+  };
 
-  timeline.previous.addEventListener("click", () => {
-    if (isSearchActive(state.search.query)) {
-      const next = requestPreviousPage(state.search.paging);
-      if (!next) {
-        return;
-      }
-      state.search.paging = next;
-      void loadSearch().then(() => alive && paintMiddle());
-      return;
-    }
-    void loadConversation("earlier").then(() => alive && paintMiddle());
-  });
-  timeline.next.addEventListener("click", () => {
+  handleLoadEarlier = (): void => {
     if (isSearchActive(state.search.query)) {
       const next = requestNextPage(state.search.paging);
       if (!next) {
@@ -903,8 +967,63 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       void loadSearch().then(() => alive && paintMiddle());
       return;
     }
-    void loadConversation("latest").then(() => alive && paintMiddle("top"));
-  });
+    void loadConversation("earlier").then(() => alive && paintMiddle());
+  };
+
+  handleJumpLatest = (): void => {
+    state.search = createSearchState();
+    state.searchHits = [];
+    transcript.searchInput.value = "";
+    transcriptAwayFromLatest = false;
+    if (
+      state.conversationHasNewer ||
+      state.conversationResetRequired ||
+      currentTranscriptMode() !== "latest"
+    ) {
+      void loadConversation("latest").then(() => alive && paintMiddle("top"));
+      return;
+    }
+    paintMiddle("top");
+  };
+
+  handleTranscriptFocus = (eventKey): void => {
+    focusedEventKey = eventKey;
+  };
+
+  handleTranscriptActivate = (eventKey, exchangeKey): void => {
+    focusedEventKey = eventKey;
+    state.selectedEventKey = eventKey;
+    state.selectedExchangeKey = exchangeKey;
+    void loadEvent(eventKey).then(() => {
+      if (alive) {
+        paintMiddle();
+      }
+    });
+  };
+
+  const onTranscriptScroll = (): void => {
+    if (currentTranscriptMode() === "latest") {
+      const away = transcript.scrollport.scrollTop > 24;
+      if (away !== transcriptAwayFromLatest) {
+        transcriptAwayFromLatest = away;
+        transcript.jumpLatest.hidden = !away;
+        setText(transcript.jumpLatest, "Jump to latest");
+      }
+    }
+    evaluateContinuationReceipt();
+  };
+  const onVisibilityChange = (): void => evaluateContinuationReceipt();
+  const onDrawerBreakpointChange = (): void => {
+    drawerController.syncLayout(preferredDrawerLayout());
+    evaluateContinuationReceipt();
+  };
+  transcript.scrollport.addEventListener("scroll", onTranscriptScroll);
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  compactDrawerQuery?.addEventListener("change", onDrawerBreakpointChange);
+  if (typeof ResizeObserver === "function") {
+    drawerResizeObserver = new ResizeObserver(onDrawerBreakpointChange);
+    drawerResizeObserver.observe(root);
+  }
 
   inspector.selectLog.addEventListener("click", () => {
     if (state.selectingLog) {
@@ -1037,7 +1156,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       });
   });
 
-  exit.addEventListener("click", () => {
+  requestExit = (): void => {
     if (state.exiting) {
       return;
     }
@@ -1051,7 +1170,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       state.loadError = loadErrorLabel("exit");
       paintChrome();
     });
-  });
+  };
 
   peerHealth.muted.addEventListener("change", () => {
     if (state.peerHealthBusy) {
@@ -1198,10 +1317,37 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     healthPoller.stop();
     activityPoller.stop();
     continuation.stop();
+    drawerController.stop();
+    transcript.scrollport.removeEventListener("scroll", onTranscriptScroll);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    compactDrawerQuery?.removeEventListener("change", onDrawerBreakpointChange);
+    drawerResizeObserver?.disconnect();
+    drawerResizeObserver = null;
     window.removeEventListener("pagehide", stop);
   };
   window.addEventListener("pagehide", stop);
   return { stop };
+}
+
+function utilityAttentionLabel(unread: number, pending: number): string {
+  const parts: string[] = [];
+  if (unread > 0) {
+    parts.push(`${Math.trunc(unread)} unread`);
+  }
+  if (pending > 0) {
+    parts.push(`${Math.trunc(pending)} pending`);
+  }
+  return parts.length > 0 ? `Utilities, ${parts.join(", ")}` : "Utilities";
+}
+
+function utilityHeading(utility: UtilityId): string {
+  if (utility === "activity") {
+    return "Activity";
+  }
+  if (utility === "sources") {
+    return "Sources";
+  }
+  return "Settings";
 }
 
 function conversationSummary(state: DetailState): string {

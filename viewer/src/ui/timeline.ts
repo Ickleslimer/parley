@@ -5,6 +5,7 @@ import { el } from "./dom";
 import { presentExchange, searchHitHeading, type PresentedMessage } from "./excerpt";
 import { formatTimestamp } from "./format";
 import { LANDMARKS } from "./landmarks";
+import type { TranscriptRowModel } from "./studio-seam";
 
 export type TimelineSide = "request" | "completion";
 
@@ -59,6 +60,76 @@ export function exchangeStops(exchanges: readonly ExchangeSummary[]): TimelineSt
     }
   }
   return stops;
+}
+
+export function exchangeTranscriptRows(
+  exchanges: readonly ExchangeSummary[],
+): TranscriptRowModel[] {
+  const rows: TranscriptRowModel[] = [];
+  for (const exchange of exchanges) {
+    const presented = presentExchange(exchange);
+    if (presented.request && exchange.request) {
+      rows.push({
+        kind: "message",
+        exchangeKey: exchange.exchangeKey,
+        eventKey: presented.request.eventKey,
+        side: "request",
+        speaker: presented.request.speaker,
+        recipient: presented.request.recipient,
+        roleLabel: presented.request.heading,
+        timestampMs: exchange.request.timestampMs,
+        timeLabel: presented.request.timestamp,
+        excerpt: presented.request.excerpt,
+        pending: false,
+      });
+    }
+    if (presented.completion && exchange.completion) {
+      rows.push({
+        kind: "message",
+        exchangeKey: exchange.exchangeKey,
+        eventKey: presented.completion.eventKey,
+        side: "completion",
+        speaker: presented.completion.speaker,
+        recipient: presented.completion.recipient,
+        roleLabel: presented.completion.heading,
+        timestampMs: exchange.completion.timestampMs,
+        timeLabel: presented.completion.timestamp,
+        excerpt: presented.completion.excerpt,
+        pending: false,
+      });
+    } else if (presented.pendingLabel) {
+      rows.push({
+        kind: "pending",
+        exchangeKey: exchange.exchangeKey,
+        eventKey: null,
+        side: null,
+        speaker: presented.request?.recipient ?? null,
+        recipient: presented.request?.speaker ?? null,
+        roleLabel: "Pending",
+        timestampMs: exchange.timestampMs,
+        timeLabel: formatTimestamp(exchange.timestampMs),
+        excerpt: presented.pendingLabel,
+        pending: true,
+      });
+    }
+  }
+  return rows;
+}
+
+export function searchTranscriptRows(hits: readonly SearchHit[]): TranscriptRowModel[] {
+  return hits.map((hit) => ({
+    kind: "search",
+    exchangeKey: hit.exchangeKey,
+    eventKey: hit.eventKey,
+    side: hit.eventType === "request" ? "request" : "completion",
+    speaker: null,
+    recipient: null,
+    roleLabel: searchHitHeading(hit.eventType),
+    timestampMs: hit.timestampMs,
+    timeLabel: formatTimestamp(hit.timestampMs),
+    excerpt: hit.excerpt,
+    pending: false,
+  }));
 }
 
 export function moveTimelineStop(

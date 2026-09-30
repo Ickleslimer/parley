@@ -49,6 +49,7 @@ export const REQUIRED_FIXTURES: readonly FixtureRequest[] = [
   { surface: "widget-surface", scenario: "live", width: 720, height: 560, textScale: 2, reducedMotion: false },
   { surface: "widget-surface", scenario: "live", width: 480, height: 420, textScale: 1, reducedMotion: false },
   { surface: "widget-surface", scenario: "live", width: 960, height: 720, textScale: 1, reducedMotion: false },
+  { surface: "detail", scenario: "short-exchange", width: 1120, height: 760, textScale: 1, reducedMotion: false },
   { surface: "detail", scenario: "short-exchange", width: 1120, height: 760, textScale: 1, reducedMotion: false, inspectorTab: "event" },
   { surface: "detail", scenario: "short-exchange", width: 840, height: 560, textScale: 1, reducedMotion: false, inspectorTab: "activity" },
   { surface: "detail", scenario: "search-results", width: 1120, height: 760, textScale: 1, reducedMotion: false, inspectorTab: "sources" },

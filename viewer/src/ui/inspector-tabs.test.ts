@@ -1,7 +1,7 @@
 /**
  * @vitest-environment happy-dom
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import type { PeerActivitySnapshot, PeerHealthSnapshot, PeerHandoffItem, PeerIncident } from "../contracts";
 import { DEFAULT_PEER_HEALTH_DIAGNOSTICS } from "../contracts";
@@ -9,9 +9,15 @@ import { DEFAULT_PEER_HEALTH_DIAGNOSTICS } from "../contracts";
 import {
   activityAttentionLabel,
   buildInspector,
+  buildStudioDrawerController,
   pendingHandoffCount,
   unreadIncidentCount,
 } from "./inspector-tabs";
+import type { StudioDrawerNodes } from "./studio-seam";
+
+afterEach(() => {
+  document.body.replaceChildren();
+});
 
 const incident = (overrides: Partial<PeerIncident> = {}): PeerIncident => ({
   incidentId: "incident-1",
@@ -134,3 +140,98 @@ describe("manual inspector tabs", () => {
     expect(inspector.panels.sources.hidden).toBe(false);
   });
 });
+
+describe("studio drawer controller", () => {
+  it("makes compact evidence modal, traps focus, and restores the exact row", () => {
+    const nodes = drawerNodes();
+    const background = document.createElement("main");
+    const transcript = document.createElement("div");
+    transcript.tabIndex = -1;
+    const utilities = document.createElement("button");
+    const row = document.createElement("button");
+    row.dataset.eventKey = "event-a";
+    const action = document.createElement("button");
+    nodes.region.append(action);
+    document.body.append(background, transcript, utilities, row, nodes.region);
+    nodes.region.dataset.eventKey = "event-a";
+
+    const controller = buildStudioDrawerController({
+      nodes,
+      background: [background],
+      resolveEventFocus: (eventKey) =>
+        eventKey === row.dataset.eventKey ? row : null,
+      utilitiesButton: utilities,
+      transcriptFallback: transcript,
+    });
+    controller.open("event", "compact", { kind: "event", eventKey: "event-a" });
+
+    expect(nodes.region.hidden).toBe(false);
+    expect(nodes.region.getAttribute("role")).toBe("dialog");
+    expect(nodes.region.getAttribute("aria-modal")).toBe("true");
+    expect(background.hasAttribute("inert")).toBe(true);
+    expect(document.activeElement).toBe(nodes.close);
+    expect(controller.modalEventKey()).toBe("event-a");
+
+    action.focus();
+    action.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+    expect(document.activeElement).toBe(nodes.close);
+
+    nodes.close.click();
+    expect(nodes.region.hidden).toBe(true);
+    expect(background.hasAttribute("inert")).toBe(false);
+    expect(document.activeElement).toBe(row);
+    expect(controller.modalEventKey()).toBeNull();
+    controller.stop();
+  });
+
+  it("keeps wide utilities in flow and restores the Utilities control", () => {
+    const nodes = drawerNodes();
+    const background = document.createElement("main");
+    const transcript = document.createElement("div");
+    transcript.tabIndex = -1;
+    const utilities = document.createElement("button");
+    document.body.append(background, transcript, utilities, nodes.region);
+    const controller = buildStudioDrawerController({
+      nodes,
+      background: [background],
+      resolveEventFocus: () => null,
+      utilitiesButton: utilities,
+      transcriptFallback: transcript,
+    });
+
+    controller.open("settings", "wide", { kind: "utilities" });
+    expect(nodes.region.getAttribute("role")).toBe("complementary");
+    expect(nodes.region.hasAttribute("aria-modal")).toBe(false);
+    expect(background.hasAttribute("inert")).toBe(false);
+    controller.syncLayout("compact");
+    expect(background.hasAttribute("inert")).toBe(true);
+    controller.close();
+    expect(document.activeElement).toBe(utilities);
+    controller.stop();
+  });
+});
+
+function drawerNodes(): StudioDrawerNodes {
+  const region = document.createElement("aside");
+  const heading = document.createElement("h2");
+  const close = document.createElement("button");
+  close.textContent = "Close";
+  const exactBody = document.createElement("pre");
+  const technicalDetails = document.createElement("details");
+  const technicalContent = document.createElement("div");
+  technicalDetails.append(technicalContent);
+  const utilityHost = document.createElement("div");
+  region.append(heading, close, exactBody, technicalDetails, utilityHost);
+  return {
+    region,
+    heading,
+    close,
+    exactBody,
+    technicalDetails,
+    technicalContent,
+    utilityHost,
+    setLayoutClass: (layout) => {
+      region.dataset.layout = layout;
+    },
+  };
+}

@@ -4,6 +4,7 @@ import { isIncidentClass } from "../contracts";
 import { el, labelledControl } from "./dom";
 import { isFocusLocked, isTimelineKey, type TimelineKey } from "./timeline";
 import { LANDMARKS } from "./landmarks";
+import type { DrawerContent, DrawerLayout, StudioDrawerNodes } from "./studio-seam";
 
 export const STUDIO_TABS = ["event", "activity", "sources", "settings"] as const;
 export type StudioTab = (typeof STUDIO_TABS)[number];
@@ -85,6 +86,158 @@ export interface InspectorNodes {
   settingsForm: HTMLFormElement;
   widgetVisible: HTMLInputElement;
   launchAtLogin: HTMLInputElement;
+}
+
+export type DrawerRestoreTarget =
+  | { kind: "event"; eventKey: string }
+  | { kind: "utilities" }
+  | { kind: "transcript" };
+
+export interface StudioDrawerController {
+  open: (
+    content: DrawerContent,
+    layout: Exclude<DrawerLayout, "closed">,
+    restore: DrawerRestoreTarget,
+  ) => void;
+  close: () => void;
+  syncLayout: (layout: Exclude<DrawerLayout, "closed">) => void;
+  selected: () => DrawerContent | null;
+  modalEventKey: () => string | null;
+  stop: () => void;
+}
+
+export interface StudioDrawerControllerOptions {
+  nodes: StudioDrawerNodes;
+  background: readonly HTMLElement[];
+  resolveEventFocus: (eventKey: string) => HTMLElement | null;
+  utilitiesButton: HTMLElement;
+  transcriptFallback: HTMLElement;
+}
+
+export function buildStudioDrawerController(
+  options: StudioDrawerControllerOptions,
+): StudioDrawerController {
+  let content: DrawerContent | null = null;
+  let layout: DrawerLayout = "closed";
+  let restore: DrawerRestoreTarget = { kind: "transcript" };
+
+  const setBackgroundInert = (inert: boolean): void => {
+    for (const element of options.background) {
+      element.toggleAttribute("inert", inert);
+    }
+  };
+
+  const applyLayout = (next: DrawerLayout): void => {
+    layout = next;
+    options.nodes.setLayoutClass(next);
+    const compact = next === "compact";
+    setBackgroundInert(compact);
+    if (compact) {
+      options.nodes.region.setAttribute("role", "dialog");
+      options.nodes.region.setAttribute("aria-modal", "true");
+    } else {
+      options.nodes.region.setAttribute("role", "complementary");
+      options.nodes.region.removeAttribute("aria-modal");
+    }
+  };
+
+  const restoreFocus = (): void => {
+    if (restore.kind === "event") {
+      const event = options.resolveEventFocus(restore.eventKey);
+      if (event?.isConnected) {
+        event.focus();
+        return;
+      }
+    } else if (restore.kind === "utilities" && options.utilitiesButton.isConnected) {
+      options.utilitiesButton.focus();
+      return;
+    }
+    options.transcriptFallback.focus();
+  };
+
+  const close = (): void => {
+    if (content == null) {
+      return;
+    }
+    content = null;
+    options.nodes.region.hidden = true;
+    applyLayout("closed");
+    restoreFocus();
+  };
+
+  const open = (
+    nextContent: DrawerContent,
+    nextLayout: Exclude<DrawerLayout, "closed">,
+    nextRestore: DrawerRestoreTarget,
+  ): void => {
+    content = nextContent;
+    restore = nextRestore;
+    options.nodes.region.hidden = false;
+    applyLayout(nextLayout);
+    if (nextLayout === "compact") {
+      options.nodes.close.focus();
+    }
+  };
+
+  const syncLayout = (next: Exclude<DrawerLayout, "closed">): void => {
+    if (content == null || layout === next) {
+      return;
+    }
+    applyLayout(next);
+    if (next === "compact" && !options.nodes.region.contains(document.activeElement)) {
+      options.nodes.close.focus();
+    }
+  };
+
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (content == null) {
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+      return;
+    }
+    if (layout !== "compact" || event.key !== "Tab") {
+      return;
+    }
+    const focusable = focusableElements(options.nodes.region);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      options.nodes.close.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last?.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first?.focus();
+    }
+  };
+
+  options.nodes.close.addEventListener("click", close);
+  options.nodes.region.addEventListener("keydown", onKeyDown);
+  options.nodes.region.hidden = true;
+  applyLayout("closed");
+
+  return {
+    open,
+    close,
+    syncLayout,
+    selected: () => content,
+    modalEventKey: () =>
+      layout === "compact" && content === "event"
+        ? (options.nodes.region.dataset.eventKey ?? null)
+        : null,
+    stop: () => {
+      setBackgroundInert(false);
+      options.nodes.close.removeEventListener("click", close);
+      options.nodes.region.removeEventListener("keydown", onKeyDown);
+    },
+  };
 }
 
 export function buildInspector(): InspectorNodes {
@@ -320,6 +473,24 @@ function moveTab(current: StudioTab, key: TimelineKey): StudioTab {
 function numberInput(id: string, label: string): HTMLInputElement {
   return el("input", {
     attrs: { id, type: "number", "aria-label": label },
+  });
+}
+
+function focusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), details > summary, [href], [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter((element) => {
+    if (
+      element.hidden ||
+      element.closest("[hidden]") != null ||
+      element.closest('[aria-hidden="true"]') != null
+    ) {
+      return false;
+    }
+    const closedDetails = element.closest<HTMLDetailsElement>("details:not([open])");
+    return closedDetails == null || element.tagName === "SUMMARY";
   });
 }
 

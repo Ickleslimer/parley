@@ -237,6 +237,34 @@ function continuationStatus(overrides: Partial<ContinuationStatus> = {}): Contin
   };
 }
 
+function completedContinuation(completionEventId = "completion-id"): ContinuationStatus {
+  return continuationStatus({
+    state: "completed",
+    manifestId: "manifest-1",
+    worktreeName: "synthetic-worktree",
+    writablePaths: ["viewer/src/ui"],
+    continuationCount: 1,
+    latest: {
+      schemaVersion: 1,
+      continuationId: "123e4567-e89b-12d3-a456-426614174000",
+      manifestId: "manifest-1",
+      state: "completed",
+      prompt: "Private duplicate prompt",
+      reply: "Private duplicate reply",
+      error: null,
+      exchangeId: "exchange-1",
+      requestEventId: "request-id",
+      completionEventId,
+      changedPaths: ["viewer/src/ui/detail.ts"],
+      validationState: "not_executed",
+      diffFingerprint: "diff-fingerprint",
+      evidenceHash: "evidence-hash",
+      completedAtMs: 1_700_000_000_500,
+      userReceived: false,
+    },
+  });
+}
+
 function content(eventKey: string): EventContent {
   const secondSession = eventKey.includes("session-2");
   return {
@@ -265,7 +293,11 @@ function content(eventKey: string): EventContent {
 
 function createApi(
   statusOverrides: Partial<ViewerStatus> = {},
-  options: { pagedConversation?: boolean } = {},
+  options: {
+    pagedConversation?: boolean;
+    continuation?: ContinuationStatus;
+    conversation?: ExchangeSummary[];
+  } = {},
 ) {
   const calls = {
     acknowledge: [] as string[],
@@ -280,6 +312,7 @@ function createApi(
     launchAtLogin: [] as boolean[],
     savedSettings: [] as ViewerSettings[],
     retryInteractive: 0,
+    receive: [] as Array<{ continuationId: string; evidenceHash: string }>,
     conversation: [] as Array<{
       beforeExchangeKey: string | null;
       aroundExchangeKey: string | null;
@@ -287,7 +320,8 @@ function createApi(
   };
   let bytesRead = 100;
   let currentHealth = health(1);
-  const conversation = [
+  let currentContinuation = options.continuation ?? continuationStatus();
+  const conversation = options.conversation ?? [
     exchange({ sessionKey: "session:1" }),
     exchange({
       exchangeKey: "exchange:2",
@@ -400,13 +434,22 @@ function createApi(
       return selection;
     },
     getPeerActivity: async () => activity(),
-    getContinuationStatus: async () => continuationStatus(),
+    getContinuationStatus: async () => currentContinuation,
     submitContinuation: async () => ({
       continuationId: "123e4567-e89b-12d3-a456-426614174000",
       state: "completed",
     }),
-    cancelContinuation: async () => continuationStatus(),
-    receiveContinuation: async () => continuationStatus(),
+    cancelContinuation: async () => currentContinuation,
+    receiveContinuation: async (continuationId, evidenceHash) => {
+      calls.receive.push({ continuationId, evidenceHash });
+      if (currentContinuation.latest?.continuationId === continuationId) {
+        currentContinuation = {
+          ...currentContinuation,
+          latest: { ...currentContinuation.latest, userReceived: true },
+        };
+      }
+      return currentContinuation;
+    },
     getSettings: async () => ({ ...DEFAULT_SETTINGS }),
     saveSettings: async (settings) => {
       calls.savedSettings.push(settings);
@@ -469,6 +512,11 @@ async function settle(): Promise<void> {
   await vi.advanceTimersByTimeAsync(0);
 }
 
+function chooseUtility(root: HTMLElement, utility: "activity" | "sources" | "settings"): void {
+  root.querySelector<HTMLButtonElement>('[data-region="studio-utilities"]')?.click();
+  root.querySelector<HTMLButtonElement>(`[role="menuitem"][data-utility="${utility}"]`)?.click();
+}
+
 describe("conversation studio detail", () => {
   let stop: (() => void) | null = null;
 
@@ -478,11 +526,13 @@ describe("conversation studio detail", () => {
     tauriEvents.handlers.clear();
     tauriEvents.listen.mockClear();
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+    Reflect.deleteProperty(window, "matchMedia");
+    Reflect.deleteProperty(document, "visibilityState");
     document.body.replaceChildren();
     vi.useRealTimers();
   });
 
-  it("opens the exact widget event in the Event inspector and adopts its exchange", async () => {
+  it("opens the exact widget event in the closed-by-default evidence drawer", async () => {
     vi.useFakeTimers();
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
@@ -507,19 +557,17 @@ describe("conversation studio detail", () => {
       aroundExchangeKey: "exchange:1",
     });
     expect(root.querySelector('[aria-label="Sessions"]')).toBeNull();
-    expect(
-      root
-        .querySelector('[data-event-key="event:request"]')
-        ?.getAttribute("aria-pressed"),
-    ).toBe("true");
-    expect(root.querySelector('[data-region="studio-tab-event"]')?.getAttribute("aria-selected"))
+    expect(root.querySelector('[data-event-key="event:request"]')?.getAttribute("aria-current"))
       .toBe("true");
-    expect(root.querySelector(".event-body")?.textContent).toContain(
-      "Exact request",
-    );
+    const drawer = root.querySelector<HTMLElement>('[data-region="studio-drawer"]');
+    expect(drawer?.hidden).toBe(false);
+    expect(drawer?.getAttribute("role")).toBe("complementary");
+    expect(drawer?.querySelector(".studio-focus-exact")?.textContent).toContain("Exact request");
+    expect(drawer?.querySelector("details")?.hasAttribute("open")).toBe(false);
+    expect(root.querySelector('[role="tablist"]')).toBeNull();
   });
 
-  it("appends earlier exchanges without restoring a session boundary or scroll position", async () => {
+  it("appends earlier exchanges without restoring a session boundary or moving the viewport", async () => {
     vi.useFakeTimers();
     const harness = createApi({}, { pagedConversation: true });
     const root = document.createElement("div");
@@ -527,29 +575,30 @@ describe("conversation studio detail", () => {
     stop = mountDetail(root, harness.api).stop;
     await settle();
 
-    const timeline = root.querySelector<HTMLElement>('[data-region="studio-timeline"]');
-    expect(timeline?.textContent).not.toContain(HOSTILE);
-    const loadEarlier = Array.from(timeline?.querySelectorAll<HTMLButtonElement>("button") ?? []).find(
-      (button) => button.textContent === "Load earlier messages",
-    );
+    const transcript = root.querySelector<HTMLElement>('[data-region="studio-transcript"]');
+    expect(transcript?.textContent).not.toContain(HOSTILE);
+    const loadEarlier = Array.from(transcript?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+      .find((button) => button.textContent === "Load earlier messages");
     expect(loadEarlier?.disabled).toBe(false);
-    const thread = timeline?.querySelector<HTMLElement>('[aria-label="Exchanges"]');
-    expect(thread).not.toBeNull();
-    if (thread) {
-      thread.scrollTop = 73;
+    const scrollport = transcript?.querySelector<HTMLElement>(
+      '[data-region="studio-transcript-scroll"]',
+    );
+    expect(scrollport).not.toBeNull();
+    if (scrollport) {
+      scrollport.scrollTop = 73;
     }
     loadEarlier?.click();
     await settle();
 
-    const text = timeline?.textContent ?? "";
+    const text = transcript?.textContent ?? "";
     expect(text).toContain(HOSTILE);
     expect(text).toContain("Second-session request");
     expect(text.indexOf("Second-session request")).toBeLessThan(text.indexOf(HOSTILE));
-    expect(thread?.scrollTop).toBe(73);
+    expect(scrollport?.scrollTop).toBe(73);
     expect(root.querySelector('[aria-label="Sessions"]')).toBeNull();
   });
 
-  it("renders every session as one escaped newest-first conversation", async () => {
+  it("renders every session as one escaped newest-first transcript without diagnostics", async () => {
     vi.useFakeTimers();
     const harness = createApi();
     const root = document.createElement("div");
@@ -557,23 +606,25 @@ describe("conversation studio detail", () => {
     stop = mountDetail(root, harness.api).stop;
     await settle();
 
-    expect(root.querySelector("img.studio-logo")).not.toBeNull();
-    const timeline = root.querySelector<HTMLElement>('[data-region="studio-timeline"]');
-    expect(timeline?.querySelector("img")).toBeNull();
-    expect(timeline?.textContent).toContain(HOSTILE);
-    expect(timeline?.textContent).toContain("Second-session request");
-    const timelineText = timeline?.textContent ?? "";
-    expect(timelineText.indexOf("Second-session request")).toBeLessThan(timelineText.indexOf(HOSTILE));
-    expect(timelineText.indexOf("Second-session request")).toBeLessThan(
-      timelineText.indexOf("Second-session completion"),
+    const transcript = root.querySelector<HTMLElement>('[data-region="studio-transcript"]');
+    expect(transcript?.querySelector("img")).toBeNull();
+    expect(transcript?.textContent).toContain(HOSTILE);
+    expect(transcript?.textContent).toContain("Second-session request");
+    const transcriptText = transcript?.textContent ?? "";
+    expect(transcriptText.indexOf("Second-session request")).toBeLessThan(
+      transcriptText.indexOf(HOSTILE),
     );
-    expect(timeline?.textContent).not.toContain("alpha");
-    expect(timeline?.textContent).not.toContain("beta");
-    expect(timeline?.textContent).not.toContain("synthetic://events.jsonl");
+    expect(transcriptText.indexOf("Second-session request")).toBeLessThan(
+      transcriptText.indexOf("Second-session completion"),
+    );
+    expect(transcript?.textContent).not.toContain("alpha");
+    expect(transcript?.textContent).not.toContain("beta");
+    expect(transcript?.textContent).not.toContain("synthetic://events.jsonl");
     expect(root.querySelector('[aria-label="Sessions"]')).toBeNull();
+    expect(root.querySelector('[data-region="studio-drawer"]')?.hasAttribute("hidden")).toBe(true);
   });
 
-  it("searches from the timeline, retains focus across a refresh, and does not leave the search field", async () => {
+  it("searches without fetching on focus and retains semantic focus across polling", async () => {
     vi.useFakeTimers();
     const harness = createApi();
     const root = document.createElement("div");
@@ -594,15 +645,18 @@ describe("conversation studio detail", () => {
     firstHit?.focus();
     firstHit?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
     expect(document.activeElement).toBe(secondHit);
+    expect(harness.calls.content).toEqual([]);
 
-    const previousHit = document.activeElement;
     harness.setBytes(240);
     await vi.advanceTimersByTimeAsync(500);
-    expect(previousHit?.isConnected).toBe(false);
     expect(document.activeElement?.getAttribute("data-event-key")).toBe("event:hit-2");
-    expect(root.querySelector('[data-event-key="event:hit-2"]')?.getAttribute("aria-selected")).toBe(
-      "false",
+    expect(harness.calls.content).toEqual([]);
+
+    document.activeElement?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
     );
+    await settle();
+    expect(harness.calls.content).toEqual(["event:hit-2"]);
 
     const search = root.querySelector<HTMLInputElement>('input[type="search"]');
     search?.focus();
@@ -611,7 +665,7 @@ describe("conversation studio detail", () => {
     expect(document.activeElement).toBe(search);
   });
 
-  it("keeps activity counts from selecting a tab and still calls the existing helper actions", async () => {
+  it("keeps utility counts quiet until explicitly opened and preserves helper actions", async () => {
     vi.useFakeTimers();
     const harness = createApi();
     const root = document.createElement("div");
@@ -619,10 +673,10 @@ describe("conversation studio detail", () => {
     stop = mountDetail(root, harness.api).stop;
     await settle();
 
-    const eventTab = root.querySelector<HTMLButtonElement>('[data-region="studio-tab-event"]');
-    const activityTab = root.querySelector<HTMLButtonElement>('[data-region="studio-tab-activity"]');
-    expect(eventTab?.getAttribute("aria-selected")).toBe("true");
-    expect(activityTab?.textContent).toContain("1 unread, 1 pending");
+    const utilities = root.querySelector<HTMLButtonElement>('[data-region="studio-utilities"]');
+    const drawer = root.querySelector<HTMLElement>('[data-region="studio-drawer"]');
+    expect(utilities?.getAttribute("aria-label")).toBe("Utilities, 1 unread, 1 pending");
+    expect(drawer?.hidden).toBe(true);
 
     harness.setHealth({
       ...health(1),
@@ -630,15 +684,16 @@ describe("conversation studio detail", () => {
       activeIncidents: [incident(), { ...incident(), incidentId: "incident-2" }],
     });
     await vi.advanceTimersByTimeAsync(500);
-    expect(eventTab?.getAttribute("aria-selected")).toBe("true");
-    expect(activityTab?.textContent).toContain("2 unread, 1 pending");
+    expect(utilities?.getAttribute("aria-label")).toBe("Utilities, 2 unread, 1 pending");
+    expect(drawer?.hidden).toBe(true);
 
-    activityTab?.click();
-    expect(activityTab?.getAttribute("aria-selected")).toBe("true");
+    chooseUtility(root, "activity");
+    await Promise.resolve();
+    expect(drawer?.hidden).toBe(false);
+    expect(drawer?.querySelector("h2")?.textContent).toBe("Activity");
     root.querySelector<HTMLButtonElement>(".peer-health-ack")?.click();
     await settle();
     expect(harness.calls.acknowledge).toEqual(["incident-1"]);
-    expect(activityTab?.getAttribute("aria-selected")).toBe("true");
 
     const mute = root.querySelector<HTMLInputElement>("#peer-health-muted");
     mute!.checked = true;
@@ -655,8 +710,10 @@ describe("conversation studio detail", () => {
       ?.click();
     await settle();
     expect(harness.calls.open).toBe(1);
-    expect(eventTab?.getAttribute("aria-selected")).toBe("true");
-    expect(root.querySelector(".event-body")?.textContent).toContain("Exact completion body");
+    expect(drawer?.querySelector("h2")?.textContent).toBe("Exact event evidence");
+    expect(drawer?.querySelector(".studio-focus-exact")?.textContent).toContain(
+      "Exact completion body",
+    );
 
     const exit = root.querySelector<HTMLButtonElement>('[data-region="studio-exit"]');
     const banner = root.querySelector<HTMLElement>('[data-region="studio-banner"]');
@@ -667,7 +724,7 @@ describe("conversation studio detail", () => {
     expect(harness.calls.exit).toBe(1);
   });
 
-  it("keeps source, placement, visibility, and autostart controls connected", async () => {
+  it("keeps source, placement, visibility, and autostart controls in the utility drawer", async () => {
     vi.useFakeTimers();
     const harness = createApi();
     const root = document.createElement("div");
@@ -675,18 +732,23 @@ describe("conversation studio detail", () => {
     stop = mountDetail(root, harness.api).stop;
     await settle();
 
-    root.querySelector<HTMLButtonElement>('[data-region="studio-tab-sources"]')?.click();
-    const sourcePanel = root.querySelector<HTMLElement>('[role="tabpanel"]:not([hidden])');
+    chooseUtility(root, "sources");
+    await Promise.resolve();
+    const sourcePanel = root.querySelector<HTMLElement>(
+      '.studio-focus-utility-panel[data-utility="sources"]',
+    );
     sourcePanel?.querySelector<HTMLButtonElement>(".studio-action")?.click();
     await settle();
     expect(harness.calls.selectLog).toBe(1);
 
-    root.querySelector<HTMLButtonElement>('[data-region="studio-tab-sources"]')?.click();
+    chooseUtility(root, "sources");
+    await Promise.resolve();
     root.querySelector<HTMLButtonElement>(".studio-source-remove")?.click();
     await settle();
     expect(harness.calls.removeLog).toEqual(["synthetic://events.jsonl"]);
 
-    root.querySelector<HTMLButtonElement>('[data-region="studio-tab-settings"]')?.click();
+    chooseUtility(root, "settings");
+    await Promise.resolve();
     const corner = root.querySelector<HTMLSelectElement>("#corner");
     const horizontal = root.querySelector<HTMLInputElement>("#offset-x");
     const vertical = root.querySelector<HTMLInputElement>("#offset-y");
@@ -722,6 +784,80 @@ describe("conversation studio detail", () => {
     expect(harness.calls.launchAtLogin).toEqual([true]);
   });
 
+  it("records one receipt only after the matching terminal row is visibly presented", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    const harness = createApi({}, { continuation: completedContinuation() });
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, harness.api).stop;
+    await settle();
+
+    expect(harness.calls.receive).toEqual([]);
+    const scrollport = root.querySelector<HTMLElement>('[data-region="studio-transcript-scroll"]');
+    const row = root.querySelector<HTMLElement>('[data-event-key="event:completion"]');
+    expect(scrollport).not.toBeNull();
+    expect(row).not.toBeNull();
+    Object.defineProperty(scrollport, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ top: 0, bottom: 240, left: 0, right: 600, width: 600, height: 240 }),
+    });
+    Object.defineProperty(row, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ top: 20, bottom: 80, left: 0, right: 600, width: 600, height: 60 }),
+    });
+    scrollport?.dispatchEvent(new Event("scroll"));
+    await settle();
+
+    expect(harness.calls.receive).toEqual([
+      {
+        continuationId: "123e4567-e89b-12d3-a456-426614174000",
+        evidenceHash: "evidence-hash",
+      },
+    ]);
+    scrollport?.dispatchEvent(new Event("scroll"));
+    await settle();
+    expect(harness.calls.receive).toHaveLength(1);
+  });
+
+  it("shows exact evidence in a compact modal with inert background and restores row focus", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: () => ({
+        matches: true,
+        media: "(max-width: 53em)",
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      }),
+    });
+    const harness = createApi();
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, harness.api).stop;
+    await settle();
+
+    const row = root.querySelector<HTMLButtonElement>('[data-event-key="event:completion"]');
+    row?.focus();
+    row?.click();
+    await settle();
+    const drawer = root.querySelector<HTMLElement>('[data-region="studio-drawer"]');
+    expect(drawer?.getAttribute("role")).toBe("dialog");
+    expect(drawer?.getAttribute("aria-modal")).toBe("true");
+    expect(root.querySelector('[data-region="studio-header"]')?.hasAttribute("inert")).toBe(true);
+    expect(root.querySelector(".studio-focus-main")?.hasAttribute("inert")).toBe(true);
+
+    drawer?.querySelector<HTMLButtonElement>(".studio-focus-close")?.click();
+    expect(document.activeElement?.getAttribute("data-event-key")).toBe("event:completion");
+  });
+
   it("offers an explicit retry only while interactive mode is in fallback", async () => {
     vi.useFakeTimers();
     const harness = createApi({
@@ -733,7 +869,8 @@ describe("conversation studio detail", () => {
     stop = mountDetail(root, harness.api).stop;
     await settle();
 
-    root.querySelector<HTMLButtonElement>('[data-region="studio-tab-settings"]')?.click();
+    chooseUtility(root, "settings");
+    await Promise.resolve();
     const retry = Array.from(root.querySelectorAll<HTMLButtonElement>("button")).find(
       (button) => button.textContent === "Retry interactive mode",
     );
@@ -751,10 +888,10 @@ describe("conversation studio detail", () => {
 
 describe("studio presentation contract", () => {
   it("uses paper tokens, a 44px target, a 3px focus, and no infinite or glow language", () => {
-    const css = readFileSync(
-      join(dirname(fileURLToPath(import.meta.url)), "../styles/studio.css"),
-      "utf8",
-    );
+    const styles = dirname(fileURLToPath(import.meta.url));
+    const css = ["studio.css", "studio-focus.css"]
+      .map((name) => readFileSync(join(styles, "../styles", name), "utf8"))
+      .join("\n");
     expect(contrast("#241c16", "#f3e6d0")).toBeGreaterThanOrEqual(4.5);
     expect(contrast("#5c5146", "#f3e6d0")).toBeGreaterThanOrEqual(4.5);
     expect(contrast("#234e86", "#f3e6d0")).toBeGreaterThanOrEqual(3);
@@ -766,6 +903,7 @@ describe("studio presentation contract", () => {
     expect(css).toContain("min-height: var(--target-min)");
     expect(css).toContain("font-family: var(--exact-font)");
     expect(css).toContain("@container (max-width: 53em)");
+    expect(css).toContain(".studio-focus-workspace:has([data-region=\"studio-drawer\"].is-wide)");
     expect(css).toContain("grid-template-columns: minmax(0, 1fr) minmax(18rem, 26rem)");
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
     expect(css).not.toMatch(/infinite/i);

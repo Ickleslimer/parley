@@ -1,6 +1,5 @@
 import type { ViewerApi } from "../ipc";
 import { mountDetail } from "../ui/detail";
-import { LANDMARKS } from "../ui/landmarks";
 import { mountWidget } from "../ui/widget";
 import { mountWidgetSurface } from "../ui/widget-surface";
 import {
@@ -29,13 +28,6 @@ const SCENARIOS = new Set<FixtureScenario>([
   "expanded",
   "completion",
 ]);
-
-const TAB_LANDMARKS: Record<FixtureInspectorTab, string> = {
-  event: LANDMARKS.studioTabEvent,
-  activity: LANDMARKS.studioTabActivity,
-  sources: LANDMARKS.studioTabSources,
-  settings: LANDMARKS.studioTabSettings,
-};
 
 export function mountSyntheticFixture(
   root: HTMLElement,
@@ -98,21 +90,16 @@ async function prepareDetailFixture(
   tab: string | null,
 ): Promise<void> {
   if (scenario !== "empty" && scenario !== "source-error") {
-    const session = await waitForElement<HTMLElement>(root, "[data-session-key]");
-    session?.click();
     if (scenario === "search-results") {
       const input = await waitForElement<HTMLInputElement>(root, 'input[type="search"]');
       if (input) {
         input.value = "synthetic evidence";
         input.form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
-        await waitForElement(root, '[role="option"][data-event-key]');
+        await waitForElement(root, '.studio-focus-row[data-event-key]');
       }
-    } else {
-      const message = await waitForElement<HTMLButtonElement>(root, ".studio-message");
-      message?.click();
     }
   }
-  activateInspectorTab(tab);
+  await activateStudioSurface(root, tab);
 }
 
 async function waitForElement<T extends Element>(
@@ -129,12 +116,26 @@ async function waitForElement<T extends Element>(
   return null;
 }
 
-function activateInspectorTab(value: string | null): void {
+async function activateStudioSurface(root: HTMLElement, value: string | null): Promise<void> {
   if (value !== "event" && value !== "activity" && value !== "sources" && value !== "settings") {
     return;
   }
-  const tab = document.querySelector<HTMLButtonElement>(
-    `[data-region="${TAB_LANDMARKS[value]}"]`,
+  if (value === "event") {
+    const message = await waitForElement<HTMLButtonElement>(
+      root,
+      ".studio-focus-row[data-event-key]",
+    );
+    message?.click();
+    return;
+  }
+  const utilities = await waitForElement<HTMLButtonElement>(
+    root,
+    '[data-region="studio-utilities"]',
   );
-  tab?.click();
+  utilities?.click();
+  const item = await waitForElement<HTMLButtonElement>(
+    root,
+    `[role="menuitem"][data-utility="${value}"]`,
+  );
+  item?.click();
 }
