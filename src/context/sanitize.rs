@@ -7,6 +7,7 @@ use super::parse::{get_str, parse_json};
 use super::reader::PhysicalRecord;
 
 const AGENTS_PREFIX: &str = "# AGENTS.md instructions for";
+const MAX_IDENTIFIER_CHARS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VisibleMessage {
@@ -20,15 +21,18 @@ pub(crate) struct VisibleMessage {
     pub end_offset: u64,
 }
 
-pub(crate) fn visible_messages(
-    records: &[PhysicalRecord],
-) -> Result<Vec<VisibleMessage>, ContextError> {
-    let mut current_turn: Option<(String, u64)> = None;
-    let mut synthetic_n: u64 = 0;
-    let mut last_synthetic: Option<String> = None;
-    let mut out = Vec::new();
+#[derive(Default)]
+pub(crate) struct VisibleMessageDecoder {
+    current_turn: Option<(String, u64)>,
+    synthetic_n: u64,
+    last_synthetic: Option<String>,
+}
 
-    for record in records {
+impl VisibleMessageDecoder {
+    pub(crate) fn push(
+        &mut self,
+        record: &PhysicalRecord,
+    ) -> Result<Option<VisibleMessage>, ContextError> {
         let json = parse_json(&record.text)?;
         if json.as_object().is_none() {
             return Err(ContextError::malformed(format!(
@@ -43,30 +47,38 @@ pub(crate) fn visible_messages(
                 .and_then(|payload| get_str(payload, "turn_id"))
                 .filter(|value| !value.is_empty())
             {
-                current_turn = Some((turn_id.to_string(), record.start_offset));
+                self.current_turn = Some((
+                    bounded_identifier("turn_id", turn_id, record.start_offset)?,
+                    record.start_offset,
+                ));
             }
-            continue;
+            return Ok(None);
         }
 
         let Some(extracted) = extract_visible(&json, record)? else {
-            continue;
+            return Ok(None);
         };
         let turn_id = extracted
             .explicit_turn
-            .or_else(|| current_turn.as_ref().map(|(turn_id, _)| turn_id.clone()))
+            .or_else(|| {
+                self.current_turn
+                    .as_ref()
+                    .map(|(turn_id, _)| turn_id.clone())
+            })
             .unwrap_or_else(|| {
-                if extracted.role == "user" || last_synthetic.is_none() {
-                    synthetic_n += 1;
-                    last_synthetic = Some(format!("synthetic:{synthetic_n}"));
+                if extracted.role == "user" || self.last_synthetic.is_none() {
+                    self.synthetic_n += 1;
+                    self.last_synthetic = Some(format!("synthetic:{}", self.synthetic_n));
                 }
-                last_synthetic.clone().unwrap()
+                self.last_synthetic.clone().unwrap()
             });
-        let turn_start_offset = current_turn
+        let turn_start_offset = self
+            .current_turn
             .as_ref()
             .filter(|(current, _)| current == &turn_id)
             .map(|(_, offset)| *offset)
             .unwrap_or(record.start_offset);
-        out.push(VisibleMessage {
+        Ok(Some(VisibleMessage {
             role: extracted.role,
             phase: extracted.phase,
             text: extracted.text,
@@ -75,7 +87,21 @@ pub(crate) fn visible_messages(
             turn_start_offset,
             start_offset: record.start_offset,
             end_offset: record.end_offset,
-        });
+        }))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn visible_messages(
+    records: &[PhysicalRecord],
+) -> Result<Vec<VisibleMessage>, ContextError> {
+    let mut decoder = VisibleMessageDecoder::default();
+    let mut out = Vec::new();
+
+    for record in records {
+        if let Some(message) = decoder.push(record)? {
+            out.push(message);
+        }
     }
     Ok(out)
 }
@@ -138,11 +164,12 @@ fn extract_visible(
                 .and_then(|metadata| get_str(metadata, "turn_id"))
         })
         .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let message_id = get_str(payload, "id")
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("offset:{}", record.start_offset));
+        .map(|value| bounded_identifier("turn_id", value, record.start_offset))
+        .transpose()?;
+    let message_id = match get_str(payload, "id").filter(|value| !value.is_empty()) {
+        Some(value) => bounded_identifier("message_id", value, record.start_offset)?,
+        None => format!("offset:{}", record.start_offset),
+    };
     Ok(Some(Extracted {
         role: role.to_string(),
         phase,
@@ -150,6 +177,20 @@ fn extract_visible(
         explicit_turn,
         message_id,
     }))
+}
+
+fn bounded_identifier(kind: &str, value: &str, offset: u64) -> Result<String, ContextError> {
+    if value.chars().count() > MAX_IDENTIFIER_CHARS {
+        return Err(ContextError::overflow(format!(
+            "{kind} at offset {offset} exceeds {MAX_IDENTIFIER_CHARS} characters"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ContextError::malformed(format!(
+            "{kind} at offset {offset} contains control characters"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn message_text(payload: &Json, offset: u64) -> Result<String, ContextError> {

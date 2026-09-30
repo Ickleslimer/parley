@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ask::{self, AskFailure, AskSpawnObserver, AskSpawnReceipt};
 use crate::context::refuse_reparse_chain;
+use crate::continuation;
 use crate::event_log::{EventReceipt, ExchangeReceipt};
 use crate::grok_subagents::{append_parent_contract, GuardedSubagentLaunch};
 use crate::job_lock::ExecutionLease;
@@ -22,6 +23,7 @@ use crate::jobs::{
 };
 use crate::json::Json;
 use crate::lane_plan;
+use crate::peer_session::ConversationMode;
 use crate::policy::RuntimePolicy;
 use crate::process::{CancellationToken, Captured, OutputStream, Timeouts};
 use crate::profile_namespace;
@@ -173,6 +175,7 @@ impl JobRuntime {
         if spec.request.harness != "grok" && spec.request.harness != "gr" {
             return Err("start_agent_job supports only Grok".to_string());
         }
+        normalize_job_conversation_mode(spec.mode, &mut spec.request.conversation_mode)?;
         validate_handoff_turn_request(spec.handoff_mode, spec.request.max_turns.as_deref())?;
 
         let (mut request, policy) = ask::prepare_for_job(&spec.request)?;
@@ -198,6 +201,13 @@ impl JobRuntime {
             }
             (JobMode::Review | JobMode::Probe, None) => None,
         };
+        if let Some(plan) = &spec.lane_plan {
+            for lane in &plan.lanes {
+                if lane.role == LaneRole::Writer {
+                    continuation::require_reviewed(&lane.cwd)?;
+                }
+            }
+        }
         let guarded_launch =
             GuardedSubagentLaunch::from_plan(&spec.job_id, spec.lane_plan.as_ref(), &policy)?;
         request.allow_subagents = guarded_launch
@@ -556,6 +566,20 @@ fn validate_handoff_turn_request(
             "max_turns is not accepted for acknowledgement-required asynchronous jobs".to_string(),
         );
     }
+    Ok(())
+}
+
+fn normalize_job_conversation_mode(
+    job_mode: JobMode,
+    conversation_mode: &mut Option<ConversationMode>,
+) -> Result<(), String> {
+    if job_mode != JobMode::Probe {
+        return Ok(());
+    }
+    if *conversation_mode == Some(ConversationMode::Canonical) {
+        return Err("probe jobs require conversation_mode=isolated".to_string());
+    }
+    *conversation_mode = Some(ConversationMode::Isolated);
     Ok(())
 }
 
@@ -2841,6 +2865,20 @@ mod tests {
         let mut probe_turns = Some("30".to_string());
         canonicalize_handoff_turn_limit(HandoffMode::None, &mut probe_turns);
         assert_eq!(probe_turns.as_deref(), Some("30"));
+    }
+
+    #[test]
+    fn probes_force_isolated_conversations_without_changing_substantive_jobs() {
+        let mut omitted = None;
+        normalize_job_conversation_mode(JobMode::Probe, &mut omitted).unwrap();
+        assert_eq!(omitted, Some(ConversationMode::Isolated));
+
+        let mut canonical = Some(ConversationMode::Canonical);
+        assert!(normalize_job_conversation_mode(JobMode::Probe, &mut canonical).is_err());
+
+        let mut review = None;
+        normalize_job_conversation_mode(JobMode::Review, &mut review).unwrap();
+        assert_eq!(review, None);
     }
 
     fn test_handoff_session(name: &str) -> HandoffSession {

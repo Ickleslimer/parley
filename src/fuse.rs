@@ -200,9 +200,11 @@ pub(crate) fn run_judge(
         max_turns: None,
         session_id: None,
         resume_id: None,
+        conversation_mode: Some(crate::peer_session::ConversationMode::Isolated),
         yolo,
         context: None,
         max_context_chars: Some(max_context),
+        images: Vec::new(),
         allow_subagents: false,
     };
     run_one(&req)
@@ -249,9 +251,11 @@ fn build_requests(
                 max_turns: None,
                 session_id: None,
                 resume_id: None,
+                conversation_mode: Some(crate::peer_session::ConversationMode::Isolated),
                 yolo,
                 context: context.clone(),
                 max_context_chars: Some(max_context),
+                images: Vec::new(),
                 allow_subagents: false,
             };
             (label, req)
@@ -322,9 +326,11 @@ fn dry_run(prompt: &str, panel: &[String], config: DryRunConfig<'_>) -> Result<(
         max_turns: None,
         session_id: None,
         resume_id: None,
+        conversation_mode: Some(crate::peer_session::ConversationMode::Isolated),
         yolo: config.yolo,
         context: None,
         max_context_chars: Some(config.max_context),
+        images: Vec::new(),
         allow_subagents: false,
     };
     println!(

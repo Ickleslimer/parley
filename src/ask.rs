@@ -8,23 +8,27 @@
 //! session module) and prepends it, so the answer is informed by that history.
 
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cli::{AskOptions, CliOptions};
 use crate::context::{
-    cleanup_stale_agent_profile_files, cleanup_stale_prompt_files, resolve_codex_rollout,
-    resolve_codex_sessions_root, AgentProfileFile, CodexHomeEnv, ContextBounds, ContextKey,
-    ContextMode, ContextPlan, ContextRecovery, JournalStore, PlanKind, PromptFile, ResolvedSource,
-    StateDirEnv,
+    cleanup_stale_agent_profile_files, cleanup_stale_prompt_files,
+    load_interaction_profile_from_process, resolve_codex_rollout, resolve_codex_sessions_root,
+    AgentProfileFile, CodexHomeEnv, ContextBounds, ContextKey, ContextMode, ContextPlan,
+    ContextRecovery, JournalStore, PlanKind, PromptFile, ResolvedSource, StateDirEnv,
 };
+use crate::continuation;
 use crate::event_log::{EventReceipt, ExchangeLog, ExchangeReceipt};
 use crate::grok_subagents::GuardedSubagentLaunch;
 use crate::harness::{normalize_harness, HarnessFactory, Invocation, Request};
 use crate::health_report::HealthReporter;
+use crate::image_attachments::{self, ImageAttachment, ImageBundle};
 use crate::job_lock::ExecutionLease;
 use crate::lane_grants::GrantSet;
+use crate::peer_session::{resolve_canonical_target, CanonicalAction, ConversationMode};
 use crate::policy::{ContextPolicyRequest, PolicyRequest, RuntimePolicy};
 use crate::process::{
     capture_invocation_timeout_controlled_observed, CancellationToken, Captured, OutputObserver,
@@ -57,9 +61,11 @@ pub(crate) struct AskRequest {
     pub max_turns: Option<String>,
     pub session_id: Option<String>,
     pub resume_id: Option<String>,
+    pub conversation_mode: Option<ConversationMode>,
     pub yolo: bool,
     pub context: Option<ContextRef>,
     pub max_context_chars: Option<usize>,
+    pub images: Vec<ImageAttachment>,
     pub(crate) allow_subagents: bool,
 }
 
@@ -258,6 +264,7 @@ struct ResolvedPrompt {
 struct InvocationFiles {
     prompt: Option<PromptFile>,
     agent_profile: Option<AgentProfileFile>,
+    image_bundle: Option<ImageBundle>,
 }
 
 impl InvocationFiles {
@@ -271,6 +278,11 @@ impl InvocationFiles {
         if let Some(agent_profile) = self.agent_profile.take() {
             if let Err(error) = agent_profile.cleanup() {
                 errors.push(error.to_string());
+            }
+        }
+        if let Some(mut image_bundle) = self.image_bundle.take() {
+            if let Err(error) = image_bundle.cleanup() {
+                errors.push(error);
             }
         }
         if errors.is_empty() {
@@ -419,7 +431,15 @@ fn resolve_prompt(
         }
         _ => return Err("invalid stateful context session/mode/recovery combination".to_string()),
     };
-    let text = frame_stateful_prompt(exchange_id, ctx, &plan, &req.prompt);
+    let interaction_profile =
+        load_interaction_profile_from_process().map_err(|error| error.to_string())?;
+    let text = frame_stateful_prompt(
+        exchange_id,
+        ctx,
+        &plan,
+        interaction_profile.as_deref(),
+        &req.prompt,
+    );
     Ok(ResolvedPrompt {
         text,
         stateful: Some(StatefulPrompt {
@@ -436,6 +456,7 @@ fn frame_stateful_prompt(
     exchange_id: &str,
     context: &ContextRef,
     plan: &ContextPlan,
+    interaction_profile: Option<&str>,
     current_request: &str,
 ) -> String {
     let mode = if plan.kind == PlanKind::Seed {
@@ -464,6 +485,12 @@ fn frame_stateful_prompt(
         prompt.push('\n');
     }
     prompt.push_str("=== END_UNTRUSTED_TRANSCRIPT ===\n");
+    if let Some(profile) = interaction_profile {
+        prompt.push_str(profile);
+        if !profile.ends_with('\n') {
+            prompt.push('\n');
+        }
+    }
     prompt.push_str(&format!(
         "=== PARLEY_CURRENT_REQUEST_V1 exchange={exchange_id} ===\n{current_request}"
     ));
@@ -471,7 +498,9 @@ fn frame_stateful_prompt(
 }
 
 fn should_use_prompt_file(req: &AskRequest, invocation: &Invocation, stateful: bool) -> bool {
-    req.harness == "grok" && (stateful || invocation.projected_windows_command_units() > 24_000)
+    req.images.is_empty()
+        && req.harness == "grok"
+        && (stateful || invocation.projected_windows_command_units() > 24_000)
 }
 
 fn build_prepared(req: &AskRequest, prompt: String) -> Result<Invocation, String> {
@@ -530,13 +559,30 @@ pub(crate) fn run_with_receipt_controlled(
     cancellation: &CancellationToken,
     observer: &dyn AskSpawnObserver,
 ) -> Result<AskOutcome, AskFailure> {
-    let (req, policy) = prepare_with_policy(req)?;
+    let (mut req, policy) = prepare_policy(req)?;
+    if let Err(error) = finalize_prepared_prompt(&mut req, &policy) {
+        return Err(preflight_failure(
+            &req,
+            &req.prompt,
+            ExchangeLog::allocate_exchange_id(),
+            "image_preflight_error",
+            &format!("image validation failed; agent was not started: {error}"),
+        ));
+    }
     run_prepared_with_receipt_controlled(&req, &policy, None, cancellation, observer)
 }
 
 #[allow(dead_code)]
 pub(crate) fn prepare_for_job(req: &AskRequest) -> Result<(AskRequest, RuntimePolicy), String> {
-    prepare_with_policy(req)
+    if !req.images.is_empty() {
+        return Err(
+            "image attachments are supported only by synchronous ask_agent/par ask calls"
+                .to_string(),
+        );
+    }
+    let (mut prepared, policy) = prepare_policy(req)?;
+    policy.apply_handoff_contract(&prepared.harness, &mut prepared.prompt);
+    Ok((prepared, policy))
 }
 
 pub(crate) fn run_prepared_with_receipt_controlled(
@@ -561,30 +607,63 @@ pub(crate) fn run_prepared_with_receipt_controlled(
             ));
         }
     };
+    let timeouts = observer.timeouts(Timeouts::from_env());
+    let temporary_file_max_age = observer.temporary_file_max_age(timeouts);
+    let mut invocation_files = InvocationFiles::default();
+    if !req.images.is_empty() {
+        if guarded_launch.is_some() {
+            return Err(preflight_failure(
+                req,
+                &resolved.text,
+                exchange_id,
+                "image_preflight_error",
+                "image attachments are not supported by asynchronous or guarded jobs; agent was not started",
+            ));
+        }
+        match ImageBundle::stage(&req.images, temporary_file_max_age) {
+            Ok(bundle) => invocation_files.image_bundle = Some(bundle),
+            Err(error) => {
+                return Err(preflight_failure(
+                    req,
+                    &resolved.text,
+                    exchange_id,
+                    "image_preflight_error",
+                    &format!("image staging failed; agent was not started: {error}"),
+                ));
+            }
+        }
+    }
     let mut invocation = match build_prepared(req, resolved.text.clone()) {
         Ok(invocation) => invocation,
         Err(error) => {
+            let cleanup = cleanup_invocation_files(&mut invocation_files)
+                .err()
+                .map(|cleanup| format!("; temporary-file cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
             return Err(preflight_failure(
                 req,
                 &resolved.text,
                 exchange_id,
                 "context_preflight_error",
-                &format!("invocation construction failed; agent was not started: {error}"),
+                &format!("invocation construction failed; agent was not started: {error}{cleanup}"),
             ));
         }
     };
     if let Err(error) = observer.configure_invocation(&mut invocation) {
+        let cleanup = cleanup_invocation_files(&mut invocation_files)
+            .err()
+            .map(|cleanup| format!("; temporary-file cleanup also failed: {cleanup}"))
+            .unwrap_or_default();
         return Err(preflight_failure(
             req,
             &resolved.text,
             exchange_id,
             "job_preflight_error",
-            &format!("job invocation configuration failed; agent was not started: {error}"),
+            &format!(
+                "job invocation configuration failed; agent was not started: {error}{cleanup}"
+            ),
         ));
     }
-    let timeouts = observer.timeouts(Timeouts::from_env());
-    let temporary_file_max_age = observer.temporary_file_max_age(timeouts);
-    let mut invocation_files = InvocationFiles::default();
     if let Some(guarded_launch) = guarded_launch {
         let profile_path = if guarded_launch.has_children() {
             if let Err(error) = cleanup_stale_agent_profile_files(temporary_file_max_age) {
@@ -828,14 +907,28 @@ pub(crate) fn run_prepared_with_receipt_controlled(
     let spawn_cwd = guarded_launch
         .map(GuardedSubagentLaunch::spawn_cwd)
         .or_else(|| req.cwd.to_str());
-    match capture_invocation_timeout_controlled_observed(
-        invocation,
-        spawn_cwd,
-        timeouts,
-        cancellation,
-        &process_observer,
-        &process_observer,
-    ) {
+    let execution = if let Some(bundle) = invocation_files.image_bundle.as_ref() {
+        run_image_invocation(ImageRun {
+            req,
+            policy,
+            prompt: &resolved.text,
+            bundle,
+            spawn_cwd,
+            timeouts,
+            cancellation,
+            observer: &process_observer,
+        })
+    } else {
+        capture_invocation_timeout_controlled_observed(
+            invocation,
+            spawn_cwd,
+            timeouts,
+            cancellation,
+            &process_observer,
+            &process_observer,
+        )
+    };
+    match execution {
         Ok(mut out) => {
             let lane_result = consume_grants(&mut active_grants);
             let duration_ms = started.elapsed().as_millis();
@@ -1051,6 +1144,102 @@ pub(crate) fn run_prepared_with_receipt_controlled(
     }
 }
 
+struct ImageRun<'a, 'observer> {
+    req: &'a AskRequest,
+    policy: &'a RuntimePolicy,
+    prompt: &'a str,
+    bundle: &'a ImageBundle,
+    spawn_cwd: Option<&'a str>,
+    timeouts: Timeouts,
+    cancellation: &'a CancellationToken,
+    observer: &'a ProcessObserverAdapter<'observer>,
+}
+
+#[cfg(windows)]
+fn run_image_invocation(run: ImageRun<'_, '_>) -> Result<Captured, String> {
+    use crate::grok_acp::{AcpProfile, AcpRequest, SessionAction};
+
+    let ImageRun {
+        req,
+        policy,
+        prompt,
+        bundle,
+        spawn_cwd,
+        timeouts,
+        cancellation,
+        observer,
+    } = run;
+
+    let session = match (&req.session_id, &req.resume_id) {
+        (Some(_), Some(_)) => {
+            return Err("image turn received conflicting session identifiers".to_string())
+        }
+        (Some(_), None) => {
+            return Err("image turn cannot create a native Grok session over ACP".to_string())
+        }
+        (None, Some(session_id)) => SessionAction::Load(session_id.clone()),
+        (None, None) => return Err("image turn requires an existing Grok session".to_string()),
+    };
+    let model = req
+        .model
+        .as_deref()
+        .ok_or_else(|| "image turn requires an explicit Grok model".to_string())?;
+    let reasoning_effort = req
+        .reasoning_effort
+        .as_deref()
+        .ok_or_else(|| "image turn requires an explicit Grok reasoning effort".to_string())?;
+    let broker_exe = env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|_| "resolve private image broker executable failed".to_string())?;
+    let cwd = spawn_cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| req.cwd.clone());
+    let grants: [crate::jobs::PathGrant; 0] = [];
+    let mut outcome = crate::grok_acp::run_observed(
+        AcpRequest {
+            cwd: &cwd,
+            session,
+            prompt,
+            model,
+            reasoning_effort,
+            grants: &grants,
+            cancellation,
+            timeout: timeouts.overall,
+            idle_timeout: timeouts.idle,
+            profile: AcpProfile::Images {
+                broker_exe: &broker_exe,
+                bundle_dir: bundle.root(),
+                health_query_exe: policy.image_health_query_exe(),
+            },
+        },
+        |process_id| SpawnObserver::process_created(observer, process_id),
+        |process_id| SpawnObserver::process_resumed(observer, process_id),
+    )?;
+    if let Err(error) = bundle.validate_consumption(policy.image_health_query_exe().is_some()) {
+        outcome.error = Some(match outcome.error {
+            Some(existing) => format!("{existing}; {error}"),
+            None => error,
+        });
+    }
+    let success = outcome.error.is_none()
+        && outcome
+            .reply
+            .as_deref()
+            .is_some_and(|reply| !reply.trim().is_empty());
+    Ok(Captured {
+        stdout: outcome.reply.unwrap_or_default(),
+        stderr: outcome.error.unwrap_or_default(),
+        success,
+        timed_out: outcome.timed_out,
+        cancelled: outcome.cancelled,
+    })
+}
+
+#[cfg(not(windows))]
+fn run_image_invocation(_run: ImageRun<'_, '_>) -> Result<Captured, String> {
+    Err("Grok image attachments currently require Windows".to_string())
+}
+
 fn preflight_failure(
     req: &AskRequest,
     prompt: &str,
@@ -1183,14 +1372,75 @@ fn has_handoff_footer(reply: &str) -> bool {
 }
 
 fn prepare(req: &AskRequest) -> Result<AskRequest, String> {
-    prepare_with_policy(req).map(|(prepared, _)| prepared)
+    let (mut prepared, policy) = prepare_policy(req)?;
+    finalize_prepared_prompt(&mut prepared, &policy)?;
+    Ok(prepared)
 }
 
-fn prepare_with_policy(req: &AskRequest) -> Result<(AskRequest, RuntimePolicy), String> {
+fn prepare_policy(req: &AskRequest) -> Result<(AskRequest, RuntimePolicy), String> {
     let policy = RuntimePolicy::from_env()?;
     let mut prepared = req.clone();
     prepared.harness = normalize_harness(&prepared.harness);
     prepared.cwd = policy.validate_spawn_cwd(&prepared.cwd)?;
+    if prepared.harness == "grok" {
+        continuation::require_reviewed(&prepared.cwd)?;
+    }
+    if let Some(context) = prepared.context.as_mut() {
+        if !context.harness.is_empty() {
+            context.harness = normalize_harness(&context.harness);
+        }
+    }
+    let conversation_mode =
+        policy.resolve_conversation_mode(&prepared.harness, prepared.conversation_mode);
+    prepared.conversation_mode = Some(conversation_mode);
+    if conversation_mode == ConversationMode::Canonical {
+        if prepared.harness != "grok" {
+            return Err("canonical conversation mode is only supported for Grok".to_string());
+        }
+        if prepared.session_id.is_some() || prepared.resume_id.is_some() {
+            return Err(
+                "canonical conversation mode derives its target session; omit session_id and resume_id"
+                    .to_string(),
+            );
+        }
+        let source_session = {
+            let context = prepared.context.as_mut().ok_or_else(|| {
+                "canonical conversation mode requires context_from with an explicit Codex session"
+                    .to_string()
+            })?;
+            policy.apply_context(ContextPolicyRequest {
+                target_harness: &prepared.harness,
+                source_harness: &mut context.harness,
+                source_session: &context.session,
+                mode: &mut context.mode,
+                mode_explicit: context.mode_explicit,
+                recovery: context.recovery,
+                max_context_chars: prepared.max_context_chars,
+                session_id: None,
+                resume_id: None,
+                allow_missing_target: true,
+            })?;
+            if context.harness.is_empty() {
+                return Err("canonical conversation mode requires source harness codex".to_string());
+            }
+            context.harness = normalize_harness(&context.harness);
+            if context.harness != "codex" || context.mode != ContextMode::Auto {
+                return Err(
+                    "canonical conversation mode requires Codex context in auto mode".to_string(),
+                );
+            }
+            context.session.clone()
+        };
+        let target = resolve_canonical_target(
+            &source_session,
+            policy.grok_canonical_epoch(),
+            &prepared.cwd,
+        )?;
+        match target.action {
+            CanonicalAction::New => prepared.session_id = Some(target.session_id),
+            CanonicalAction::Resume => prepared.resume_id = Some(target.session_id),
+        }
+    }
     policy.apply_request(PolicyRequest {
         harness: &prepared.harness,
         yolo: prepared.yolo,
@@ -1203,9 +1453,6 @@ fn prepare_with_policy(req: &AskRequest) -> Result<(AskRequest, RuntimePolicy), 
         passthrough: &[],
     })?;
     if let Some(context) = prepared.context.as_mut() {
-        if !context.harness.is_empty() {
-            context.harness = normalize_harness(&context.harness);
-        }
         policy.apply_context(ContextPolicyRequest {
             target_harness: &prepared.harness,
             source_harness: &mut context.harness,
@@ -1216,14 +1463,56 @@ fn prepare_with_policy(req: &AskRequest) -> Result<(AskRequest, RuntimePolicy), 
             max_context_chars: prepared.max_context_chars,
             session_id: prepared.session_id.as_deref(),
             resume_id: prepared.resume_id.as_deref(),
+            allow_missing_target: false,
         })?;
         if context.harness.is_empty() {
             return Err("context source harness is required".to_string());
         }
         context.harness = normalize_harness(&context.harness);
     }
-    policy.apply_handoff_contract(&prepared.harness, &mut prepared.prompt);
     Ok((prepared, policy))
+}
+
+fn finalize_prepared_prompt(
+    prepared: &mut AskRequest,
+    policy: &RuntimePolicy,
+) -> Result<(), String> {
+    if !prepared.images.is_empty() {
+        if prepared.harness != "grok" {
+            return Err("image attachments are supported only for Grok".to_string());
+        }
+        if prepared.yolo {
+            return Err("image attachments require yolo to be disabled".to_string());
+        }
+        if prepared.provider.is_some() {
+            return Err("image attachments do not accept a provider override".to_string());
+        }
+        if prepared.allow_subagents {
+            return Err("image attachments do not permit subagents".to_string());
+        }
+        if prepared.session_id.is_some() {
+            return Err(
+                "image attachments require an existing Grok session; start the session with a text turn, then use resume_id or an established canonical conversation"
+                    .to_string(),
+            );
+        }
+        if prepared.resume_id.is_none() {
+            return Err(
+                "image attachments require resume_id or an established canonical conversation"
+                    .to_string(),
+            );
+        }
+        image_attachments::inspect_all(
+            &mut prepared.images,
+            &prepared.cwd,
+            policy.restrict_image_sources(),
+        )?;
+        image_attachments::append_prompt_section(&mut prepared.prompt, &prepared.images)?;
+        policy.apply_image_handoff_contract(&prepared.harness, &mut prepared.prompt);
+    } else {
+        policy.apply_handoff_contract(&prepared.harness, &mut prepared.prompt);
+    }
+    Ok(())
 }
 
 /// `par ask` entry point: resolve options, then run (or print under dry-run).
@@ -1235,6 +1524,39 @@ pub(crate) fn run_cli(options: AskOptions) -> Result<(), String> {
         let prepared = prepare(&req)?;
         let exchange_id = ExchangeLog::allocate_exchange_id();
         let resolved = resolve_prompt(&prepared, &exchange_id, true)?;
+        if !prepared.images.is_empty() {
+            let model = prepared
+                .model
+                .as_deref()
+                .ok_or("image dry-run requires an explicit Grok model")?;
+            let effort = prepared
+                .reasoning_effort
+                .as_deref()
+                .ok_or("image dry-run requires an explicit Grok reasoning effort")?;
+            let invocation = Invocation::new(
+                "grok",
+                vec![
+                    "--no-auto-update".to_string(),
+                    "agent".to_string(),
+                    "--no-leader".to_string(),
+                    "--model".to_string(),
+                    model.to_string(),
+                    "--reasoning-effort".to_string(),
+                    effort.to_string(),
+                    "--agent-profile".to_string(),
+                    "<PARLEY_IMAGE_PROFILE>".to_string(),
+                    "stdio".to_string(),
+                ],
+            );
+            println!(
+                "{}",
+                invocation.to_json_with_prompt_metadata(Some((
+                    resolved.text.chars().count(),
+                    &format!("{:016x}", fnv1a_64(&resolved.text)),
+                )))
+            );
+            return Ok(());
+        }
         let mut invocation = build_prepared(&prepared, resolved.text.clone())?;
         let metadata =
             if should_use_prompt_file(&prepared, &invocation, resolved.stateful.is_some()) {
@@ -1288,6 +1610,11 @@ fn resolve(options: AskOptions) -> Result<AskRequest, String> {
         max_turns: options.max_turns,
         session_id: options.session_id,
         resume_id: options.resume_id,
+        conversation_mode: options
+            .conversation_mode
+            .as_deref()
+            .map(ConversationMode::parse)
+            .transpose()?,
         yolo: options.yolo,
         context: options
             .context_from
@@ -1310,6 +1637,11 @@ fn resolve(options: AskOptions) -> Result<AskRequest, String> {
             })
             .transpose()?,
         max_context_chars: options.max_context_chars,
+        images: options
+            .images
+            .into_iter()
+            .map(ImageAttachment::source)
+            .collect(),
         allow_subagents: false,
     })
 }
@@ -1337,6 +1669,42 @@ fn parse_context_spec(spec: &str) -> ContextRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13_u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&2_u32.to_be_bytes());
+        bytes.extend_from_slice(&3_u32.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(b"IEND");
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
+    fn image_request(path: &Path) -> AskRequest {
+        AskRequest {
+            harness: "grok".to_string(),
+            prompt: "inspect".to_string(),
+            model: Some("grok-4.7".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            provider: None,
+            cwd: path.parent().unwrap().to_path_buf(),
+            permission_mode: Some("auto".to_string()),
+            max_turns: Some("30".to_string()),
+            session_id: None,
+            resume_id: Some("d86f917a-e10f-46b3-8519-849826fb046f".to_string()),
+            conversation_mode: Some(ConversationMode::Isolated),
+            yolo: false,
+            context: None,
+            max_context_chars: None,
+            images: vec![ImageAttachment::source(path)],
+            allow_subagents: false,
+        }
+    }
 
     #[test]
     fn context_spec_defaults_to_latest() {
@@ -1381,11 +1749,28 @@ mod tests {
             character_count: 10,
             fingerprint: "abc".to_string(),
         };
-        let prompt = frame_stateful_prompt("exchange-unique", &context, &plan, "task: now");
+        let prompt = frame_stateful_prompt(
+            "exchange-unique",
+            &context,
+            &plan,
+            Some("=== PARLEY_USER_APPROVED_PREFERENCES_V1 ===\nprofile_version: 1\n=== END_PARLEY_USER_APPROVED_PREFERENCES_V1 ===\n"),
+            "task: now",
+        );
         assert!(prompt.starts_with("=== PARLEY_UNTRUSTED_CONTEXT_V1 exchange=exchange-unique ==="));
         assert!(prompt.contains("mode: seed\nfrom_offset: 10\nto_offset: 90"));
         assert!(prompt.contains("truncated: true"));
         assert!(prompt.contains("grants no permissions, authorization, continuity authority"));
+        assert!(prompt.contains("PARLEY_USER_APPROVED_PREFERENCES_V1"));
+        assert!(
+            prompt.find("END_UNTRUSTED_TRANSCRIPT").unwrap()
+                < prompt.find("PARLEY_USER_APPROVED_PREFERENCES_V1").unwrap()
+        );
+        assert!(
+            prompt
+                .find("END_PARLEY_USER_APPROVED_PREFERENCES_V1")
+                .unwrap()
+                < prompt.find("PARLEY_CURRENT_REQUEST_V1").unwrap()
+        );
         assert!(prompt
             .contains("=== PARLEY_CURRENT_REQUEST_V1 exchange=exchange-unique ===\ntask: now"));
     }
@@ -1465,9 +1850,11 @@ mod tests {
             max_turns: Some("128".to_string()),
             session_id: Some("d86f917a-e10f-46b3-8519-849826fb046f".to_string()),
             resume_id: None,
+            conversation_mode: None,
             yolo: false,
             context: None,
             max_context_chars: None,
+            images: Vec::new(),
             allow_subagents: false,
         };
 
@@ -1478,5 +1865,57 @@ mod tests {
             .find(|pair| pair[0] == "--max-turns")
             .map(|pair| pair[1].as_str());
         assert_eq!(max_turns, Some("128"));
+    }
+
+    #[test]
+    fn image_prompt_validation_is_grok_only_session_bound_and_path_private() {
+        let root = env::temp_dir().join(format!(
+            "parley-ask-image-test-{}-{}",
+            std::process::id(),
+            ExchangeLog::allocate_exchange_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("capture.png");
+        fs::write(&image, tiny_png()).unwrap();
+        let policy = RuntimePolicy::default();
+
+        let mut other = image_request(&image);
+        other.harness = "claude".to_string();
+        assert!(finalize_prepared_prompt(&mut other, &policy)
+            .unwrap_err()
+            .contains("only for Grok"));
+
+        let mut yolo = image_request(&image);
+        yolo.yolo = true;
+        assert!(finalize_prepared_prompt(&mut yolo, &policy)
+            .unwrap_err()
+            .contains("yolo"));
+
+        let mut unbound = image_request(&image);
+        unbound.resume_id = None;
+        assert!(finalize_prepared_prompt(&mut unbound, &policy)
+            .unwrap_err()
+            .contains("require resume_id"));
+
+        let mut new_session = image_request(&image);
+        new_session.session_id = new_session.resume_id.take();
+        assert!(finalize_prepared_prompt(&mut new_session, &policy)
+            .unwrap_err()
+            .contains("require an existing Grok session"));
+
+        let mut accepted = image_request(&image);
+        finalize_prepared_prompt(&mut accepted, &policy).unwrap();
+        assert!(accepted.prompt.contains("PARLEY_IMAGE_ATTACHMENTS_V1"));
+        assert!(accepted.prompt.contains("mime=image/png width=2 height=3"));
+        assert!(!accepted.prompt.contains(image.to_string_lossy().as_ref()));
+        assert!(!accepted.prompt.contains("iVBOR"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn asynchronous_job_preparation_rejects_images_before_staging() {
+        let request = image_request(Path::new(r"C:\missing\capture.png"));
+        let error = prepare_for_job(&request).unwrap_err();
+        assert!(error.contains("synchronous ask_agent/par ask"));
     }
 }

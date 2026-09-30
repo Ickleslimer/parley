@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{c_void, OsStr, OsString};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
@@ -115,7 +115,7 @@ extern "system" {
         file_name: *const u16,
         desired_access: u32,
         share_mode: u32,
-        attributes: *mut SecurityAttributes,
+        attributes: *mut c_void,
         creation_disposition: u32,
         flags_and_attributes: u32,
         template_file: Handle,
@@ -157,12 +157,19 @@ pub(crate) struct SpawnError {
 pub(crate) struct ContainedChild {
     process: Handle,
     job: Handle,
+    stdin: Option<File>,
     stdout: Option<File>,
     stderr: Option<File>,
     terminated: bool,
 }
 
 impl ContainedChild {
+    pub(crate) fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>> {
+        self.stdin
+            .take()
+            .map(|file| Box::new(file) as Box<dyn Write + Send>)
+    }
+
     pub(crate) fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
         self.stdout
             .take()
@@ -244,6 +251,33 @@ where
     F: FnOnce(u32) -> Result<(), String>,
     G: FnOnce(u32) -> Result<(), String>,
 {
+    spawn_internal(invocation, cwd, false, process_created, process_resumed)
+}
+
+pub(crate) fn spawn_bidirectional<F, G>(
+    invocation: &Invocation,
+    cwd: Option<&str>,
+    process_created: F,
+    process_resumed: G,
+) -> Result<ContainedChild, SpawnError>
+where
+    F: FnOnce(u32) -> Result<(), String>,
+    G: FnOnce(u32) -> Result<(), String>,
+{
+    spawn_internal(invocation, cwd, true, process_created, process_resumed)
+}
+
+fn spawn_internal<F, G>(
+    invocation: &Invocation,
+    cwd: Option<&str>,
+    bidirectional: bool,
+    process_created: F,
+    process_resumed: G,
+) -> Result<ContainedChild, SpawnError>
+where
+    F: FnOnce(u32) -> Result<(), String>,
+    G: FnOnce(u32) -> Result<(), String>,
+{
     let executable = resolve_executable(&invocation.command).map_err(|message| SpawnError {
         message,
         started: false,
@@ -281,28 +315,45 @@ where
             });
         }
     };
-    let nul_name = wide_null(OsStr::new("NUL"));
-    let stdin = unsafe {
-        CreateFileW(
-            nul_name.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &mut attributes,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut(),
-        )
+    let (stdin, parent_stdin) = if bidirectional {
+        match create_input_pipe(&mut attributes) {
+            Ok((child_read, parent_write)) => (child_read, Some(parent_write)),
+            Err(message) => {
+                close(stdout_read);
+                close(stdout_write);
+                close(stderr_read);
+                close(stderr_write);
+                return Err(SpawnError {
+                    message,
+                    started: false,
+                });
+            }
+        }
+    } else {
+        let nul_name = wide_null(OsStr::new("NUL"));
+        let handle = unsafe {
+            CreateFileW(
+                nul_name.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                (&mut attributes as *mut SecurityAttributes).cast(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            close(stdout_read);
+            close(stdout_write);
+            close(stderr_read);
+            close(stderr_write);
+            return Err(SpawnError {
+                message: last_error("CreateFileW(NUL)"),
+                started: false,
+            });
+        }
+        (handle, None)
     };
-    if stdin == INVALID_HANDLE_VALUE {
-        close(stdout_read);
-        close(stdout_write);
-        close(stderr_read);
-        close(stderr_write);
-        return Err(SpawnError {
-            message: last_error("CreateFileW(NUL)"),
-            started: false,
-        });
-    }
 
     let job = unsafe { CreateJobObjectW(null(), null()) };
     if job.is_null() {
@@ -311,6 +362,9 @@ where
         close(stderr_read);
         close(stderr_write);
         close(stdin);
+        if let Some(handle) = parent_stdin {
+            close(handle);
+        }
         return Err(SpawnError {
             message: last_error("CreateJobObjectW"),
             started: false,
@@ -366,6 +420,9 @@ where
     if created == 0 {
         close(stdout_read);
         close(stderr_read);
+        if let Some(handle) = parent_stdin {
+            close(handle);
+        }
         close(job);
         return Err(SpawnError {
             message: last_error("CreateProcessW"),
@@ -382,6 +439,9 @@ where
             CloseHandle(job);
             CloseHandle(stdout_read);
             CloseHandle(stderr_read);
+            if let Some(handle) = parent_stdin {
+                CloseHandle(handle);
+            }
         }
         SpawnError {
             message,
@@ -409,6 +469,9 @@ where
             CloseHandle(job);
             CloseHandle(stdout_read);
             CloseHandle(stderr_read);
+            if let Some(handle) = parent_stdin {
+                CloseHandle(handle);
+            }
         }
         return Err(SpawnError {
             message: format!("process-resumed observer failed: {error}"),
@@ -416,11 +479,13 @@ where
         });
     }
 
+    let stdin = parent_stdin.map(|handle| unsafe { File::from_raw_handle(handle) });
     let stdout = unsafe { File::from_raw_handle(stdout_read) };
     let stderr = unsafe { File::from_raw_handle(stderr_read) };
     Ok(ContainedChild {
         process: process_info.process,
         job,
+        stdin,
         stdout: Some(stdout),
         stderr: Some(stderr),
         terminated: false,
@@ -434,6 +499,20 @@ fn create_pipe(attributes: &mut SecurityAttributes) -> Result<(Handle, Handle), 
         return Err(last_error("CreatePipe"));
     }
     if unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        close(read);
+        close(write);
+        return Err(last_error("SetHandleInformation"));
+    }
+    Ok((read, write))
+}
+
+fn create_input_pipe(attributes: &mut SecurityAttributes) -> Result<(Handle, Handle), String> {
+    let mut read = null_mut();
+    let mut write = null_mut();
+    if unsafe { CreatePipe(&mut read, &mut write, attributes, 0) } == 0 {
+        return Err(last_error("CreatePipe"));
+    }
+    if unsafe { SetHandleInformation(write, HANDLE_FLAG_INHERIT, 0) } == 0 {
         close(read);
         close(write);
         return Err(last_error("SetHandleInformation"));
@@ -632,6 +711,52 @@ mod tests {
         assert_eq!(output.trim(), "contained");
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "created");
+        assert_eq!(events[1].0, "resumed");
+        assert_eq!(events[0].1, events[1].1);
+    }
+
+    #[test]
+    fn bidirectional_spawn_keeps_assignment_before_resume_and_round_trips_stdin() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let created_events = Arc::clone(&events);
+        let resumed_events = Arc::clone(&events);
+        let invocation = Invocation::new(
+            "cmd.exe",
+            vec![
+                "/D".to_string(),
+                "/V:ON".to_string(),
+                "/C".to_string(),
+                "set /p line=& echo(!line!".to_string(),
+            ],
+        );
+        let mut child = spawn_bidirectional(
+            &invocation,
+            None,
+            move |process_id| {
+                created_events.lock().unwrap().push(("created", process_id));
+                Ok(())
+            },
+            move |process_id| {
+                resumed_events.lock().unwrap().push(("resumed", process_id));
+                Ok(())
+            },
+        )
+        .map_err(|error| error.message)
+        .unwrap();
+        let mut stdin = child.take_stdin().unwrap();
+        stdin.write_all(b"acp-round-trip\r\n").unwrap();
+        stdin.flush().unwrap();
+        drop(stdin);
+        let mut output = String::new();
+        child
+            .take_stdout()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert_eq!(child.wait().unwrap(), 0);
+        assert_eq!(output.trim(), "acp-round-trip");
+        let events = events.lock().unwrap();
         assert_eq!(events[0].0, "created");
         assert_eq!(events[1].0, "resumed");
         assert_eq!(events[0].1, events[1].1);

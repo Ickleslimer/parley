@@ -5,6 +5,7 @@ use std::process::Command;
 
 use crate::context::{refuse_reparse_chain, ContextMode, ContextRecovery};
 use crate::jobs::{HandoffMode, JobMode};
+use crate::peer_session::ConversationMode;
 
 const HARDENED_GROK_DENIES: &[&str] = &[
     "WebFetch",
@@ -130,6 +131,7 @@ pub(crate) struct RuntimePolicy {
     grok_max_turns: Option<u64>,
     grok_denies: Vec<String>,
     grok_allows: Vec<String>,
+    grok_health_query_exe: Option<PathBuf>,
     grok_health_query_command: Option<String>,
     grok_require_handoff_footer: bool,
     grok_subagent_mode: GrokSubagentMode,
@@ -137,6 +139,8 @@ pub(crate) struct RuntimePolicy {
     context_locked_source: Option<String>,
     context_locked_mode: Option<ContextMode>,
     context_require_explicit_session: bool,
+    grok_default_conversation_mode: ConversationMode,
+    grok_canonical_epoch: u64,
     handoff: Option<HandoffPolicy>,
 }
 
@@ -196,6 +200,7 @@ pub(crate) struct ContextPolicyRequest<'a> {
     pub max_context_chars: Option<usize>,
     pub session_id: Option<&'a str>,
     pub resume_id: Option<&'a str>,
+    pub allow_missing_target: bool,
 }
 
 impl Default for RuntimePolicy {
@@ -212,6 +217,7 @@ impl Default for RuntimePolicy {
             grok_max_turns: None,
             grok_denies: Vec::new(),
             grok_allows: Vec::new(),
+            grok_health_query_exe: None,
             grok_health_query_command: None,
             grok_require_handoff_footer: false,
             grok_subagent_mode: GrokSubagentMode::Unspecified,
@@ -219,6 +225,8 @@ impl Default for RuntimePolicy {
             context_locked_source: None,
             context_locked_mode: None,
             context_require_explicit_session: false,
+            grok_default_conversation_mode: ConversationMode::Isolated,
+            grok_canonical_epoch: 0,
             handoff: None,
         }
     }
@@ -392,6 +400,16 @@ impl RuntimePolicy {
             .transpose()?;
         let context_require_explicit_session =
             env_bool("PARLEY_CONTEXT_REQUIRE_EXPLICIT_SESSION")?.unwrap_or(false);
+        let grok_default_conversation_mode = env_nonempty("PARLEY_GROK_DEFAULT_CONVERSATION_MODE")
+            .map(|value| ConversationMode::parse(&value))
+            .transpose()?
+            .unwrap_or_default();
+        let grok_canonical_epoch = match env_nonempty("PARLEY_GROK_CANONICAL_EPOCH") {
+            Some(value) => value.parse::<u64>().map_err(|_| {
+                format!("PARLEY_GROK_CANONICAL_EPOCH must be a non-negative integer, got {value}")
+            })?,
+            None => 0,
+        };
         if grok_require_handoff_footer && grok_health_query_exe.is_none() {
             return Err(
                 "PARLEY_GROK_REQUIRE_HANDOFF_FOOTER requires PARLEY_GROK_HEALTH_QUERY_EXE"
@@ -483,6 +501,7 @@ impl RuntimePolicy {
             grok_max_turns,
             grok_denies,
             grok_allows,
+            grok_health_query_exe,
             grok_health_query_command,
             grok_require_handoff_footer,
             grok_subagent_mode,
@@ -490,6 +509,8 @@ impl RuntimePolicy {
             context_locked_source,
             context_locked_mode,
             context_require_explicit_session,
+            grok_default_conversation_mode,
+            grok_canonical_epoch,
             handoff,
         })
     }
@@ -648,6 +669,7 @@ impl RuntimePolicy {
             max_context_chars,
             session_id,
             resume_id,
+            allow_missing_target,
         } = request;
         if let Some(locked) = &self.context_locked_source {
             if !source_harness.is_empty() && source_harness != locked {
@@ -693,6 +715,15 @@ impl RuntimePolicy {
         if max_context_chars.is_some() {
             return Err("--max-context applies only to snapshot context mode".to_string());
         }
+        if allow_missing_target {
+            if session_id.is_some() || resume_id.is_some() {
+                return Err(
+                    "canonical context preflight requires caller session ids to be omitted"
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        }
         if session_id.is_none() && resume_id.is_none() {
             return Err(
                 "stateful context requires an explicit target session_id or resume_id".to_string(),
@@ -731,6 +762,61 @@ impl RuntimePolicy {
             ContextMode::Snapshot => unreachable!(),
         }
         Ok(())
+    }
+
+    pub(crate) fn resolve_conversation_mode(
+        &self,
+        target_harness: &str,
+        requested: Option<ConversationMode>,
+    ) -> ConversationMode {
+        requested.unwrap_or_else(|| {
+            if target_harness == "grok" {
+                self.grok_default_conversation_mode
+            } else {
+                ConversationMode::Isolated
+            }
+        })
+    }
+
+    pub(crate) fn grok_canonical_epoch(&self) -> u64 {
+        self.grok_canonical_epoch
+    }
+
+    pub(crate) fn restrict_image_sources(&self) -> bool {
+        self.allowed_cwd_root.is_some()
+            || self.grok_locked_model.is_some()
+            || self.grok_locked_permission_mode.is_some()
+    }
+
+    pub(crate) fn image_health_query_exe(&self) -> Option<&Path> {
+        self.grok_health_query_exe.as_deref()
+    }
+
+    pub(crate) fn allowed_cwd_root(&self) -> Option<&Path> {
+        self.allowed_cwd_root.as_deref()
+    }
+
+    pub(crate) fn grok_locked_model(&self) -> Option<&str> {
+        self.grok_locked_model.as_deref()
+    }
+
+    pub(crate) fn grok_locked_version(&self) -> Option<&str> {
+        self.grok_locked_version.as_deref()
+    }
+
+    pub(crate) fn validate_locked_grok_version(&self) -> Result<(), String> {
+        match self.grok_locked_version.as_deref() {
+            Some(expected) => validate_grok_version(expected),
+            None => Err("a locked Grok CLI version is required".to_string()),
+        }
+    }
+
+    pub(crate) fn grok_locked_reasoning_effort(&self) -> Option<&str> {
+        self.grok_locked_reasoning_effort.as_deref()
+    }
+
+    pub(crate) fn grok_locked_permission_mode(&self) -> Option<&str> {
+        self.grok_locked_permission_mode.as_deref()
     }
 
     pub(crate) fn grok_denies(&self) -> &[String] {
@@ -784,6 +870,21 @@ impl RuntimePolicy {
         prompt.push_str("TWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: <usage_sample|quota_exhausted|unavailable>\nincident_id: <id|none>\nas_of_ms: <integer|unknown>\n");
         prompt.push_str("Include event_id and exchange_id only when present. End with: continuity: not_authorized\n");
         prompt.push_str("Stale or unavailable evidence never means the peer is down. Do not retry the query or authorize continuation.\n");
+    }
+
+    pub(crate) fn apply_image_handoff_contract(&self, harness: &str, prompt: &mut String) {
+        if harness != "grok" || !self.grok_require_handoff_footer {
+            return;
+        }
+        if self.grok_health_query_exe.is_none() {
+            return;
+        }
+        prompt.push_str("\n\nTWO CHAIRS LOCKED RESPONSE CONTRACT\n");
+        prompt.push_str("The private image broker also exposes get_peer_health. Immediately before finishing, call that zero-argument read-only tool exactly once.\n");
+        prompt.push_str("Keep the normal final response self-contained. End the response with this exact field block, copying only current evidence from the returned query JSON:\n");
+        prompt.push_str("TWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: <usage_sample|quota_exhausted|unavailable>\nincident_id: <id|none>\nas_of_ms: <integer|unknown>\n");
+        prompt.push_str("Include event_id and exchange_id only when present. End with: continuity: not_authorized\n");
+        prompt.push_str("Stale or unavailable evidence never means the peer is down. Do not retry either private tool or authorize continuation.\n");
     }
 
     pub(crate) fn resolve_handoff_mode(
@@ -1372,6 +1473,7 @@ mod tests {
                 max_context_chars: None,
                 session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903"),
                 resume_id: None,
+                allow_missing_target: false,
             })
             .unwrap();
         assert_eq!(source, "codex");
@@ -1390,6 +1492,7 @@ mod tests {
                 max_context_chars: None,
                 session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903"),
                 resume_id: None,
+                allow_missing_target: false,
             })
             .unwrap_err()
             .contains("source is locked"));
@@ -1407,9 +1510,70 @@ mod tests {
                 max_context_chars: None,
                 session_id: Some("01a06582-d66e-7811-b0c9-0b0266e17903"),
                 resume_id: None,
+                allow_missing_target: false,
             })
             .unwrap_err()
             .contains("mode is locked"));
+    }
+
+    #[test]
+    fn canonical_defaults_remain_overridable_by_explicit_isolation() {
+        let generic = RuntimePolicy::default();
+        assert_eq!(
+            generic.resolve_conversation_mode("grok", None),
+            ConversationMode::Isolated
+        );
+
+        let locked = RuntimePolicy {
+            grok_default_conversation_mode: ConversationMode::Canonical,
+            grok_canonical_epoch: 7,
+            ..RuntimePolicy::default()
+        };
+        assert_eq!(
+            locked.resolve_conversation_mode("grok", None),
+            ConversationMode::Canonical
+        );
+        assert_eq!(
+            locked.resolve_conversation_mode("grok", Some(ConversationMode::Isolated)),
+            ConversationMode::Isolated
+        );
+        assert_eq!(
+            locked.resolve_conversation_mode("claude", None),
+            ConversationMode::Isolated
+        );
+        assert_eq!(
+            locked.resolve_conversation_mode("claude", Some(ConversationMode::Canonical)),
+            ConversationMode::Canonical
+        );
+        assert_eq!(locked.grok_canonical_epoch(), 7);
+    }
+
+    #[test]
+    fn canonical_context_preflight_applies_locks_before_target_derivation() {
+        let policy = RuntimePolicy {
+            context_locked_source: Some("codex".to_string()),
+            context_locked_mode: Some(ContextMode::Auto),
+            context_require_explicit_session: true,
+            ..RuntimePolicy::default()
+        };
+        let mut source = String::new();
+        let mut mode = ContextMode::Snapshot;
+        policy
+            .apply_context(ContextPolicyRequest {
+                target_harness: "grok",
+                source_harness: &mut source,
+                source_session: "codex-session",
+                mode: &mut mode,
+                mode_explicit: false,
+                recovery: None,
+                max_context_chars: None,
+                session_id: None,
+                resume_id: None,
+                allow_missing_target: true,
+            })
+            .unwrap();
+        assert_eq!(source, "codex");
+        assert_eq!(mode, ContextMode::Auto);
     }
 
     #[test]
@@ -1452,6 +1616,7 @@ mod tests {
                     max_context_chars: None,
                     session_id,
                     resume_id,
+                    allow_missing_target: false,
                 })
                 .unwrap_err();
             assert!(error.contains(expected), "{error}");
@@ -1470,6 +1635,7 @@ mod tests {
                 max_context_chars: None,
                 session_id: Some("new"),
                 resume_id: None,
+                allow_missing_target: false,
             })
             .unwrap_err();
         assert!(error.contains("only supported for Grok"));
@@ -1487,6 +1653,7 @@ mod tests {
                 max_context_chars: Some(1_000),
                 session_id: Some("new"),
                 resume_id: None,
+                allow_missing_target: false,
             })
             .unwrap_err();
         assert!(error.contains("only to snapshot"));
@@ -1579,6 +1746,23 @@ mod tests {
         let mut other = "task".to_string();
         policy.apply_handoff_contract("codex", &mut other);
         assert_eq!(other, "task");
+    }
+
+    #[test]
+    fn image_handoff_contract_uses_only_the_private_health_tool() {
+        let query = PathBuf::from(r"C:\Program Files\Parley\parley-health-query.exe");
+        let policy = RuntimePolicy {
+            grok_health_query_exe: Some(query.clone()),
+            grok_health_query_command: Some(query.to_string_lossy().into_owned()),
+            grok_require_handoff_footer: true,
+            ..RuntimePolicy::default()
+        };
+        let mut prompt = "task".to_string();
+        policy.apply_image_handoff_contract("grok", &mut prompt);
+        assert!(prompt.contains("get_peer_health"));
+        assert!(prompt.contains("continuity: not_authorized"));
+        assert!(!prompt.contains(query.to_string_lossy().as_ref()));
+        assert!(!prompt.contains("executing only the exact peer-health query"));
     }
 
     #[test]

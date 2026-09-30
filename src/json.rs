@@ -18,6 +18,16 @@ impl Json {
         Ok(value)
     }
 
+    pub(crate) fn parse_exact(input: &str) -> Result<Self, String> {
+        let mut parser = Parser::new(input);
+        let value = parser.parse_value()?;
+        parser.skip_whitespace();
+        if parser.pos != parser.input.len() {
+            return Err("unexpected trailing JSON data".to_string());
+        }
+        Ok(value)
+    }
+
     pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Object(map) => map.get(key),
@@ -529,5 +539,18 @@ mod tests {
     fn handles_empty_structures() {
         assert_eq!(Json::parse("{}").unwrap(), Json::Object(BTreeMap::new()));
         assert_eq!(Json::parse("[]").unwrap(), Json::Array(Vec::new()));
+    }
+
+    #[test]
+    fn exact_parser_rejects_trailing_protocol_data() {
+        assert_eq!(
+            Json::parse_exact("{\"ok\":true}\r\n")
+                .unwrap()
+                .get("ok")
+                .and_then(Json::as_bool),
+            Some(true)
+        );
+        assert!(Json::parse_exact("{} garbage").is_err());
+        assert!(Json::parse_exact("{}{}").is_err());
     }
 }

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::error::ErrorKind;
 use super::journal::{ContextKey, CursorState, JournalStore};
-use super::plan::{ContextBounds, PlanKind};
+use super::plan::{fingerprint_records, ContextBounds, PlanKind};
 use super::reader::{SharedJsonlReader, MAX_PHYSICAL_RECORD};
 use super::root::{resolve_codex_rollout, resolve_codex_sessions_root, CodexHomeEnv};
 use super::sanitize::visible_messages;
@@ -51,6 +51,21 @@ fn write_rollout(codex_home: &Path, session: &str, body: &str) -> PathBuf {
     let path = dir.join(format!("rollout-2026-09-21T00-00-00-{session}.jsonl"));
     fs::write(&path, body).unwrap();
     path
+}
+
+fn append_oversized_compacted(path: &Path, payload_bytes: usize) {
+    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(br#"{"type":"compacted","payload":{"message":""#)
+        .unwrap();
+    let chunk = [b'x'; 64 * 1024];
+    let mut remaining = payload_bytes;
+    while remaining > 0 {
+        let write = remaining.min(chunk.len());
+        file.write_all(&chunk[..write]).unwrap();
+        remaining -= write;
+    }
+    file.write_all(b"\"}}\n").unwrap();
+    file.flush().unwrap();
 }
 
 fn jsonl(lines: &[String]) -> String {
@@ -336,11 +351,173 @@ fn reader_accepts_bom_crlf_unicode_and_retains_incomplete_tail() {
     let mut reader = SharedJsonlReader::open(&path).unwrap();
     let batch = reader.read_from(0).unwrap();
     assert_eq!(batch.records.len(), 3);
+    assert_eq!(batch.record_count, 3);
+    assert_eq!(batch.fingerprint, fingerprint_records(&batch.records));
     assert_eq!(batch.records[0].start_offset, 3);
     assert!(!batch.incomplete_tail.is_empty());
+    assert_eq!(
+        batch.incomplete_tail_len,
+        batch.incomplete_tail.len() as u64
+    );
+    assert!(!batch.incomplete_tail_oversized);
     let messages = visible_messages(&batch.records).unwrap();
     assert_eq!(messages[0].text, "café 😀");
     assert_eq!(messages[0].text.chars().count(), 6);
+}
+
+#[test]
+fn reader_skips_only_closed_invalid_utf8_tool_output_records() {
+    let home = temp_dir("invalid-utf8-excluded-home");
+    let path = write_rollout(
+        &home,
+        "sess-invalid-utf8-excluded",
+        &jsonl(&[session_meta("sess-invalid-utf8-excluded")]),
+    );
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(br#"{"timestamp":"x","type":"response_item","payload":{"type":"custom_tool_call_output","id":"one","output":"before "#)
+        .unwrap();
+    file.write_all(&[0xf8]).unwrap();
+    file.write_all(b" after\"}}\n").unwrap();
+    file.write_all(user_msg("u1", "visible after excluded bytes").as_bytes())
+        .unwrap();
+    file.write_all(b"\n").unwrap();
+    file.flush().unwrap();
+
+    let mut reader = SharedJsonlReader::open(&path).unwrap();
+    let batch = reader.read_from(0).unwrap();
+    assert_eq!(batch.record_count, 3);
+    assert_eq!(batch.records.len(), 2);
+    assert_eq!(batch.skipped_invalid_utf8, 1);
+    let messages = visible_messages(&batch.records).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text, "visible after excluded bytes");
+
+    let visible = write_rollout(&home, "sess-invalid-utf8-visible", "");
+    let mut bytes = br#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":""#.to_vec();
+    bytes.push(0xf8);
+    bytes.extend_from_slice(b"\"}]}}\n");
+    fs::write(&visible, bytes).unwrap();
+    let mut reader = SharedJsonlReader::open(&visible).unwrap();
+    assert_eq!(reader.read_from(0).unwrap_err().kind, ErrorKind::Malformed);
+}
+
+#[test]
+fn reader_skips_only_valid_oversized_excluded_records() {
+    let home = temp_dir("oversized-reader-home");
+    let path = write_rollout(
+        &home,
+        "sess-oversized-reader",
+        &jsonl(&[session_meta("sess-oversized-reader")]),
+    );
+    append_oversized_compacted(&path, 256);
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(user_msg("u1", "visible").as_bytes())
+        .unwrap();
+    file.write_all(b"\n").unwrap();
+    file.flush().unwrap();
+
+    let mut reader = SharedJsonlReader::open_with_limit(&path, 200).unwrap();
+    let batch = reader.read_from(0).unwrap();
+    assert_eq!(batch.records.len(), 2);
+    assert_eq!(batch.record_count, 3);
+    assert_eq!(batch.skipped_oversized, 1);
+    assert_ne!(batch.fingerprint, fingerprint_records(&batch.records));
+    let exact = reader.read_until(0, batch.complete_end).unwrap();
+    assert_eq!(exact.fingerprint, batch.fingerprint);
+    assert_eq!(exact.record_count, batch.record_count);
+}
+
+#[test]
+fn reader_defers_an_oversized_incomplete_tail_until_newline() {
+    let home = temp_dir("oversized-tail-home");
+    let path = write_rollout(
+        &home,
+        "sess-oversized-tail",
+        &jsonl(&[session_meta("sess-oversized-tail")]),
+    );
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(br#"{"type":"compacted","payload":{"message":""#)
+        .unwrap();
+    file.write_all(&[b'x'; 256]).unwrap();
+    file.flush().unwrap();
+
+    let mut reader = SharedJsonlReader::open_with_limit(&path, 64).unwrap();
+    let first = reader.read_from(0).unwrap();
+    assert!(first.incomplete_tail.is_empty());
+    assert!(first.incomplete_tail_oversized);
+    assert!(first.incomplete_tail_len > 64);
+    assert_eq!(first.record_count, 1);
+
+    file.write_all(b"\"}}\n").unwrap();
+    file.flush().unwrap();
+    let completed = reader.read_from(first.complete_end).unwrap();
+    assert_eq!(completed.record_count, 1);
+    assert_eq!(completed.skipped_oversized, 1);
+    assert!(!completed.incomplete_tail_oversized);
+}
+
+#[test]
+fn oversized_eligible_unknown_and_ambiguous_records_fail_closed() {
+    let home = temp_dir("oversized-deny-home");
+    let cases = [
+        r#"{"type":"response_item","payload":{"type":"message"}}"#,
+        r#"{"type":"future_record","payload":{}}"#,
+        r#"{"payload":{"type":"compacted"}}"#,
+        r#"{"type":"compacted","type":"compacted"}"#,
+    ];
+    for (index, line) in cases.iter().enumerate() {
+        let path = write_rollout(
+            &home,
+            &format!("sess-oversized-deny-{index}"),
+            &format!("{line}\n"),
+        );
+        let mut reader = SharedJsonlReader::open_with_limit(&path, 16).unwrap();
+        assert_eq!(reader.read_from(0).unwrap_err().kind, ErrorKind::Malformed);
+    }
+}
+
+#[test]
+fn delta_cursor_round_trips_across_a_real_oversized_compacted_record() {
+    let home = temp_dir("oversized-delta-home");
+    let path = write_rollout(
+        &home,
+        "sess-oversized-delta",
+        &jsonl(&[
+            session_meta("sess-oversized-delta"),
+            turn_context("turn-1"),
+            user_msg("u1", "ONE"),
+        ]),
+    );
+    let state = temp_dir("oversized-delta-state");
+    let store = store_at(&state);
+    let source = resolve(&home, "sess-oversized-delta");
+    let context_key = key("grok-oversized-delta", "sess-oversized-delta");
+    commit_seed(&store, &context_key, &source, 100, "ex-seed");
+
+    append_oversized_compacted(&path, MAX_PHYSICAL_RECORD);
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(turn_context("turn-2").as_bytes()).unwrap();
+    file.write_all(b"\n").unwrap();
+    file.write_all(user_msg("u2", "TWO").as_bytes()).unwrap();
+    file.write_all(b"\n").unwrap();
+    file.flush().unwrap();
+
+    let source = resolve(&home, "sess-oversized-delta");
+    let delta = store
+        .plan_resume_delta(&context_key, &source, &bounds(100, 100, 100))
+        .unwrap();
+    assert!(delta.text.contains("TWO"));
+    assert_eq!(delta.record_count, 3);
+    store
+        .append_in_flight(&context_key, &delta, "ex-delta")
+        .unwrap();
+    store.commit(&context_key, &delta, "ex-delta").unwrap();
+
+    let empty = store
+        .plan_resume_delta(&context_key, &source, &bounds(100, 100, 100))
+        .unwrap();
+    assert!(empty.text.is_empty());
+    assert_eq!(empty.record_count, 0);
 }
 
 #[test]
@@ -436,6 +613,43 @@ fn sanitizer_reads_codex_metadata_passthrough_turn_ids() {
     let batch = reader.read_from(0).unwrap();
     let messages = visible_messages(&batch.records).unwrap();
     assert_eq!(messages[0].turn_id, "turn-from-metadata");
+}
+
+#[test]
+fn sanitizer_bounds_message_and_turn_identifiers() {
+    let home = temp_dir("bounded-identifiers-home");
+    let long_id = "x".repeat(257);
+
+    let message_path = write_rollout(
+        &home,
+        "sess-long-message-id",
+        &jsonl(&[
+            session_meta("sess-long-message-id"),
+            user_msg(&long_id, "visible"),
+        ]),
+    );
+    let mut reader = SharedJsonlReader::open(&message_path).unwrap();
+    let batch = reader.read_from(0).unwrap();
+    assert_eq!(
+        visible_messages(&batch.records).unwrap_err().kind,
+        ErrorKind::Overflow
+    );
+
+    let turn_path = write_rollout(
+        &home,
+        "sess-long-turn-id",
+        &jsonl(&[
+            session_meta("sess-long-turn-id"),
+            turn_context(&long_id),
+            user_msg("u1", "visible"),
+        ]),
+    );
+    let mut reader = SharedJsonlReader::open(&turn_path).unwrap();
+    let batch = reader.read_from(0).unwrap();
+    assert_eq!(
+        visible_messages(&batch.records).unwrap_err().kind,
+        ErrorKind::Overflow
+    );
 }
 
 #[test]
@@ -644,6 +858,11 @@ fn replay_uses_exact_uncertain_range_and_skip_then_delta_advances() {
     assert!(replay.text.contains("ONE"));
     assert!(!replay.text.contains("TWO"));
     assert_eq!(replay.end_offset, seed.end_offset);
+    assert_eq!(replay.fingerprint, seed.fingerprint);
+    assert_eq!(replay.record_count, seed.record_count);
+    assert_eq!(replay.character_count, seed.character_count);
+    assert_eq!(replay.first_message, seed.first_message);
+    assert_eq!(replay.last_message, seed.last_message);
 
     let skip_delta = restarted
         .plan_skip_then_delta(&key, &source, &bounds(100, 100, 100), "ex-skip")

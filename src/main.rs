@@ -2,14 +2,18 @@ mod ask;
 mod cli;
 mod config;
 mod context;
+mod continuation;
 mod converse;
 mod convert;
 mod event_log;
 mod fsx;
 mod fuse;
+#[cfg(windows)]
+mod grok_acp;
 mod grok_subagents;
 mod harness;
 mod health_report;
+mod image_attachments;
 mod installer;
 mod job_lock;
 mod job_runtime;
@@ -19,6 +23,7 @@ mod lane_grants;
 mod lane_plan;
 mod mcp;
 mod model;
+mod peer_session;
 mod policy;
 mod process;
 mod profile_namespace;
@@ -46,7 +51,15 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let action = parse_args(env::args().skip(1), EnvDefaults::load())?;
+    let mut args = env::args().skip(1).peekable();
+    if args.peek().map(String::as_str) == Some("__parley-image-mcp") {
+        args.next();
+        if args.next().is_some() {
+            return Err("private image broker accepts no arguments".to_string());
+        }
+        return image_attachments::run_private_mcp_from_env();
+    }
+    let action = parse_args(args, EnvDefaults::load())?;
 
     match action {
         CliAction::Help => {
@@ -64,6 +77,7 @@ fn run() -> Result<(), String> {
         CliAction::Convert(options) => convert::run_convert(options),
         CliAction::Resume(options) => session::run_resume(options),
         CliAction::Ask(options) => ask::run_cli(options),
+        CliAction::Continuation(options) => continuation::run_cli(options),
         CliAction::Converse(options) => converse::run_cli(options),
         CliAction::Fuse(options) => fuse::run_cli(options),
         CliAction::Mcp(options) => mcp::dispatch(options),

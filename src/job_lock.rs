@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ask::AskRequest;
 use crate::context::refuse_reparse_chain;
+use crate::peer_session::ConversationMode;
 use crate::profile_namespace;
 use crate::signals::fnv1a_64;
 
@@ -16,7 +17,8 @@ pub(crate) struct ExecutionLease {
 
 impl ExecutionLease {
     pub(crate) fn acquire_for_request(req: &AskRequest, owner: &str) -> Result<Self, String> {
-        let Some(root) = configured_root()? else {
+        let Some(root) = require_conversation_root(req.conversation_mode, configured_root()?)?
+        else {
             return Ok(Self { _files: Vec::new() });
         };
         if req.harness != "grok" {
@@ -67,6 +69,19 @@ impl ExecutionLease {
         }
         acquire(&root, keys, owner)
     }
+}
+
+fn require_conversation_root(
+    conversation_mode: Option<ConversationMode>,
+    root: Option<PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    if conversation_mode == Some(ConversationMode::Canonical) && root.is_none() {
+        return Err(
+            "canonical conversation mode requires PARLEY_ASYNC_JOBS_ENABLED=true and PARLEY_JOB_STATE_DIR so the native session has a cross-process execution lease"
+                .to_string(),
+        );
+    }
+    Ok(root)
 }
 
 fn configured_root() -> Result<Option<PathBuf>, String> {
@@ -195,6 +210,24 @@ fn sanitize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_conversations_require_a_configured_execution_lease() {
+        assert!(require_conversation_root(Some(ConversationMode::Canonical), None).is_err());
+        assert!(
+            require_conversation_root(Some(ConversationMode::Isolated), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(require_conversation_root(None, None).unwrap().is_none());
+
+        let root = PathBuf::from(r"C:\parley-jobs");
+        assert_eq!(
+            require_conversation_root(Some(ConversationMode::Canonical), Some(root.clone()))
+                .unwrap(),
+            Some(root)
+        );
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         let root = env::temp_dir().join(format!(

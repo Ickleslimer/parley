@@ -104,9 +104,11 @@ pub(crate) fn run_cli(options: ConverseOptions) -> Result<(), String> {
             max_turns: None,
             session_id: None,
             resume_id: None,
+            conversation_mode: Some(crate::peer_session::ConversationMode::Isolated),
             yolo: options.yolo,
             context: None,
             max_context_chars: Some(max_context),
+            images: Vec::new(),
             allow_subagents: false,
         };
 

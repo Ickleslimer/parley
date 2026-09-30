@@ -5,11 +5,10 @@
 //! scoped, like every harness's own `--resume`, to a working directory.
 //!
 //! Built on the crate's zero-dependency `Json` type. The protocol surface is
-//! intentionally small: `initialize`, `tools/list`, and `tools/call` with five
-//! tools — three for session discovery/resume, `ask_agent` for one-shot
-//! agent-to-agent calls, and `fuse` to convene a panel of agents on one prompt.
-//! Resume tools return *commands* as text and never spawn an interactive
-//! harness; `ask_agent` and `fuse` run the target agents headless.
+//! intentionally small: `initialize`, `tools/list`, and `tools/call` expose
+//! session discovery, headless collaboration, contained jobs, and opt-in locked
+//! continuation controls. Resume tools return *commands* as text and never
+//! spawn an interactive harness; agent calls run their targets headless.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -19,14 +18,17 @@ use std::path::{Path, PathBuf};
 
 use crate::ask::{self, AskRequest, ContextRef};
 use crate::cli::{McpMode, McpOptions};
+use crate::continuation;
 use crate::event_log::ExchangeReceipt;
 use crate::fsx;
 use crate::fuse;
 use crate::harness::{normalize_harness, Invocation};
 use crate::health_report::HealthReporter;
+use crate::image_attachments::{ImageAttachment, MAX_IMAGES};
 use crate::job_runtime::{self, JobRuntime};
 use crate::jobs::{HandoffMode, JobMode, JobSpec, MAX_LISTED_JOBS};
 use crate::json::Json;
+use crate::peer_session::ConversationMode;
 use crate::policy::RuntimePolicy;
 use crate::process::{capture_invocation, run_invocation};
 use crate::session;
@@ -510,10 +512,26 @@ fn tools_list_result() -> Json {
     };
     let ask_tool = tool(
         "ask_agent",
-        "Ask another agent (including Grok) a headless question and return its reply. Use session_id for a new native session or resume_id to continue one. Optionally seed it with another agent's transcript via context_from.",
+        "Ask another agent (including Grok) a headless question and return its reply. Use session_id for a new native session or resume_id to continue one. Optionally seed it with another agent's transcript via context_from or attach validated images to a synchronous Grok turn.",
         obj(vec![
             ("harness", str_prop("Target agent to ask (shorthands allowed).")),
             ("prompt", str_prop("The question or task for the target agent.")),
+            (
+                "images",
+                obj(vec![
+                    ("type", Json::Str("array".to_string())),
+                    ("minItems", Json::Number(1.0)),
+                    ("maxItems", Json::Number(MAX_IMAGES as f64)),
+                    (
+                        "items",
+                        str_prop("Absolute PNG, JPEG, or WebP path to attach to this Grok turn."),
+                    ),
+                    (
+                        "description",
+                        Json::Str("Optional image paths for a synchronous Grok turn. Image bytes and paths are never written to the Parley event log.".to_string()),
+                    ),
+                ]),
+            ),
             ("model", str_prop("Optional model override.")),
             (
                 "reasoning_effort",
@@ -539,6 +557,28 @@ fn tools_list_result() -> Json {
             ("permission_mode", str_prop("Optional target permission mode.")),
             ("session_id", str_prop("UUID for a new native session.")),
             ("resume_id", str_prop("Existing native session id to continue.")),
+            (
+                "conversation_mode",
+                obj(vec![
+                    ("type", Json::Str("string".to_string())),
+                    (
+                        "enum",
+                        Json::Array(
+                            ["isolated", "canonical"]
+                                .into_iter()
+                                .map(|value| Json::Str(value.to_string()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "description",
+                        Json::Str(
+                            "Use an explicit native session or Parley's canonical Grok peer session."
+                                .to_string(),
+                        ),
+                    ),
+                ]),
+            ),
             (
                 "max_turns",
                 obj(vec![
@@ -732,7 +772,7 @@ fn tools_list_result() -> Json {
                     "writable_paths",
                     obj(vec![
                         ("type", Json::Str("array".to_string())),
-                        ("items", grant_schema),
+                        ("items", grant_schema.clone()),
                     ]),
                 ),
             ]),
@@ -787,6 +827,7 @@ fn tools_list_result() -> Json {
         .and_then(Json::as_object)
         .cloned()
         .unwrap_or_default();
+    start_properties.remove("images");
     start_properties.insert(
         "job_id".to_string(),
         str_prop("Caller-generated idempotency UUID."),
@@ -877,6 +918,54 @@ fn tools_list_result() -> Json {
         obj(vec![("job_id", str_prop("Caller-generated job UUID."))]),
         vec!["job_id"],
     );
+    let publish_continuation_tool = tool(
+        "publish_continuation",
+        "Publish one immutable Codex-only emergency continuation grant for the current canonical Grok task. Publication does not start Grok or authorize executable validation.",
+        obj(vec![
+            ("manifest_id", str_prop("Caller-generated manifest UUID.")),
+            (
+                "source_session",
+                str_prop("Explicit current Codex source-session identifier."),
+            ),
+            ("cwd", str_prop("Exact canonical worktree.")),
+            (
+                "writable_paths",
+                obj(vec![
+                    ("type", Json::Str("array".to_string())),
+                    ("items", grant_schema),
+                    ("minItems", Json::Number(1.0)),
+                    ("maxItems", Json::Number(64.0)),
+                ]),
+            ),
+            (
+                "ttl_seconds",
+                obj(vec![
+                    ("type", Json::Str("integer".to_string())),
+                    ("minimum", Json::Number(1.0)),
+                    ("maximum", Json::Number(21_600.0)),
+                ]),
+            ),
+        ]),
+        vec!["manifest_id", "source_session", "cwd", "writable_paths"],
+    );
+    let get_continuation_tool = tool(
+        "get_continuation_evidence",
+        "Read the exact direct user-Grok continuation evidence for the current locked profile without acknowledging or accepting it.",
+        obj(vec![]),
+        vec![],
+    );
+    let review_continuation_tool = tool(
+        "review_continuation",
+        "Record Codex review receipt for one exact aggregate continuation-evidence hash. Receipt does not imply correctness or scientific validation.",
+        obj(vec![
+            ("manifest_id", str_prop("Published continuation manifest UUID.")),
+            (
+                "evidence_hash",
+                str_prop("Exact aggregate hash returned by get_continuation_evidence."),
+            ),
+        ]),
+        vec!["manifest_id", "evidence_hash"],
+    );
 
     obj(vec![(
         "tools",
@@ -891,6 +980,9 @@ fn tools_list_result() -> Json {
             ack_handoff_tool,
             list_job_tool,
             cancel_job_tool,
+            publish_continuation_tool,
+            get_continuation_tool,
+            review_continuation_tool,
             fuse_tool,
         ]),
     )])
@@ -968,6 +1060,13 @@ fn call_tool(
             }
         }
         "start_agent_job" => {
+            if args.get("images").is_some() {
+                return Err((
+                    -32602,
+                    "image attachments are supported only by synchronous ask_agent calls"
+                        .to_string(),
+                ));
+            }
             let job_id = required_arg_string(args, "job_id")?;
             let mode = JobMode::parse(&required_arg_string(args, "job_mode")?)
                 .map_err(|error| (-32602, error))?;
@@ -1072,6 +1171,18 @@ fn call_tool(
                 Err(error) => Ok(text_content(&error, true)),
             }
         }
+        "publish_continuation" => match continuation::publish_from_mcp(args, default_cwd, policy) {
+            Ok(value) => Ok(text_content(&value.to_pretty_string(), false)),
+            Err(error) => Ok(text_content(&error, true)),
+        },
+        "get_continuation_evidence" => match continuation::get_for_codex(policy) {
+            Ok(value) => Ok(text_content(&value.to_pretty_string(), false)),
+            Err(error) => Ok(text_content(&error, true)),
+        },
+        "review_continuation" => match continuation::review_from_mcp(args, policy) {
+            Ok(value) => Ok(text_content(&value.to_pretty_string(), false)),
+            Err(error) => Ok(text_content(&error, true)),
+        },
         "fuse" => {
             let prompt = args
                 .get("prompt")
@@ -1214,6 +1325,17 @@ fn parse_ask_request(
     let harness = required_arg_string(args, "harness")?;
     let prompt = required_arg_string(args, "prompt")?;
     let context = parse_ask_context(args)?;
+    let conversation_mode = match args.get("conversation_mode") {
+        Some(value) => Some(
+            ConversationMode::parse(
+                value
+                    .as_str()
+                    .ok_or((-32602, "conversation_mode must be a string".to_string()))?,
+            )
+            .map_err(|error| (-32602, error))?,
+        ),
+        None => None,
+    };
     let cwd = policy
         .validate_spawn_cwd(&arg_cwd(args, default_cwd))
         .map_err(|error| (-32602, error))?;
@@ -1246,11 +1368,42 @@ fn parse_ask_request(
             .get("resume_id")
             .and_then(Json::as_str)
             .map(str::to_string),
+        conversation_mode,
         yolo,
         context,
         max_context_chars: optional_positive_usize(args, "max_context_chars")?,
+        images: optional_image_attachments(args)?,
         allow_subagents: false,
     })
+}
+
+fn optional_image_attachments(args: &Json) -> Result<Vec<ImageAttachment>, (i64, String)> {
+    let Some(value) = args.get("images") else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or((-32602, "images must be an array".to_string()))?;
+    if values.is_empty() {
+        return Err((-32602, "images must contain at least one path".to_string()));
+    }
+    if values.len() > MAX_IMAGES {
+        return Err((-32602, format!("images accepts at most {MAX_IMAGES} paths")));
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .filter(|path| !path.is_empty())
+                .map(ImageAttachment::source)
+                .ok_or((
+                    -32602,
+                    format!("images[{index}] must be a non-empty string"),
+                ))
+        })
+        .collect()
 }
 
 fn required_arg_string(args: &Json, name: &str) -> Result<String, (i64, String)> {
@@ -1648,7 +1801,7 @@ mod tests {
             .and_then(|r| r.get("tools"))
             .and_then(Json::as_array)
             .unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 14);
         let names: Vec<_> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Json::as_str))
@@ -1663,7 +1816,57 @@ mod tests {
         assert!(names.contains(&"ack_agent_handoff"));
         assert!(names.contains(&"list_agent_jobs"));
         assert!(names.contains(&"cancel_agent_job"));
+        assert!(names.contains(&"publish_continuation"));
+        assert!(names.contains(&"get_continuation_evidence"));
+        assert!(names.contains(&"review_continuation"));
         assert!(names.contains(&"fuse"));
+    }
+
+    #[test]
+    fn continuation_schema_exposes_only_bounded_publication_inputs() {
+        let result = tools_list_result();
+        let tools = result.get("tools").and_then(Json::as_array).unwrap();
+        let publish = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Json::as_str) == Some("publish_continuation"))
+            .unwrap();
+        let schema = publish.get("inputSchema").unwrap();
+        let properties = schema.get("properties").unwrap();
+        for name in [
+            "manifest_id",
+            "source_session",
+            "cwd",
+            "writable_paths",
+            "ttl_seconds",
+        ] {
+            assert!(properties.get(name).is_some(), "missing {name}");
+        }
+        for forbidden in [
+            "session_id",
+            "resume_id",
+            "model",
+            "permission_mode",
+            "yolo",
+        ] {
+            assert!(
+                properties.get(forbidden).is_none(),
+                "unexpected {forbidden}"
+            );
+        }
+        assert!(properties.get("validation_commands").is_none());
+        let review = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Json::as_str) == Some("review_continuation"))
+            .unwrap();
+        let required = review
+            .get("inputSchema")
+            .and_then(|value| value.get("required"))
+            .and_then(Json::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Json::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(required, vec!["manifest_id", "evidence_hash"]);
     }
 
     #[test]
@@ -1686,6 +1889,7 @@ mod tests {
             assert!(required.contains(&name));
         }
         let properties = schema.get("properties").unwrap();
+        assert!(properties.get("images").is_none());
         assert_eq!(
             properties
                 .get("job_mode")
@@ -1730,15 +1934,23 @@ mod tests {
             .and_then(|schema| schema.get("properties"))
             .unwrap();
         for name in [
+            "images",
             "permission_mode",
             "reasoning_effort",
             "max_turns",
             "session_id",
             "resume_id",
+            "conversation_mode",
             "yolo",
         ] {
             assert!(properties.get(name).is_some(), "missing {name}");
         }
+        let images = properties.get("images").unwrap();
+        assert_eq!(images.get("minItems").and_then(Json::as_number), Some(1.0));
+        assert_eq!(
+            images.get("maxItems").and_then(Json::as_number),
+            Some(MAX_IMAGES as f64)
+        );
         assert_eq!(
             properties
                 .get("reasoning_effort")
@@ -1749,6 +1961,17 @@ mod tests {
                 .filter_map(Json::as_str)
                 .collect::<Vec<_>>(),
             vec!["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            properties
+                .get("conversation_mode")
+                .and_then(|property| property.get("enum"))
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Json::as_str)
+                .collect::<Vec<_>>(),
+            vec!["isolated", "canonical"]
         );
         let context = properties.get("context_from").unwrap();
         let context_properties = context.get("properties").unwrap();
@@ -1815,6 +2038,45 @@ mod tests {
         ] {
             let args = Json::parse(bad).unwrap();
             assert!(parse_ask_context(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn ask_parser_validates_conversation_mode() {
+        let args =
+            Json::parse(r#"{"harness":"grok","prompt":"task","conversation_mode":"canonical"}"#)
+                .unwrap();
+        let real_cwd = std::env::current_dir().unwrap();
+        let request = parse_ask_request(&args, &real_cwd, &RuntimePolicy::default()).unwrap();
+        assert_eq!(request.conversation_mode, Some(ConversationMode::Canonical));
+
+        for invalid in [
+            r#"{"harness":"grok","prompt":"task","conversation_mode":"shared"}"#,
+            r#"{"harness":"grok","prompt":"task","conversation_mode":true}"#,
+        ] {
+            let args = Json::parse(invalid).unwrap();
+            assert!(parse_ask_request(&args, &real_cwd, &RuntimePolicy::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn ask_parser_accepts_bounded_image_paths_and_rejects_bad_shapes() {
+        let real_cwd = std::env::current_dir().unwrap();
+        let args = Json::parse(
+            r#"{"harness":"grok","prompt":"inspect","images":["C:\\Temp\\one.png","C:\\Temp\\two.webp"]}"#,
+        )
+        .unwrap();
+        let request = parse_ask_request(&args, &real_cwd, &RuntimePolicy::default()).unwrap();
+        assert_eq!(request.images.len(), 2);
+
+        for invalid in [
+            r#"{"harness":"grok","prompt":"inspect","images":"C:\\Temp\\one.png"}"#,
+            r#"{"harness":"grok","prompt":"inspect","images":[]}"#,
+            r#"{"harness":"grok","prompt":"inspect","images":[""]}"#,
+            r#"{"harness":"grok","prompt":"inspect","images":["a","b","c","d"]}"#,
+        ] {
+            let args = Json::parse(invalid).unwrap();
+            assert!(parse_ask_request(&args, &real_cwd, &RuntimePolicy::default()).is_err());
         }
     }
 

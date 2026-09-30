@@ -10,7 +10,7 @@ pub(crate) fn from_env() -> Result<String, String> {
     let caller = env::var("PARLEY_CALLER").unwrap_or_else(|_| "parley".to_string());
     validate_caller(&caller)?;
     let configured_root = env::var_os("PARLEY_ALLOWED_CWD_ROOT")
-        .ok_or_else(|| "asynchronous jobs require PARLEY_ALLOWED_CWD_ROOT".to_string())?;
+        .ok_or_else(|| "profile-scoped operations require PARLEY_ALLOWED_CWD_ROOT".to_string())?;
     let configured_root = Path::new(&configured_root);
     if !configured_root.is_dir() {
         return Err(format!(

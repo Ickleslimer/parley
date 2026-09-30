@@ -56,7 +56,9 @@ impl ExchangeLog {
         let mut log = Self {
             path,
             exchange_id: exchange_id.clone(),
-            source: env::var("PARLEY_CALLER").unwrap_or_else(|_| "parley".to_string()),
+            source: env::var("PARLEY_EVENT_SOURCE")
+                .or_else(|_| env::var("PARLEY_CALLER"))
+                .unwrap_or_else(|_| "parley".to_string()),
             target: req.harness.clone(),
             cwd: req.cwd.to_string_lossy().to_string(),
             session_id: req.session_id.clone().or_else(|| req.resume_id.clone()),

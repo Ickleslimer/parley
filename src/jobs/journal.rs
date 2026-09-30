@@ -473,12 +473,49 @@ fn canonical_request_json(spec: &JobSpec) -> Result<String, JobError> {
         "reasoning_effort".to_string(),
         opt_str(&spec.request.reasoning_effort),
     );
-    map.insert("resume_id".to_string(), opt_str(&spec.request.resume_id));
+    let canonical_session = if spec.request.conversation_mode
+        == Some(crate::peer_session::ConversationMode::Canonical)
+    {
+        Some(
+            spec.request
+                .session_id
+                .as_deref()
+                .or(spec.request.resume_id.as_deref())
+                .ok_or_else(|| {
+                    JobError::invalid("invalid: canonical request is missing its derived session")
+                })?,
+        )
+    } else {
+        None
+    };
+    if let Some(session) = canonical_session {
+        map.insert(
+            "conversation_mode".to_string(),
+            Json::Str(
+                spec.request
+                    .conversation_mode
+                    .expect("canonical mode checked above")
+                    .as_str()
+                    .to_string(),
+            ),
+        );
+        map.insert(
+            "canonical_session".to_string(),
+            Json::Str(session.to_string()),
+        );
+        map.insert("resume_id".to_string(), Json::Null);
+    } else {
+        map.insert("resume_id".to_string(), opt_str(&spec.request.resume_id));
+    }
     map.insert(
         "schema".to_string(),
         Json::Str("parley-job-request-v1".to_string()),
     );
-    map.insert("session_id".to_string(), opt_str(&spec.request.session_id));
+    if canonical_session.is_some() {
+        map.insert("session_id".to_string(), Json::Null);
+    } else {
+        map.insert("session_id".to_string(), opt_str(&spec.request.session_id));
+    }
     map.insert("yolo".to_string(), Json::Bool(spec.request.yolo));
     Ok(Json::Object(map).to_compact_string())
 }
@@ -1909,9 +1946,11 @@ mod tests {
             max_turns: Some("30".to_string()),
             session_id: Some(SESSION.to_string()),
             resume_id: None,
+            conversation_mode: None,
             yolo: false,
             context: None,
             max_context_chars: None,
+            images: Vec::new(),
             allow_subagents: false,
         }
     }
@@ -2114,6 +2153,27 @@ mod tests {
         assert_eq!(fs::read(fixture.journal(JOB_A)).unwrap(), before);
         assert_eq!(fs::read(fixture.snapshot(JOB_A)).unwrap(), snapshot);
         assert!(!conflict.message.contains("beta"));
+    }
+
+    #[test]
+    fn canonical_job_fingerprint_ignores_new_versus_resume_action() {
+        let mut new_session = spec(JOB_A, "same task");
+        new_session.request.conversation_mode =
+            Some(crate::peer_session::ConversationMode::Canonical);
+        let mut resumed = new_session.clone();
+        resumed.request.resume_id = resumed.request.session_id.take();
+
+        assert_eq!(
+            request_fingerprint(&new_session).unwrap(),
+            request_fingerprint(&resumed).unwrap()
+        );
+
+        let mut isolated = new_session.clone();
+        isolated.request.conversation_mode = Some(crate::peer_session::ConversationMode::Isolated);
+        assert_ne!(
+            request_fingerprint(&new_session).unwrap(),
+            request_fingerprint(&isolated).unwrap()
+        );
     }
 
     #[test]

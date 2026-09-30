@@ -5,17 +5,21 @@
 //! logging, health, and child-process ordering around them.
 
 mod error;
+mod excluded_bytes;
 mod journal;
+mod oversized;
 mod parse;
 mod plan;
+mod profile;
 mod prompt_file;
 mod reader;
 mod root;
 mod sanitize;
 mod winfile;
 
-pub(crate) use journal::{ContextKey, JournalStore, StateDirEnv};
+pub(crate) use journal::{ContextKey, CursorState, JournalStore, StateDirEnv};
 pub(crate) use plan::{ContextBounds, ContextPlan, PlanKind};
+pub(crate) use profile::load_interaction_profile_from_process;
 pub(crate) use prompt_file::{
     cleanup_stale_agent_profile_files, cleanup_stale_prompt_files, AgentProfileFile, PromptFile,
 };

@@ -11,7 +11,18 @@ use crate::json::Json;
 use super::error::ContextError;
 
 pub(crate) fn parse_json(input: &str) -> Result<Json, ContextError> {
-    let mut parser = Parser::new(input);
+    parse_json_with_duplicate_policy(input, false)
+}
+
+pub(crate) fn parse_json_strict(input: &str) -> Result<Json, ContextError> {
+    parse_json_with_duplicate_policy(input, true)
+}
+
+fn parse_json_with_duplicate_policy(
+    input: &str,
+    reject_duplicate_keys: bool,
+) -> Result<Json, ContextError> {
+    let mut parser = Parser::new(input, reject_duplicate_keys);
     let value = parser.parse_value()?;
     parser.skip_whitespace();
     if parser.pos != parser.input.len() {
@@ -72,11 +83,16 @@ pub(crate) fn required_object<'a>(object: &'a Json, key: &str) -> Result<&'a Jso
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    reject_duplicate_keys: bool,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+    fn new(input: &'a str, reject_duplicate_keys: bool) -> Self {
+        Self {
+            input,
+            pos: 0,
+            reject_duplicate_keys,
+        }
     }
 
     fn rest(&self) -> &'a str {
@@ -235,6 +251,9 @@ impl<'a> Parser<'a> {
             let key = self.parse_string()?;
             self.expect_byte(b':')?;
             let value = self.parse_value()?;
+            if self.reject_duplicate_keys && map.contains_key(&key) {
+                return Err(ContextError::malformed("duplicate JSON object key"));
+            }
             map.insert(key, value);
             self.skip_whitespace();
             match self.peek_byte() {

@@ -15,11 +15,12 @@ use crate::signals::fnv1a_64;
 use super::error::{ContextError, ErrorKind};
 use super::parse::{optional_str, parse_json, required_object, required_str, required_u64};
 use super::plan::{
-    fingerprint_records, plan_delta, plan_replay, plan_seed, ContextBounds, ContextPlan,
-    MessageAnchor, PlanKind,
+    plan_delta, plan_replay, plan_seed, scan_evidence, ContextBounds, ContextPlan, MessageAnchor,
+    PlanKind,
 };
-use super::reader::{ReadBatch, SharedJsonlReader};
+use super::reader::{ScanSummary, SharedJsonlReader};
 use super::root::{source_harness, ResolvedSource};
+use super::sanitize::VisibleMessage;
 use super::winfile::{
     open_exclusive_lock, open_shared_read, open_shared_read_write, refuse_reparse_chain,
     SourceIdentity,
@@ -186,6 +187,10 @@ impl JournalStore {
         self.inspect_locked(key)
     }
 
+    pub(crate) fn cursor_state(&self, key: &ContextKey) -> Result<CursorState, ContextError> {
+        self.inspect_locked(key).map(|snapshot| snapshot.state)
+    }
+
     pub(crate) fn plan_new_session_seed(
         &self,
         key: &ContextKey,
@@ -205,8 +210,7 @@ impl JournalStore {
         self.verify_source_session(key, source)?;
         let mut reader = SharedJsonlReader::open(&source.path)?;
         self.verify_live_identity(source, reader.identity())?;
-        let batch = reader.read_from(0)?;
-        plan_seed(source, &batch.records, batch.complete_end, bounds)
+        plan_seed(source, &mut reader, bounds)
     }
 
     pub(crate) fn plan_new_session_seed_read_only(
@@ -227,8 +231,7 @@ impl JournalStore {
         self.verify_source_session(key, source)?;
         let mut reader = SharedJsonlReader::open(&source.path)?;
         self.verify_live_identity(source, reader.identity())?;
-        let batch = reader.read_from(0)?;
-        plan_seed(source, &batch.records, batch.complete_end, bounds)
+        plan_seed(source, &mut reader, bounds)
     }
 
     pub(crate) fn plan_resume_delta(
@@ -297,14 +300,14 @@ impl JournalStore {
         let mut reader = SharedJsonlReader::open(&source.path)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
-        let batch = reader.read_until(snapshot.start_offset, snapshot.end_offset)?;
-        self.verify_range(&snapshot, &batch)?;
-        plan_replay(
+        let (summary, messages) = self.verify_range(&snapshot, &mut reader)?;
+        Ok(plan_replay(
             source,
-            &batch.records,
+            &summary,
+            &messages,
             snapshot.start_offset,
             snapshot.end_offset,
-        )
+        ))
     }
 
     pub(crate) fn plan_uncertain_replay_read_only(
@@ -322,14 +325,14 @@ impl JournalStore {
         let mut reader = SharedJsonlReader::open(&source.path)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
-        let batch = reader.read_until(snapshot.start_offset, snapshot.end_offset)?;
-        self.verify_range(&snapshot, &batch)?;
-        plan_replay(
+        let (summary, messages) = self.verify_range(&snapshot, &mut reader)?;
+        Ok(plan_replay(
             source,
-            &batch.records,
+            &summary,
+            &messages,
             snapshot.start_offset,
             snapshot.end_offset,
-        )
+        ))
     }
 
     pub(crate) fn attest_skip(
@@ -349,8 +352,7 @@ impl JournalStore {
         let mut reader = SharedJsonlReader::open(&source.path)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
-        let batch = reader.read_until(snapshot.start_offset, snapshot.end_offset)?;
-        self.verify_range(&snapshot, &batch)?;
+        self.verify_range(&snapshot, &mut reader)?;
         let skip_plan = snapshot_to_plan(&snapshot)?;
         self.append_locked(
             key,
@@ -382,8 +384,7 @@ impl JournalStore {
         let mut reader = SharedJsonlReader::open(&source.path)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
-        let skipped = reader.read_until(snapshot.start_offset, snapshot.end_offset)?;
-        self.verify_range(&snapshot, &skipped)?;
+        self.verify_range(&snapshot, &mut reader)?;
         let skip_plan = snapshot_to_plan(&snapshot)?;
         self.append_locked(
             key,
@@ -414,8 +415,7 @@ impl JournalStore {
         let mut reader = SharedJsonlReader::open(&source.path)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
-        let skipped = reader.read_until(snapshot.start_offset, snapshot.end_offset)?;
-        self.verify_range(&snapshot, &skipped)?;
+        self.verify_range(&snapshot, &mut reader)?;
         self.prepare_delta(key, source, &snapshot, bounds)
     }
 
@@ -435,8 +435,7 @@ impl JournalStore {
         let mut reader = SharedJsonlReader::open(&source.path)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
-        let skipped = reader.read_until(snapshot.start_offset, snapshot.end_offset)?;
-        self.verify_range(&snapshot, &skipped)?;
+        self.verify_range(&snapshot, &mut reader)?;
         self.prepare_delta(key, source, &snapshot, bounds)
     }
 
@@ -556,16 +555,8 @@ impl JournalStore {
         let mut reader = SharedJsonlReader::open(&source.path)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(snapshot, reader.identity())?;
-        let prior = reader.read_until(snapshot.start_offset, snapshot.end_offset)?;
-        self.verify_range(snapshot, &prior)?;
-        let next = reader.read_from(snapshot.end_offset)?;
-        plan_delta(
-            source,
-            &next.records,
-            snapshot.end_offset,
-            next.complete_end,
-            bounds,
-        )
+        self.verify_range(snapshot, &mut reader)?;
+        plan_delta(source, &mut reader, snapshot.end_offset, bounds)
     }
 
     fn inspect_locked(&self, key: &ContextKey) -> Result<CursorSnapshot, ContextError> {
@@ -757,21 +748,35 @@ impl JournalStore {
     fn verify_range(
         &self,
         snapshot: &CursorSnapshot,
-        batch: &ReadBatch,
-    ) -> Result<(), ContextError> {
-        if batch.complete_end != snapshot.end_offset {
+        reader: &mut SharedJsonlReader,
+    ) -> Result<(ScanSummary, Vec<VisibleMessage>), ContextError> {
+        let (summary, messages) = scan_evidence(
+            reader,
+            snapshot.start_offset,
+            snapshot.end_offset,
+            snapshot_chars(snapshot)?,
+        )?;
+        if summary.complete_end != snapshot.end_offset {
             return Err(ContextError::mismatch(format!(
                 "source end offset {} does not match cursor {}",
-                batch.complete_end, snapshot.end_offset
+                summary.complete_end, snapshot.end_offset
             )));
         }
-        let fingerprint = fingerprint_records(&batch.records);
-        if snapshot.fingerprint.as_deref() != Some(fingerprint.as_str()) {
+        if snapshot.fingerprint.as_deref() != Some(summary.fingerprint.as_str()) {
             return Err(ContextError::mismatch(
                 "source fingerprint does not match the stored cursor",
             ));
         }
-        let messages = super::sanitize::visible_messages(&batch.records)?;
+        if snapshot.record_count != summary.record_count {
+            return Err(ContextError::mismatch(
+                "source record count does not match the stored cursor",
+            ));
+        }
+        if snapshot.character_count != super::sanitize::content_chars(&messages) {
+            return Err(ContextError::mismatch(
+                "source character count does not match the stored cursor",
+            ));
+        }
         let first = messages.first().map(|message| MessageAnchor {
             byte_offset: message.start_offset,
             message_id: message.message_id.clone(),
@@ -796,7 +801,7 @@ impl JournalStore {
                 "source turn anchors do not match the stored cursor",
             ));
         }
-        Ok(())
+        Ok((summary, messages))
     }
 
     fn mark_live(&self, key: &ContextKey) {
@@ -812,6 +817,11 @@ impl JournalStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&key.encoded());
     }
+}
+
+fn snapshot_chars(snapshot: &CursorSnapshot) -> Result<usize, ContextError> {
+    usize::try_from(snapshot.character_count)
+        .map_err(|_| ContextError::overflow("stored cursor character count exceeds usize"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

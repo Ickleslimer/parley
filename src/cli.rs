@@ -62,13 +62,36 @@ pub(crate) struct AskOptions {
     pub max_turns: Option<String>,
     pub session_id: Option<String>,
     pub resume_id: Option<String>,
+    pub conversation_mode: Option<String>,
     pub yolo: bool,
     /// `harness[:session]` of a transcript to inject as context.
     pub context_from: Option<String>,
     pub context_mode: Option<String>,
     pub context_recovery: Option<String>,
     pub max_context_chars: Option<usize>,
+    pub images: Vec<String>,
     pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ContinuationCommand {
+    Status,
+    Submit {
+        continuation_id: String,
+    },
+    Cancel {
+        continuation_id: String,
+    },
+    Receive {
+        continuation_id: String,
+        evidence_hash: String,
+    },
+    Canary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContinuationOptions {
+    pub command: ContinuationCommand,
 }
 
 /// Options for `par converse` — two agents take turns in one conversation.
@@ -152,6 +175,7 @@ pub(crate) enum CliAction {
     Convert(ConvertOptions),
     Resume(ResumeOptions),
     Ask(AskOptions),
+    Continuation(ContinuationOptions),
     Converse(ConverseOptions),
     Fuse(FuseOptions),
     Mcp(McpOptions),
@@ -213,6 +237,10 @@ where
         Some("ask") => {
             args.next();
             return parse_ask_args(args);
+        }
+        Some("continuation") => {
+            args.next();
+            return parse_continuation_args(args);
         }
         Some("converse" | "debate" | "relay") => {
             args.next();
@@ -352,6 +380,7 @@ pub(crate) fn usage() -> &'static str {
   par shims install
   par install claude
   par install list
+  par continuation status
 
 Options:
   --harness, -h <name>    claude, codex, cursor, gemini, goose, grok, opencode, qwen, aider, amazon-q, copilot, kimi, antigravity, muse, pi
@@ -435,6 +464,8 @@ Ask (agent-to-agent):
                                   Seed a new Grok session with durable context state
   par ask -h gr --context-from co:<id> --context-mode auto --resume-id <uuid> -p \"...\"
                                   Resume with the exact delta after the committed cursor
+  par ask -h gr --context-from co:<id> --conversation-mode canonical -p \"...\"
+                                  Derive and continue the canonical Grok peer session
   --context-recovery replay|skip Recover an uncertain auto-resume explicitly
   par ask -h g -p \"...\" --max-context 8000 --dry-run
                                   Cap injected context; show the command, run nothing
@@ -442,6 +473,8 @@ Ask (agent-to-agent):
                                    Start a resumable Grok session
   par ask -h gr -p \"...\" --no-yolo --permission-mode auto --reasoning-effort xhigh --resume-id <uuid>
                                    Continue that Grok session headlessly
+  par ask -h gr -p \"inspect this\" --resume-id <uuid> --no-yolo --image C:\\absolute\\capture.png
+                                   Attach up to three PNG, JPEG, or WebP images
   Context sources: claude, codex, grok, opencode, pi (cursor/gemini cannot export transcripts)
 
 Converse (multi-turn, two agents):
@@ -481,7 +514,8 @@ Environment defaults:
   PARLEY_EVENT_LOG, PARLEY_CALLER       optional append-only JSONL exchange log
   PARLEY_ALLOWED_CWD_ROOT, PARLEY_DISABLE_YOLO, PARLEY_MCP_DEFAULT_YOLO
   PARLEY_GROK_LOCKED_PERMISSION_MODE, PARLEY_GROK_REQUIRE_SESSION_ID
-  PARLEY_GROK_MAX_TURNS
+  PARLEY_GROK_MAX_TURNS, PARLEY_GROK_DEFAULT_CONVERSATION_MODE
+  PARLEY_GROK_CANONICAL_EPOCH
   (legacy AGENT_ROUTER_* names still work)
 "
 }
@@ -742,8 +776,12 @@ where
                 options.permission_mode = Some(require_value(&mut args, "--permission-mode")?)
             }
             "--max-turns" => options.max_turns = Some(require_value(&mut args, "--max-turns")?),
+            "--image" => options.images.push(require_value(&mut args, "--image")?),
             "--session-id" => options.session_id = Some(require_value(&mut args, "--session-id")?),
             "--resume-id" => options.resume_id = Some(require_value(&mut args, "--resume-id")?),
+            "--conversation-mode" => {
+                options.conversation_mode = Some(require_value(&mut args, "--conversation-mode")?)
+            }
             "--context-from" | "--context" => {
                 options.context_from = Some(require_value(&mut args, "--context-from")?)
             }
@@ -790,11 +828,17 @@ where
             _ if arg.starts_with("--max-turns=") => {
                 options.max_turns = Some(value_after_equals(&arg, "--max-turns="))
             }
+            _ if arg.starts_with("--image=") => {
+                options.images.push(value_after_equals(&arg, "--image="))
+            }
             _ if arg.starts_with("--session-id=") => {
                 options.session_id = Some(value_after_equals(&arg, "--session-id="))
             }
             _ if arg.starts_with("--resume-id=") => {
                 options.resume_id = Some(value_after_equals(&arg, "--resume-id="))
+            }
+            _ if arg.starts_with("--conversation-mode=") => {
+                options.conversation_mode = Some(value_after_equals(&arg, "--conversation-mode="))
             }
             _ if arg.starts_with('-') => return Err(format!("unknown ask option: {arg}")),
             // Bare text accumulates into the prompt.
@@ -814,6 +858,95 @@ where
         return Err("ask requires a prompt: par ask -h <agent> -p \"<prompt>\"".to_string());
     }
     Ok(CliAction::Ask(options))
+}
+
+fn parse_continuation_args<I>(mut args: std::iter::Peekable<I>) -> Result<CliAction, String>
+where
+    I: Iterator<Item = String>,
+{
+    let command = args.next().ok_or_else(|| {
+        "continuation requires status, submit, cancel, receive, or canary".to_string()
+    })?;
+    match command.as_str() {
+        "status" => {
+            reject_remaining(&mut args, "continuation status")?;
+            Ok(CliAction::Continuation(ContinuationOptions {
+                command: ContinuationCommand::Status,
+            }))
+        }
+        "canary" => {
+            reject_remaining(&mut args, "continuation canary")?;
+            Ok(CliAction::Continuation(ContinuationOptions {
+                command: ContinuationCommand::Canary,
+            }))
+        }
+        "submit" | "cancel" => {
+            let continuation_id = parse_required_continuation_id(&mut args, &command)?;
+            reject_remaining(&mut args, &format!("continuation {command}"))?;
+            let command = if command == "submit" {
+                ContinuationCommand::Submit { continuation_id }
+            } else {
+                ContinuationCommand::Cancel { continuation_id }
+            };
+            Ok(CliAction::Continuation(ContinuationOptions { command }))
+        }
+        "receive" => {
+            let mut continuation_id = None;
+            let mut evidence_hash = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--id" => continuation_id = Some(require_value(&mut args, "--id")?),
+                    "--evidence-hash" => {
+                        evidence_hash = Some(require_value(&mut args, "--evidence-hash")?)
+                    }
+                    _ if arg.starts_with("--id=") => {
+                        continuation_id = Some(value_after_equals(&arg, "--id="))
+                    }
+                    _ if arg.starts_with("--evidence-hash=") => {
+                        evidence_hash = Some(value_after_equals(&arg, "--evidence-hash="))
+                    }
+                    _ => return Err(format!("unknown continuation receive option: {arg}")),
+                }
+            }
+            Ok(CliAction::Continuation(ContinuationOptions {
+                command: ContinuationCommand::Receive {
+                    continuation_id: continuation_id
+                        .ok_or_else(|| "continuation receive requires --id".to_string())?,
+                    evidence_hash: evidence_hash.ok_or_else(|| {
+                        "continuation receive requires --evidence-hash".to_string()
+                    })?,
+                },
+            }))
+        }
+        _ => Err(format!(
+            "unknown continuation command: {command}; expected status, submit, cancel, receive, or canary"
+        )),
+    }
+}
+
+fn parse_required_continuation_id<I>(
+    args: &mut std::iter::Peekable<I>,
+    command: &str,
+) -> Result<String, String>
+where
+    I: Iterator<Item = String>,
+{
+    match args.next() {
+        Some(flag) if flag == "--id" => require_value(args, "--id"),
+        Some(flag) if flag.starts_with("--id=") => Ok(value_after_equals(&flag, "--id=")),
+        Some(flag) => Err(format!("unknown continuation {command} option: {flag}")),
+        None => Err(format!("continuation {command} requires --id")),
+    }
+}
+
+fn reject_remaining<I>(args: &mut std::iter::Peekable<I>, command: &str) -> Result<(), String>
+where
+    I: Iterator<Item = String>,
+{
+    if let Some(arg) = args.next() {
+        return Err(format!("unexpected {command} argument: {arg}"));
+    }
+    Ok(())
 }
 
 fn parse_converse_args<I>(args: std::iter::Peekable<I>) -> Result<CliAction, String>
@@ -1155,6 +1288,8 @@ mod tests {
                 "12",
                 "--session-id",
                 "01a06582-d66e-7811-b0c9-0b0266e17903",
+                "--conversation-mode",
+                "canonical",
                 "--no-yolo",
             ]
             .map(String::from),
@@ -1172,6 +1307,7 @@ mod tests {
             options.session_id.as_deref(),
             Some("01a06582-d66e-7811-b0c9-0b0266e17903")
         );
+        assert_eq!(options.conversation_mode.as_deref(), Some("canonical"));
         assert!(!options.yolo);
     }
 
@@ -1205,6 +1341,38 @@ mod tests {
         );
         assert_eq!(options.context_mode.as_deref(), Some("auto"));
         assert_eq!(options.context_recovery.as_deref(), Some("replay"));
+    }
+
+    #[test]
+    fn parses_repeated_grok_image_attachments() {
+        let action = parse_args(
+            [
+                "ask",
+                "-h",
+                "grok",
+                "-p",
+                "inspect",
+                "--image",
+                r"C:\Temp\first.png",
+                r"--image=C:\Temp\second.webp",
+                "--resume-id",
+                "01a06582-d66e-7811-b0c9-0b0266e17903",
+                "--no-yolo",
+            ]
+            .map(String::from),
+            defaults(),
+        )
+        .unwrap();
+        let CliAction::Ask(options) = action else {
+            panic!("expected ask action");
+        };
+        assert_eq!(
+            options.images,
+            vec![
+                r"C:\Temp\first.png".to_string(),
+                r"C:\Temp\second.webp".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1333,6 +1501,60 @@ mod tests {
         };
         assert_eq!(opts.prompt, Some("design a limiter".to_string()));
         assert!(opts.panel.is_empty());
+    }
+
+    #[test]
+    fn parses_continuation_broker_commands() {
+        let id = "123e4567-e89b-42d3-a456-426614174000";
+        assert_eq!(
+            parse_args(["continuation", "status"].map(String::from), defaults()).unwrap(),
+            CliAction::Continuation(ContinuationOptions {
+                command: ContinuationCommand::Status,
+            })
+        );
+        assert_eq!(
+            parse_args(
+                ["continuation", "submit", "--id", id].map(String::from),
+                defaults(),
+            )
+            .unwrap(),
+            CliAction::Continuation(ContinuationOptions {
+                command: ContinuationCommand::Submit {
+                    continuation_id: id.to_string(),
+                },
+            })
+        );
+        assert_eq!(
+            parse_args(
+                [
+                    "continuation",
+                    "receive",
+                    "--id",
+                    id,
+                    "--evidence-hash",
+                    "aabb",
+                ]
+                .map(String::from),
+                defaults(),
+            )
+            .unwrap(),
+            CliAction::Continuation(ContinuationOptions {
+                command: ContinuationCommand::Receive {
+                    continuation_id: id.to_string(),
+                    evidence_hash: "aabb".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn continuation_broker_commands_reject_extra_arguments() {
+        assert!(parse_args(
+            ["continuation", "status", "extra"].map(String::from),
+            defaults(),
+        )
+        .is_err());
+        assert!(parse_args(["continuation", "submit"].map(String::from), defaults(),).is_err());
     }
 
     #[test]

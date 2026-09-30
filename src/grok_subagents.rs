@@ -311,7 +311,7 @@ fn stored_path_grants(lane: &LaneGrant) -> Result<Vec<StoredPathGrant>, String> 
         .collect()
 }
 
-fn append_permission_allows(
+pub(crate) fn append_permission_allows(
     arguments: &mut Vec<String>,
     cwd: &Path,
     writable_paths: &[StoredPathGrant],
