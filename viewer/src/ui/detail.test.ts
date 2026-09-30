@@ -26,6 +26,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: tauriEvents.listen }));
 import {
   DEFAULT_PEER_HEALTH_DIAGNOSTICS,
   DEFAULT_SETTINGS,
+  type ContinuationStatus,
   type EventContent,
   type ExchangeSummary,
   type HandoffSelection,
@@ -220,6 +221,22 @@ function activity(): PeerActivitySnapshot {
   };
 }
 
+function continuationStatus(overrides: Partial<ContinuationStatus> = {}): ContinuationStatus {
+  return {
+    schemaVersion: 1,
+    state: "absent",
+    message: "No published continuation is available",
+    manifestId: null,
+    worktreeName: null,
+    writablePaths: [],
+    expiresAtMs: null,
+    continuationCount: 0,
+    runningContinuationId: null,
+    latest: null,
+    ...overrides,
+  };
+}
+
 function content(eventKey: string): EventContent {
   const secondSession = eventKey.includes("session-2");
   return {
@@ -383,6 +400,13 @@ function createApi(
       return selection;
     },
     getPeerActivity: async () => activity(),
+    getContinuationStatus: async () => continuationStatus(),
+    submitContinuation: async () => ({
+      continuationId: "123e4567-e89b-12d3-a456-426614174000",
+      state: "completed",
+    }),
+    cancelContinuation: async () => continuationStatus(),
+    receiveContinuation: async () => continuationStatus(),
     getSettings: async () => ({ ...DEFAULT_SETTINGS }),
     saveSettings: async (settings) => {
       calls.savedSettings.push(settings);

@@ -4,6 +4,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::continuation::{self, ContinuationStatus, ContinuationSubmission};
 use crate::event_engine::{
     ConversationPage, EventContent, ExchangePage, SearchPage, SessionPage, WidgetFeedMessage,
     WidgetFeedPage,
@@ -158,6 +159,56 @@ pub fn open_latest_handoff(state: State<'_, AppState>) -> HandoffSelection {
 #[tauri::command]
 pub fn get_peer_activity() -> PeerActivitySnapshot {
     peer_activity::snapshot()
+}
+
+#[tauri::command]
+pub async fn get_continuation_status<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+) -> Result<ContinuationStatus, String> {
+    require_detail(&window)?;
+    tauri::async_runtime::spawn_blocking(move || continuation::status(&app))
+        .await
+        .map_err(|error| format!("continuation status task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn submit_continuation<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    text: String,
+) -> Result<ContinuationSubmission, String> {
+    require_detail(&window)?;
+    tauri::async_runtime::spawn_blocking(move || continuation::submit(&app, &text))
+        .await
+        .map_err(|error| format!("continuation submission task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn cancel_continuation<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    continuation_id: String,
+) -> Result<ContinuationStatus, String> {
+    require_detail(&window)?;
+    tauri::async_runtime::spawn_blocking(move || continuation::cancel(&app, &continuation_id))
+        .await
+        .map_err(|error| format!("continuation cancellation task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn receive_continuation<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    continuation_id: String,
+    evidence_hash: String,
+) -> Result<ContinuationStatus, String> {
+    require_detail(&window)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        continuation::receive(&app, &continuation_id, &evidence_hash)
+    })
+    .await
+    .map_err(|error| format!("continuation receipt task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -336,6 +387,14 @@ fn require_widget_surface<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), S
         Ok(())
     } else {
         Err("only the widget surface may browse desktop exchanges".to_string())
+    }
+}
+
+fn require_detail<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String> {
+    if window.label() == lifecycle::DETAIL_LABEL {
+        Ok(())
+    } else {
+        Err("direct Grok continuation is available only in the detail window".to_string())
     }
 }
 

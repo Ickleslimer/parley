@@ -72,7 +72,7 @@ describe("widget feed", () => {
     mounted.stop();
   });
 
-  it("pauses only for a user scroll beyond 24px and ignores programmatic scrolling", async () => {
+  it("pauses beyond 24px and resumes only when a user returns within 1px of bottom", async () => {
     const mounted = mountFeed({
       items: [exchange(1)],
       hasEarlier: true,
@@ -98,17 +98,20 @@ describe("widget feed", () => {
     expect(live.getAttribute("aria-pressed")).toBe("false");
     expect(live.classList.contains("is-latched")).toBe(false);
 
-    scroll.scrollTop = 400;
-    scroll.dispatchEvent(new Event("scroll"));
+    assignProgrammaticScrollTop(scroll, 400);
     expect(distance(scroll)).toBe(0);
     expect(live.getAttribute("aria-pressed")).toBe("false");
-    expect(mounted.root.querySelector(`#${LANDMARKS.widgetFeedJumpLive}`)?.hasAttribute("hidden")).toBe(true);
+    scroll.dispatchEvent(new Event("scroll"));
+    expect(live.getAttribute("aria-pressed")).toBe("false");
 
-    live.click();
-    await vi.waitFor(() => {
-      expect(live.getAttribute("aria-pressed")).toBe("true");
-    });
-    expect(scroll.scrollTop).toBe(500);
+    scroll.scrollTop = 398;
+    expect(distance(scroll)).toBe(2);
+    expect(live.getAttribute("aria-pressed")).toBe("false");
+
+    scroll.scrollTop = 399;
+    expect(distance(scroll)).toBe(1);
+    expect(live.getAttribute("aria-pressed")).toBe("true");
+    expect(live.classList.contains("is-latched")).toBe(true);
     mounted.stop();
   });
 
@@ -146,6 +149,13 @@ describe("widget feed", () => {
     expect(mounted.root.textContent).toContain("The reply arrived");
     expect(mounted.root.textContent).toContain("A newer request");
     expect(button(mounted.root, LANDMARKS.widgetFeedJumpLive).textContent).toBe("Jump to live \u00b7 3 new");
+
+    scroll.scrollTop = 680;
+    expect(button(mounted.root, LANDMARKS.widgetFeedLiveToggle).getAttribute("aria-pressed")).toBe("true");
+    expect(button(mounted.root, LANDMARKS.widgetFeedJumpLive).hidden).toBe(true);
+    expect(mounted.root.textContent).toContain("Following live");
+    expect(mounted.root.textContent).toContain("The reply arrived");
+    expect(mounted.root.textContent).toContain("A newer request");
     mounted.stop();
   });
 
@@ -177,6 +187,10 @@ describe("widget feed", () => {
     expect(mounted.root.textContent).not.toContain("beta must stay hidden");
     expect(mounted.root.textContent).toContain("alpha stays");
     expect(button(mounted.root, LANDMARKS.widgetFeedLoadEarlier).disabled).toBe(true);
+
+    scroll.scrollTop = 400;
+    expect(button(mounted.root, LANDMARKS.widgetFeedLiveToggle).getAttribute("aria-pressed")).toBe("false");
+    expect(mounted.root.textContent).toContain("History changed \u00b7 Jump to live");
 
     button(mounted.root, LANDMARKS.widgetFeedJumpLive).click();
     await vi.waitFor(() => {

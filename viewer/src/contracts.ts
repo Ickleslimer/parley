@@ -438,6 +438,43 @@ export interface PeerActivitySnapshot {
   handoffs: PeerHandoffItem[];
 }
 
+export interface ContinuationEvidence {
+  schemaVersion: number;
+  continuationId: string;
+  manifestId: string;
+  state: string;
+  prompt: string;
+  reply: string | null;
+  error: string | null;
+  exchangeId: string | null;
+  requestEventId: string | null;
+  completionEventId: string | null;
+  changedPaths: string[];
+  validationState: "not_executed";
+  diffFingerprint: string;
+  evidenceHash: string;
+  completedAtMs: number;
+  userReceived: boolean;
+}
+
+export interface ContinuationStatus {
+  schemaVersion: number;
+  state: string;
+  message: string | null;
+  manifestId: string | null;
+  worktreeName: string | null;
+  writablePaths: string[];
+  expiresAtMs: number | null;
+  continuationCount: number;
+  runningContinuationId: string | null;
+  latest: ContinuationEvidence | null;
+}
+
+export interface ContinuationSubmission {
+  continuationId: string;
+  state: string;
+}
+
 export const DEFAULT_PEER_HEALTH_DIAGNOSTICS: PeerHealthDiagnostics = {
   snapshotMissing: false,
   snapshotMalformed: false,

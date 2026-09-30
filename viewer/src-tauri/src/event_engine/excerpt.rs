@@ -14,6 +14,8 @@ const ACKNOWLEDGED_HANDOFF_HEADER: &str = "TWO CHAIRS ACKNOWLEDGED HANDOFF CONTR
 const HANDOFF_FOOTER_HEADER: &str = "TWO_CHAIRS_HANDOFF";
 const HANDOFF_READY_PREFIX: &str = "=== TWO_CHAIRS_HANDOFF_READY_V1 job=";
 const HANDOFF_READY_END_PREFIX: &str = "=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff=";
+const CONTINUATION_REQUEST_MARK: &str = "=== PARLEY_USER_CONTINUATION_REQUEST_V1 ===";
+const CONTINUATION_CONTRACT_MARK: &str = "=== PARLEY_CONTINUATION_CONTRACT_V1 ===";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WidgetProjection<'a> {
@@ -35,6 +37,9 @@ pub(crate) fn bound_excerpt(text: &str) -> String {
 
 pub(crate) fn excerpt(content: &str, is_request: bool, exchange_id: &str) -> (String, bool) {
     if is_request {
+        if let Some(section) = continuation_request_section(content) {
+            return (bound_excerpt(section), false);
+        }
         if let Some(section) = current_request_section(content, exchange_id) {
             if let Some(remainder) = task_remainder(section) {
                 return (bound_excerpt(remainder), true);
@@ -129,6 +134,13 @@ pub(crate) fn widget_projection<'a>(
         },
         EventType::Response => project_response_speech(content),
         EventType::Request => {
+            if let Some(section) = continuation_request_section(content) {
+                return WidgetProjection {
+                    text: section,
+                    projection: WidgetFeedProjection::Speech,
+                    context_omitted: false,
+                };
+            }
             if let Some(section) = current_request_section(content, exchange_id) {
                 return project_request_speech(
                     strip_marker_line_break(section),
@@ -528,6 +540,14 @@ fn current_request_section<'a>(content: &'a str, exchange_id: &str) -> Option<&'
     Some(&content[idx + needle.len()..])
 }
 
+fn continuation_request_section(content: &str) -> Option<&str> {
+    let section = strip_marker_line_break(content.strip_prefix(CONTINUATION_REQUEST_MARK)?);
+    let lf = format!("\n{CONTINUATION_CONTRACT_MARK}");
+    let crlf = format!("\r\n{CONTINUATION_CONTRACT_MARK}");
+    let end = section.find(&crlf).or_else(|| section.find(&lf))?;
+    Some(trim_one_trailing_line_break(&section[..end]))
+}
+
 fn strip_marker_line_break(section: &str) -> &str {
     section
         .strip_prefix("\r\n")
@@ -633,6 +653,17 @@ truncated: true
         let (text, extracted) = excerpt(body, false, "ex-1");
         assert!(!extracted);
         assert_eq!(text, body);
+    }
+
+    #[test]
+    fn continuation_requests_project_only_exact_user_speech() {
+        let prompt = "=== PARLEY_USER_CONTINUATION_REQUEST_V1 ===\r\nPlease finish the bounded parser.\r\n=== PARLEY_CONTINUATION_CONTRACT_V1 ===\r\nDiagnostic policy text";
+        let (text, extracted) = excerpt(prompt, true, "exchange-1");
+        assert_eq!(text, "Please finish the bounded parser.");
+        assert!(!extracted);
+        let projected = widget_projection(prompt, EventType::Request, "exchange-1");
+        assert_eq!(projected.text, "Please finish the bounded parser.");
+        assert_eq!(projected.projection, WidgetFeedProjection::Speech);
     }
 
     #[test]

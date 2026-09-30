@@ -40,6 +40,7 @@
     "longDescription": "A local Windows desktop-underlay widget and transcript browser for Parley JSONL event logs.",
     "icon": ["icons/icon.ico"],
     "resources": {
+      "../../target/release/par.exe": "continuation/parley-continuation-broker.exe",
       "../../health/target/release/parley-health-supervisor.exe": "health/parley-health-supervisor.exe",
       "../../health/target/release/parley-health-query.exe": "health/parley-health-query.exe",
       "../../health/target/release/parley-health-hook.exe": "health/parley-health-hook.exe",

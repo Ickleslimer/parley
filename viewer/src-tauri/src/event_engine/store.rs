@@ -69,6 +69,13 @@ impl Store {
         self.events.len()
     }
 
+    pub(crate) fn widget_feed_event_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|event| !is_direct_user_event(event))
+            .count()
+    }
+
     pub(crate) fn session_count(&self) -> u64 {
         self.sessions.len() as u64
     }
@@ -221,6 +228,7 @@ impl Store {
     pub(crate) fn widget_feed_ranks(&self, keys: KeyContext<'_>) -> Vec<WidgetFeedRank> {
         self.exchanges
             .values()
+            .filter(|exchange| !self.is_direct_user_exchange(exchange))
             .map(|exchange| WidgetFeedRank {
                 exchange_id: exchange.exchange_id.clone(),
                 exchange_key: keys.exchange_key(&exchange.exchange_id),
@@ -235,6 +243,9 @@ impl Store {
         keys: KeyContext<'_>,
     ) -> Option<WidgetFeedExchange> {
         let exchange = self.exchanges.get(exchange_id)?;
+        if self.is_direct_user_exchange(exchange) {
+            return None;
+        }
         let request = exchange
             .request_idx
             .map(|idx| self.widget_feed_message_at(idx, keys, true));
@@ -258,6 +269,9 @@ impl Store {
         keys: KeyContext<'_>,
     ) -> Option<WidgetFeedMessage> {
         let idx = *self.by_event_id.get(event_id)?;
+        if is_direct_user_event(&self.events[idx]) {
+            return None;
+        }
         Some(self.widget_feed_message_at(idx, keys, false))
     }
 
@@ -484,6 +498,18 @@ impl Store {
             context_omitted: projected.context_omitted,
         }
     }
+
+    fn is_direct_user_exchange(&self, exchange: &ExchangeAcc) -> bool {
+        exchange
+            .request_idx
+            .into_iter()
+            .chain(exchange.completion_idx)
+            .any(|idx| is_direct_user_event(&self.events[idx]))
+    }
+}
+
+fn is_direct_user_event(event: &StoredEvent) -> bool {
+    event.source.eq_ignore_ascii_case("user")
 }
 
 fn preview_text(event: &StoredEvent) -> &str {

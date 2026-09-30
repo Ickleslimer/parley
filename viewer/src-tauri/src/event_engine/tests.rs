@@ -588,6 +588,53 @@ fn widget_feed_projects_speech_while_detail_keeps_raw_protocol_records() {
 }
 
 #[test]
+fn direct_user_continuations_stay_in_detail_but_not_the_desktop_widget() {
+    let log = TempLog::new("direct-user-continuation");
+    let raw_request = "=== PARLEY_USER_CONTINUATION_REQUEST_V1 ===\nPlease finish the bounded parser.\n=== PARLEY_CONTINUATION_CONTRACT_V1 ===\nDiagnostic policy text";
+    let mut request: Value = serde_json::from_str(&event_line(
+        "request",
+        "direct-request",
+        "direct-exchange",
+        Some("direct-session"),
+        Some(raw_request),
+        1,
+    ))
+    .unwrap();
+    request["source"] = json!("user");
+    let mut response: Value = serde_json::from_str(&event_line(
+        "response",
+        "direct-response",
+        "direct-exchange",
+        Some("direct-session"),
+        Some("Finished the bounded parser."),
+        2,
+    ))
+    .unwrap();
+    response["source"] = json!("user");
+    write_lines(&log, &[request.to_string(), response.to_string()]);
+    let engine = watching_engine(&log);
+
+    let feed = engine.widget_feed(None);
+    assert!(feed.items.is_empty());
+    assert_eq!(feed.total_exchanges, 0);
+    assert_eq!(feed.total_events, 0);
+
+    let conversation = engine.conversation_page(None, None, 20);
+    assert_eq!(conversation.items.len(), 1);
+    assert_eq!(
+        conversation.items[0]
+            .request
+            .as_ref()
+            .expect("direct request")
+            .excerpt,
+        "Please finish the bounded parser."
+    );
+    let request = unique_event(&engine, "direct-request");
+    assert_eq!(request.content, raw_request);
+    assert!(engine.widget_feed_message(&request.event_key).is_none());
+}
+
+#[test]
 fn widget_feed_counts_completion_events_and_keeps_error_semantics() {
     let log = TempLog::new("widget-feed-updates");
     write_lines(

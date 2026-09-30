@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  ContinuationStatus,
+  ContinuationSubmission,
   ConversationPage,
   EventContent,
   ExchangePage,
@@ -43,6 +45,13 @@ export interface ViewerApi {
   testPeerHealthChime(): Promise<void>;
   openLatestHandoff(): Promise<HandoffSelection>;
   getPeerActivity(): Promise<PeerActivitySnapshot>;
+  getContinuationStatus(): Promise<ContinuationStatus>;
+  submitContinuation(text: string): Promise<ContinuationSubmission>;
+  cancelContinuation(continuationId: string): Promise<ContinuationStatus>;
+  receiveContinuation(
+    continuationId: string,
+    evidenceHash: string,
+  ): Promise<ContinuationStatus>;
   getSettings(): Promise<ViewerSettings>;
   saveSettings(settings: ViewerSettings): Promise<ViewerSettings>;
   listMonitors(): Promise<MonitorInfo[]>;
@@ -93,6 +102,16 @@ export const viewerApi: ViewerApi = {
   testPeerHealthChime: () => invoke<void>("test_peer_health_chime"),
   openLatestHandoff: () => invoke<HandoffSelection>("open_latest_handoff"),
   getPeerActivity: () => invoke<PeerActivitySnapshot>("get_peer_activity"),
+  getContinuationStatus: () => invoke<ContinuationStatus>("get_continuation_status"),
+  submitContinuation: (text) =>
+    invoke<ContinuationSubmission>("submit_continuation", { text }),
+  cancelContinuation: (continuationId) =>
+    invoke<ContinuationStatus>("cancel_continuation", { continuationId }),
+  receiveContinuation: (continuationId, evidenceHash) =>
+    invoke<ContinuationStatus>("receive_continuation", {
+      continuationId,
+      evidenceHash,
+    }),
   getSettings: () => invoke<ViewerSettings>("get_settings"),
   saveSettings: (settings) => invoke<ViewerSettings>("save_settings", { settings }),
   listMonitors: () => invoke<MonitorInfo[]>("list_monitors"),

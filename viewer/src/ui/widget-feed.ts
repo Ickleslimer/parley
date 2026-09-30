@@ -12,6 +12,7 @@ import { createWidgetAvatar, type WidgetAvatarAgent } from "./widget-avatar";
 export const FEED_PAGE_EXCHANGES = 20;
 export const FEED_MAX_EXCHANGES = 200;
 export const LIVE_PAUSE_DISTANCE_PX = 24;
+export const LIVE_RESUME_DISTANCE_PX = 1;
 
 const HISTORY_LABEL = "History changed \u00b7 Jump to live";
 const FULL_MESSAGE_ERROR = loadErrorLabel("load the full message");
@@ -26,20 +27,43 @@ export function distanceFromBottom(node: {
   return Number.isFinite(distance) ? distance : 0;
 }
 
-const pendingProgrammaticScrolls = new WeakMap<HTMLElement, number>();
+interface ProgrammaticScrollMarker {
+  settling: boolean;
+  scrollTop: number;
+  distanceFromBottomPx: number;
+}
+
+const pendingProgrammaticScrolls = new WeakMap<HTMLElement, ProgrammaticScrollMarker>();
 
 export function assignProgrammaticScrollTop(node: HTMLElement, value: number): void {
-  pendingProgrammaticScrolls.set(node, value);
+  pendingProgrammaticScrolls.set(node, {
+    settling: true,
+    scrollTop: value,
+    distanceFromBottomPx: distanceFromBottom(node),
+  });
   node.scrollTop = value;
+  pendingProgrammaticScrolls.set(node, {
+    settling: false,
+    scrollTop: node.scrollTop,
+    distanceFromBottomPx: distanceFromBottom(node),
+  });
 }
 
 function consumeProgrammaticScroll(node: HTMLElement): boolean {
-  const expected = pendingProgrammaticScrolls.get(node);
-  if (expected === undefined) {
+  const marker = pendingProgrammaticScrolls.get(node);
+  if (!marker) {
     return false;
   }
-  pendingProgrammaticScrolls.delete(node);
-  return Math.abs(node.scrollTop - expected) <= 1;
+  if (marker.settling) {
+    return true;
+  }
+  const matches =
+    Math.abs(node.scrollTop - marker.scrollTop) <= 1 &&
+    Math.abs(distanceFromBottom(node) - marker.distanceFromBottomPx) <= 1;
+  if (!matches) {
+    pendingProgrammaticScrolls.delete(node);
+  }
+  return matches;
 }
 
 export function userScrollShouldPause(input: {
@@ -51,6 +75,20 @@ export function userScrollShouldPause(input: {
     input.followingLive &&
     !input.programmatic &&
     input.distanceFromBottomPx > LIVE_PAUSE_DISTANCE_PX
+  );
+}
+
+export function userScrollShouldResume(input: {
+  followingLive: boolean;
+  historyChanged: boolean;
+  programmatic: boolean;
+  distanceFromBottomPx: number;
+}): boolean {
+  return (
+    !input.followingLive &&
+    !input.historyChanged &&
+    !input.programmatic &&
+    input.distanceFromBottomPx <= LIVE_RESUME_DISTANCE_PX
   );
 }
 
@@ -229,13 +267,22 @@ export function mountWidgetFeed(options: MountWidgetFeedOptions): { stop: () => 
   options.parent.replaceChildren(column);
 
   const onScroll = (): void => {
+    const programmatic = consumeProgrammaticScroll(scrollport);
+    const distanceFromBottomPx = distanceFromBottom(scrollport);
     if (
-      !userScrollShouldPause({
+      userScrollShouldResume({
         followingLive: state.followingLive,
-        programmatic: consumeProgrammaticScroll(scrollport),
-        distanceFromBottomPx: distanceFromBottom(scrollport),
+        historyChanged: state.historyChanged,
+        programmatic,
+        distanceFromBottomPx,
       })
     ) {
+      state.followingLive = true;
+      state.unread = [];
+      paint("none");
+      return;
+    }
+    if (!userScrollShouldPause({ followingLive: state.followingLive, programmatic, distanceFromBottomPx })) {
       return;
     }
     state.followingLive = false;

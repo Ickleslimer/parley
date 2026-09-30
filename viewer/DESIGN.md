@@ -44,7 +44,7 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 - The feed combines configured sources globally and groups each request before its completion, error, or pending state.
 - Quiet `New conversation` dividers mark session changes without exposing paths or identifiers.
 - The underlay remains a neutral, accessibility-hidden lab-paper geometry host with no transcript or large workshop illustration.
-- Live is a distinct latched follow mode, visually separate from history loading and transcript actions.
+- Live is a distinct latched follow mode, visually separate from history loading and transcript actions. A genuine user scroll to the bottom resumes Live and clears the ordinary unread prompt; programmatic positioning and fail-closed history replacement do not.
 - The chat uses a visible scrollbar and a 44 by 44 `Load earlier messages` control. Older and Newer pager buttons are not used.
 - Bubble direction follows the normalized speaker, never request or completion role.
 - Unknown speakers use named center slips with no robot tail.
@@ -60,6 +60,7 @@ Exact text always uses ink or muted ink on a solid paper surface. The lighter id
 - Native session changes create no divider, label, grouping, or accessibility boundary. The conversation itself exposes no session or source identifiers; selected-event and source-management diagnostics retain them where needed.
 - The timeline is the primary focal point and presents paired exchanges with anchored `Load earlier messages` and `Jump to latest` controls.
 - The inspector explains selected evidence through Event, Activity, Sources, and Settings tabs.
+- Activity may include one calm `Direct with Grok` emergency workbench. It explains the current Codex-published task and exact writable scope in human terms, accepts only bounded message text, and keeps receipt distinct from review. It is not a dashboard card, ordinary chat launcher, session picker, path editor, permission editor, or command console.
 - Exit and degraded-state notices remain outside tabs.
 - At the content-driven compact breakpoint, the inspector stacks beneath the timeline without removing controls.
 

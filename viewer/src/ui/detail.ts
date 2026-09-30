@@ -16,6 +16,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { el, labelledControl, setText } from "./dom";
 import { exactEventBody } from "./excerpt";
+import { buildContinuationSection } from "./continuation";
 import {
   formatCharacterCount,
   formatDiagnostics,
@@ -144,7 +145,8 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   );
   const peerActivity = buildPeerActivitySection();
   const peerHealth = buildPeerHealthSection();
-  inspector.activityHost.append(peerActivity.section, peerHealth.section);
+  const continuation = buildContinuationSection(api);
+  inspector.activityHost.append(continuation.section, peerActivity.section, peerHealth.section);
 
   const sourceLine = el("p", { className: "studio-status", id: "source-status" });
   const healthLine = el("p", { className: "studio-health" });
@@ -1177,6 +1179,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
   }, DETAIL_POLL_MS);
 
   paint();
+  continuation.start();
   healthPoller.start();
   activityPoller.start();
   void bootstrap().then(() => {
@@ -1194,6 +1197,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
     poller.stop();
     healthPoller.stop();
     activityPoller.stop();
+    continuation.stop();
     window.removeEventListener("pagehide", stop);
   };
   window.addEventListener("pagehide", stop);

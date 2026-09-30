@@ -735,7 +735,7 @@ impl Inner {
         let history_token = self.widget_history_token();
         let total_events = self
             .unique_sources()
-            .map(|source| source.store.event_count() as u64)
+            .map(|source| source.store.widget_feed_event_count() as u64)
             .sum();
         let mut ranked = Vec::new();
         for (source_order, source) in self.unique_sources_enumerated() {

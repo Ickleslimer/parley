@@ -224,6 +224,27 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
       diagnostic: null,
     }),
     getPeerActivity: async () => activity,
+    getContinuationStatus: async () => ({
+      schemaVersion: 1,
+      state: "absent",
+      message: "No published continuation is available",
+      manifestId: null,
+      worktreeName: null,
+      writablePaths: [],
+      expiresAtMs: null,
+      continuationCount: 0,
+      runningContinuationId: null,
+      latest: null,
+    }),
+    submitContinuation: async () => {
+      throw new Error("No synthetic continuation is published");
+    },
+    cancelContinuation: async () => {
+      throw new Error("No synthetic continuation is running");
+    },
+    receiveContinuation: async () => {
+      throw new Error("No synthetic continuation evidence exists");
+    },
     getSettings: async () => settings,
     saveSettings: async (next) => {
       settings = { ...next };

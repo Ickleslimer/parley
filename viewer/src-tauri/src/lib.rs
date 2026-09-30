@@ -2,6 +2,7 @@
 compile_error!("Parley Conversation Viewer is Windows-only");
 
 mod commands;
+mod continuation;
 pub mod event_engine;
 mod interactive_surface;
 mod launch;
@@ -40,6 +41,10 @@ pub fn run() {
             commands::test_peer_health_chime,
             commands::open_latest_handoff,
             commands::get_peer_activity,
+            commands::get_continuation_status,
+            commands::submit_continuation,
+            commands::cancel_continuation,
+            commands::receive_continuation,
             commands::get_settings,
             commands::save_settings,
             commands::report_widget_surface_bounds,
