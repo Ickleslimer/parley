@@ -43,6 +43,23 @@ describe("studio transcript view", () => {
     expect(view.list.textContent).toContain("Search result");
   });
 
+  it("uses the local calendar day when a row has a machine timestamp label", () => {
+    const view = mount();
+    const localTimestamp = new Date(2026, 8, 30, 0, 15, 0).getTime();
+    view.paint({
+      ...sample(),
+      rows: [
+        {
+          ...STUDIO_FOCUS_ROWS[0],
+          timestampMs: localTimestamp,
+          timeLabel: "2026-09-30 00:15:00",
+        },
+      ],
+    });
+
+    expect(view.list.querySelector(".studio-focus-date")?.textContent).toBe("30 September 2026");
+  });
+
   it("keeps pending rows noninteractive and separates focus from activation", () => {
     const callbacks = handlers();
     const view = createStudioTranscript(callbacks);

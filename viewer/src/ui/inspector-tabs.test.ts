@@ -170,6 +170,7 @@ describe("studio drawer controller", () => {
     expect(nodes.region.getAttribute("aria-modal")).toBe("true");
     expect(background.hasAttribute("inert")).toBe(true);
     expect(document.activeElement).toBe(nodes.close);
+    expect(controller.compactOpen()).toBe(true);
     expect(controller.modalEventKey()).toBe("event-a");
 
     action.focus();
@@ -180,6 +181,7 @@ describe("studio drawer controller", () => {
     expect(nodes.region.hidden).toBe(true);
     expect(background.hasAttribute("inert")).toBe(false);
     expect(document.activeElement).toBe(row);
+    expect(controller.compactOpen()).toBe(false);
     expect(controller.modalEventKey()).toBeNull();
     controller.stop();
   });
@@ -203,8 +205,10 @@ describe("studio drawer controller", () => {
     expect(nodes.region.getAttribute("role")).toBe("complementary");
     expect(nodes.region.hasAttribute("aria-modal")).toBe(false);
     expect(background.hasAttribute("inert")).toBe(false);
+    expect(controller.compactOpen()).toBe(false);
     controller.syncLayout("compact");
     expect(background.hasAttribute("inert")).toBe(true);
+    expect(controller.compactOpen()).toBe(true);
     controller.close();
     expect(document.activeElement).toBe(utilities);
     controller.stop();

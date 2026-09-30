@@ -164,6 +164,7 @@ describe("continuation receipt presentation", () => {
       documentVisible: true,
       matchingEventKey: "event-a",
       modalEventKey: null,
+      compactDrawerOpen: false,
       row,
       scrollport,
     };
@@ -183,6 +184,7 @@ describe("continuation receipt presentation", () => {
       documentVisible: true,
       matchingEventKey: "event-a",
       modalEventKey: null,
+      compactDrawerOpen: false,
       row,
       scrollport,
     };
@@ -192,6 +194,7 @@ describe("continuation receipt presentation", () => {
         ...base,
         row: null,
         modalEventKey: "event-a",
+        compactDrawerOpen: true,
       }),
     ).toBe(true);
     expect(
@@ -199,6 +202,13 @@ describe("continuation receipt presentation", () => {
         ...base,
         row: null,
         modalEventKey: "event-b",
+        compactDrawerOpen: true,
+      }),
+    ).toBe(false);
+    expect(
+      isContinuationReceiptPresented({
+        ...base,
+        compactDrawerOpen: true,
       }),
     ).toBe(false);
   });

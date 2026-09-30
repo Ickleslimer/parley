@@ -102,6 +102,7 @@ export interface StudioDrawerController {
   close: () => void;
   syncLayout: (layout: Exclude<DrawerLayout, "closed">) => void;
   selected: () => DrawerContent | null;
+  compactOpen: () => boolean;
   modalEventKey: () => string | null;
   stop: () => void;
 }
@@ -228,6 +229,7 @@ export function buildStudioDrawerController(
     close,
     syncLayout,
     selected: () => content,
+    compactOpen: () => layout === "compact" && content != null,
     modalEventKey: () =>
       layout === "compact" && content === "event"
         ? (options.nodes.region.dataset.eventKey ?? null)

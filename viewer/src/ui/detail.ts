@@ -382,7 +382,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
       transcript.scrollport.scrollTop = previousScrollTop;
     }
     if (restoreFocusKey) {
-      resolveTranscriptEvent(restoreFocusKey)?.focus();
+      resolveTranscriptEvent(restoreFocusKey)?.focus({ preventScroll: true });
     }
     evaluateContinuationReceipt();
   };
@@ -513,6 +513,7 @@ export function mountDetail(root: HTMLElement, api: ViewerApi): { stop: () => vo
         documentVisible: document.visibilityState === "visible",
         matchingEventKey,
         modalEventKey,
+        compactDrawerOpen: drawerController.compactOpen(),
         row,
         scrollport: transcript.scrollport,
       })

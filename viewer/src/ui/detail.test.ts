@@ -647,9 +647,11 @@ describe("conversation studio detail", () => {
     expect(document.activeElement).toBe(secondHit);
     expect(harness.calls.content).toEqual([]);
 
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
     harness.setBytes(240);
     await vi.advanceTimersByTimeAsync(500);
     expect(document.activeElement?.getAttribute("data-event-key")).toBe("event:hit-2");
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
     expect(harness.calls.content).toEqual([]);
 
     document.activeElement?.dispatchEvent(

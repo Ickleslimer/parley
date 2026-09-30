@@ -243,8 +243,8 @@ function dateLabel(row: TranscriptRowModel): string {
   if (Number.isNaN(date.getTime())) {
     return "Unknown date";
   }
-  const month = MONTHS[date.getUTCMonth()];
-  return month ? `${date.getUTCDate()} ${month} ${date.getUTCFullYear()}` : "Unknown date";
+  const month = MONTHS[date.getMonth()];
+  return month ? `${date.getDate()} ${month} ${date.getFullYear()}` : "Unknown date";
 }
 
 function dateTime(timestampMs: number): string | undefined {

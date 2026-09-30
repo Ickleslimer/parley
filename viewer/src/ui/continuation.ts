@@ -33,6 +33,7 @@ export interface ContinuationReceiptPresentation {
   documentVisible: boolean;
   matchingEventKey: string | null;
   modalEventKey: string | null;
+  compactDrawerOpen: boolean;
   row: HTMLElement | null;
   scrollport: HTMLElement;
 }
@@ -382,6 +383,9 @@ export function isContinuationReceiptPresented(
   }
   if (presentation.modalEventKey === presentation.matchingEventKey) {
     return true;
+  }
+  if (presentation.compactDrawerOpen) {
+    return false;
   }
   if (!presentation.row) {
     return false;
