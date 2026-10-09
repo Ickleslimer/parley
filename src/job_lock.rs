@@ -17,6 +17,38 @@ pub(crate) struct ExecutionLease {
 
 impl ExecutionLease {
     pub(crate) fn acquire_for_request(req: &AskRequest, owner: &str) -> Result<Self, String> {
+        Self::acquire_request_and_worktrees(req, Vec::new(), owner)
+    }
+
+    pub(crate) fn acquire_profile(
+        root: &Path,
+        profile_namespace: &str,
+        owner: &str,
+    ) -> Result<Self, String> {
+        acquire(
+            root,
+            vec![LockKey::new("profile", profile_namespace)],
+            owner,
+        )
+    }
+
+    pub(crate) fn acquire_for_job(
+        req: &AskRequest,
+        paths: impl IntoIterator<Item = PathBuf>,
+        owner: &str,
+    ) -> Result<Self, String> {
+        let lease = Self::acquire_request_and_worktrees(req, paths, owner)?;
+        if lease._files.is_empty() {
+            return Err("asynchronous jobs require an active execution lease".to_string());
+        }
+        Ok(lease)
+    }
+
+    fn acquire_request_and_worktrees(
+        req: &AskRequest,
+        paths: impl IntoIterator<Item = PathBuf>,
+        owner: &str,
+    ) -> Result<Self, String> {
         let Some(root) = require_conversation_root(req.conversation_mode, configured_root()?)?
         else {
             return Ok(Self { _files: Vec::new() });
@@ -38,26 +70,11 @@ impl ExecutionLease {
                 req.cwd.display()
             )
         })?;
-        acquire(
-            &root,
-            vec![
-                LockKey::new("profile", &profile_namespace),
-                LockKey::new("session", session),
-                LockKey::new("worktree", &path_key(&canonical_cwd)),
-            ],
-            owner,
-        )
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn acquire_worktrees(
-        paths: impl IntoIterator<Item = PathBuf>,
-        owner: &str,
-    ) -> Result<Self, String> {
-        let Some(root) = configured_root()? else {
-            return Ok(Self { _files: Vec::new() });
-        };
-        let mut keys = Vec::new();
+        let mut keys = vec![
+            LockKey::new("profile", &profile_namespace),
+            LockKey::new("session", session),
+            LockKey::new("worktree", &path_key(&canonical_cwd)),
+        ];
         for path in paths {
             let canonical = fs::canonicalize(&path).map_err(|error| {
                 format!(
@@ -257,5 +274,22 @@ mod tests {
         let _first = acquire(&root, vec![LockKey::new("session", "a")], "first").unwrap();
         let second = acquire(&root, vec![LockKey::new("session", "b")], "second");
         assert!(second.is_ok());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn partial_acquisition_releases_profile_and_session_on_worktree_contention() {
+        let root = temp_root("partial-acquisition");
+        let profile = LockKey::new("profile", "owner");
+        let session = LockKey::new("session", "session");
+        let worktree = LockKey::new("worktree", "shared");
+        let _blocker = acquire(&root, vec![worktree.clone()], "blocker").unwrap();
+        assert!(acquire(
+            &root,
+            vec![profile.clone(), session.clone(), worktree],
+            "contender",
+        )
+        .is_err());
+        assert!(acquire(&root, vec![profile, session], "next-owner").is_ok());
     }
 }

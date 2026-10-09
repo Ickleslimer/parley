@@ -53,9 +53,22 @@ path.
 
 Job UUID, target session, profile writer slot, and canonical worktree leases
 are cross-process. Job metadata is namespaced by caller, while worktree leases
-are global beneath the configured job-state root. Startup converts durable
-`preparing`, `running`, or `cancelling` records without a live worker to
-`interrupted`.
+are global beneath the configured job-state root. Startup must acquire the
+profile's exclusive execution lease before opening or recovering its job
+store. Contention or any lease error refuses startup without rewriting job
+evidence. Only an unowned profile can convert durable `preparing`, `running`,
+or `cancelling` records to `interrupted`; repeated recovery appends nothing.
+
+A new job acquires its combined profile, session, parent-worktree, and other
+writer-worktree leases before creating `preparing`. The guard remains held
+through preflight, handoff, process execution, and terminal-state persistence,
+including worker-thread creation failure. Synchronous calls acquire their own
+lease; an asynchronous worker borrows its already-held guard rather than
+reacquiring it. Matching repeated job UUIDs return their existing state without
+another spawn, including unfinished and interrupted jobs. A conflicting payload
+is rejected. Losing lease contention for an unrelated UUID creates no job record
+and never retries automatically. Recovery never adopts or reruns an orphaned
+job, and existing `startup_recovery` errors are not cleared to fabricate success.
 
 Every configured worktree must exist below the approved cwd root, be a real
 Git worktree with the declared common-dir identity and base commit, and be

@@ -135,17 +135,11 @@ impl JobRuntime {
             );
         }
         let profile_namespace = profile_namespace::from_env()?;
-        let store = Arc::new(
-            JobStore::open(&JobStateEnv {
-                job_state_dir: Some(state_root.clone()),
-                caller: Some(profile_namespace.clone()),
-                localappdata: env::var_os("LOCALAPPDATA").map(PathBuf::from),
-            })
-            .map_err(|error| error.to_string())?,
-        );
-        store
-            .recover_startup()
-            .map_err(|error| format!("recover asynchronous jobs: {error}"))?;
+        let store = open_recovered_store(
+            &state_root,
+            &profile_namespace,
+            env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        )?;
         let escrow_dir = state_root.join("escrow").join(&profile_namespace);
         let handoff_dir = env::var_os("PARLEY_HANDOFF_STATE_DIR")
             .map(PathBuf::from)
@@ -226,6 +220,30 @@ impl JobRuntime {
             .ok_or_else(|| "asynchronous jobs require session_id or resume_id".to_string())?
             .to_ascii_lowercase();
         let worktree_keys = writer_worktree_keys(&spec);
+        if let Some(view) = inner
+            .store
+            .existing(&spec)
+            .map_err(|error| error.to_string())?
+        {
+            return self.hydrate(view);
+        }
+        let execution_lease = match ExecutionLease::acquire_for_job(
+            &spec.request,
+            extra_writer_worktrees(&spec),
+            &spec.job_id,
+        ) {
+            Ok(lease) => Arc::new(lease),
+            Err(error) => {
+                if let Some(view) = inner
+                    .store
+                    .existing(&spec)
+                    .map_err(|error| error.to_string())?
+                {
+                    return self.hydrate(view);
+                }
+                return Err(format!("execution lease preflight failed: {error}"));
+            }
+        };
         let begin = inner
             .store
             .begin(&spec)
@@ -318,6 +336,7 @@ impl JobRuntime {
         let worker_inner = Arc::clone(&inner);
         let worker_job_id = job_id.clone();
         let execution = WorkerExecution {
+            execution_lease: Arc::clone(&execution_lease),
             policy,
             guarded_launch,
             handoff: handoff.clone(),
@@ -590,6 +609,7 @@ fn canonicalize_handoff_turn_limit(handoff_mode: HandoffMode, max_turns: &mut Op
 }
 
 struct WorkerExecution {
+    execution_lease: Arc<ExecutionLease>,
     policy: RuntimePolicy,
     guarded_launch: Option<GuardedSubagentLaunch>,
     handoff: Option<HandoffSession>,
@@ -604,6 +624,7 @@ fn run_worker(
     started_tx: mpsc::SyncSender<StartSignal>,
 ) {
     let WorkerExecution {
+        execution_lease,
         policy,
         guarded_launch,
         handoff,
@@ -618,30 +639,14 @@ fn run_worker(
         started_tx: started_tx.clone(),
         sent: Arc::clone(&sent),
     };
-    let extra_paths = extra_writer_worktrees(&spec);
-    let extra_lease = match ExecutionLease::acquire_worktrees(extra_paths, &job_id) {
-        Ok(lease) => lease,
-        Err(error) => {
-            finish_pre_spawn_failure(
-                &inner,
-                &job_id,
-                "worktree_lease_failed",
-                error,
-                &started_tx,
-                &sent,
-            );
-            return;
-        }
-    };
-
-    let result = ask::run_prepared_with_receipt_controlled(
+    let result = ask::run_prepared_with_execution_lease(
         &spec.request,
         &policy,
         guarded_launch.as_ref(),
         &cancellation,
         &observer,
+        &execution_lease,
     );
-    drop(extra_lease);
     match result {
         Ok(outcome) => {
             let reply = outcome.captured.reply();
@@ -686,6 +691,29 @@ fn run_worker(
             )
         }
     }
+    drop(execution_lease);
+}
+
+fn open_recovered_store(
+    state_root: &Path,
+    profile_namespace: &str,
+    localappdata: Option<PathBuf>,
+) -> Result<Arc<JobStore>, String> {
+    let _recovery_lease =
+        ExecutionLease::acquire_profile(state_root, profile_namespace, "startup-recovery")
+            .map_err(|error| format!("acquire startup recovery ownership: {error}"))?;
+    let store = Arc::new(
+        JobStore::open(&JobStateEnv {
+            job_state_dir: Some(state_root.to_path_buf()),
+            caller: Some(profile_namespace.to_string()),
+            localappdata,
+        })
+        .map_err(|error| error.to_string())?,
+    );
+    store
+        .recover_startup()
+        .map_err(|error| format!("recover asynchronous jobs: {error}"))?;
+    Ok(store)
 }
 
 struct JobObserver {
@@ -2207,30 +2235,6 @@ fn validate_lane_result(reply: &str, job_id: &str) -> Result<(), String> {
     }
 }
 
-fn finish_pre_spawn_failure(
-    inner: &Arc<RuntimeInner>,
-    job_id: &str,
-    error_code: &str,
-    exact_error: String,
-    started_tx: &mpsc::SyncSender<StartSignal>,
-    sent: &AtomicBool,
-) {
-    let transition = terminal_transition(JobState::Failed, None, error_code);
-    finish_terminal(
-        inner,
-        job_id,
-        transition,
-        TerminalPayload {
-            reply: None,
-            error: Some(exact_error),
-            receipt: None,
-            state_override: None,
-        },
-        started_tx,
-        sent,
-    );
-}
-
 fn finish_ask_failure(
     inner: &Arc<RuntimeInner>,
     job_id: &str,
@@ -2817,6 +2821,10 @@ fn env_bool(name: &str) -> Result<Option<bool>, String> {
     };
     Ok(Some(parsed))
 }
+
+#[cfg(all(test, windows))]
+#[path = "job_runtime_ownership_tests.rs"]
+mod ownership_tests;
 
 #[cfg(test)]
 mod tests {

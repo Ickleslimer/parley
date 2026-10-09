@@ -594,6 +594,24 @@ pub(crate) fn run_prepared_with_receipt_controlled(
 ) -> Result<AskOutcome, AskFailure> {
     let _execution_lease = ExecutionLease::acquire_for_request(req, "synchronous-or-worker")
         .map_err(|error| AskFailure::new(format!("execution lease preflight failed: {error}")))?;
+    run_prepared_with_execution_lease(
+        req,
+        policy,
+        guarded_launch,
+        cancellation,
+        observer,
+        &_execution_lease,
+    )
+}
+
+pub(crate) fn run_prepared_with_execution_lease(
+    req: &AskRequest,
+    policy: &RuntimePolicy,
+    guarded_launch: Option<&GuardedSubagentLaunch>,
+    cancellation: &CancellationToken,
+    observer: &dyn AskSpawnObserver,
+    _execution_lease: &ExecutionLease,
+) -> Result<AskOutcome, AskFailure> {
     let exchange_id = ExchangeLog::allocate_exchange_id();
     let resolved = match resolve_prompt(req, &exchange_id, false) {
         Ok(resolved) => resolved,

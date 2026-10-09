@@ -262,17 +262,7 @@ impl JobStore {
         let dir = self.ensure_job_dir(&job_id)?;
         let _lock = lock_job(&dir)?;
         if let Some(existing) = load_job(&dir, &job_id)? {
-            if existing.request_fingerprint != fingerprint {
-                return Err(JobError::conflict(format!(
-                    "conflict: job {job_id} fingerprint {} does not match {fingerprint}",
-                    existing.request_fingerprint
-                )));
-            }
-            if existing.mode != spec.mode {
-                return Err(JobError::corrupt(
-                    "corrupt: stored job mode does not match the request fingerprint",
-                ));
-            }
+            validate_existing(&existing, &fingerprint, spec.mode)?;
             return Ok(BeginOutcome::Existing(existing.view()));
         }
         let now = self.now_ms();
@@ -292,6 +282,30 @@ impl JobStore {
         };
         commit_record(&dir, &record)?;
         Ok(BeginOutcome::Created(record.view()))
+    }
+
+    pub(crate) fn existing(&self, spec: &JobSpec) -> Result<Option<JobView>, JobError> {
+        let job_id = normalize_uuid(&spec.job_id)?;
+        let fingerprint = request_fingerprint(spec)?;
+        initial_session(spec)?;
+        let dir = self.namespace.directory().join(&job_id);
+        refuse_symlink(&dir)?;
+        if !dir.exists() {
+            return Ok(None);
+        }
+        if !dir.is_dir() {
+            return Err(JobError::corrupt(format!(
+                "corrupt: job path is not a directory: {}",
+                dir.display()
+            )));
+        }
+        let _lock = lock_job(&dir)?;
+        load_job(&dir, &job_id)?
+            .map(|record| {
+                validate_existing(&record, &fingerprint, spec.mode)?;
+                Ok(record.view())
+            })
+            .transpose()
     }
 
     pub(crate) fn transition(
@@ -420,6 +434,21 @@ impl JobStore {
             Clock::Manual(counter) => u128::from(counter.fetch_add(10, Ordering::Relaxed)),
         }
     }
+}
+
+fn validate_existing(record: &JobRecord, fingerprint: &str, mode: JobMode) -> Result<(), JobError> {
+    if record.request_fingerprint != fingerprint {
+        return Err(JobError::conflict(format!(
+            "conflict: job {} fingerprint {} does not match {fingerprint}",
+            record.job_id, record.request_fingerprint
+        )));
+    }
+    if record.mode != mode {
+        return Err(JobError::corrupt(
+            "corrupt: stored job mode does not match the request fingerprint",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn request_fingerprint(spec: &JobSpec) -> Result<String, JobError> {
