@@ -90,11 +90,24 @@ impl PromptFile {
     }
 
     fn create_at(root: &Path, contents: &str) -> Result<Self, ContextError> {
+        Self::create_with_extension_at(root, contents, "txt")
+    }
+
+    pub(crate) fn create_json(contents: &str) -> Result<Self, ContextError> {
+        let root = resolve_state_root(&StateDirEnv::from_process())?;
+        Self::create_with_extension_at(&root, contents, "json")
+    }
+
+    fn create_with_extension_at(
+        root: &Path,
+        contents: &str,
+        extension: &str,
+    ) -> Result<Self, ContextError> {
         OwnedTempFile::create_at(
             root,
             PROMPT_DIRECTORY,
             PROMPT_PREFIX,
-            "txt",
+            extension,
             contents,
             "prompt file",
         )
@@ -142,14 +155,17 @@ impl AgentProfileFile {
 
 pub(crate) fn cleanup_stale_prompt_files(max_age: Duration) -> Result<(), ContextError> {
     let root = resolve_state_root(&StateDirEnv::from_process())?;
-    cleanup_stale_owned_files_at(
-        &root,
-        PROMPT_DIRECTORY,
-        PROMPT_PREFIX,
-        ".txt",
-        max_age,
-        "prompt",
-    )
+    for suffix in [".txt", ".json"] {
+        cleanup_stale_owned_files_at(
+            &root,
+            PROMPT_DIRECTORY,
+            PROMPT_PREFIX,
+            suffix,
+            max_age,
+            "prompt",
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn cleanup_stale_agent_profile_files(max_age: Duration) -> Result<(), ContextError> {
@@ -278,6 +294,56 @@ mod tests {
         assert!(!first_path.exists());
         assert!(second_path.exists());
         second.cleanup().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn json_prompt_files_use_the_native_json_extension_and_exact_cleanup() {
+        let root = root("json-prompt");
+        let text = PromptFile::create_at(&root, "canonical").unwrap();
+        let json = PromptFile::create_with_extension_at(
+            &root,
+            "[{\"type\":\"text\",\"text\":\"query\"}]",
+            "json",
+        )
+        .unwrap();
+        let text_path = text.path().to_path_buf();
+        let json_path = json.path().to_path_buf();
+        assert_eq!(json_path.extension().unwrap(), "json");
+        assert!(json_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(PROMPT_PREFIX));
+        json.cleanup().unwrap();
+        assert!(!json_path.exists());
+        assert_eq!(fs::read_to_string(&text_path).unwrap(), "canonical");
+        text.cleanup().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn json_stale_cleanup_preserves_foreign_files_and_owned_text() {
+        let root = root("json-stale");
+        let text = PromptFile::create_at(&root, "canonical").unwrap();
+        let json = PromptFile::create_with_extension_at(&root, "[]", "json").unwrap();
+        let json_path = json.path().to_path_buf();
+        let unrelated = root.join(PROMPT_DIRECTORY).join("foreign.json");
+        fs::write(&unrelated, "evidence").unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        cleanup_stale_owned_files_at(
+            &root,
+            PROMPT_DIRECTORY,
+            PROMPT_PREFIX,
+            ".json",
+            Duration::ZERO,
+            "prompt",
+        )
+        .unwrap();
+        assert!(!json_path.exists());
+        assert_eq!(fs::read_to_string(text.path()).unwrap(), "canonical");
+        assert_eq!(fs::read_to_string(&unrelated).unwrap(), "evidence");
+        text.cleanup().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

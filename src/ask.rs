@@ -18,7 +18,8 @@ use crate::context::{
     cleanup_stale_agent_profile_files, cleanup_stale_prompt_files,
     load_interaction_profile_from_process, resolve_codex_rollout, resolve_codex_sessions_root,
     AgentProfileFile, CodexHomeEnv, ContextBounds, ContextKey, ContextMode, ContextPlan,
-    ContextRecovery, JournalStore, PlanKind, PromptFile, ResolvedSource, StateDirEnv,
+    ContextRecovery, GrokContextPrompt, JournalStore, PlanKind, PromptFile, ResolvedSource,
+    StateDirEnv,
 };
 use crate::continuation;
 use crate::event_log::{EventReceipt, ExchangeLog, ExchangeReceipt};
@@ -257,12 +258,14 @@ impl StatefulPrompt {
 
 struct ResolvedPrompt {
     text: String,
+    grok_context: Option<GrokContextPrompt>,
     stateful: Option<StatefulPrompt>,
 }
 
 #[derive(Default)]
 struct InvocationFiles {
     prompt: Option<PromptFile>,
+    delivered_input: Option<PromptFile>,
     agent_profile: Option<AgentProfileFile>,
     image_bundle: Option<ImageBundle>,
 }
@@ -272,6 +275,11 @@ impl InvocationFiles {
         let mut errors = Vec::new();
         if let Some(prompt) = self.prompt.take() {
             if let Err(error) = prompt.cleanup() {
+                errors.push(error.to_string());
+            }
+        }
+        if let Some(delivered_input) = self.delivered_input.take() {
+            if let Err(error) = delivered_input.cleanup() {
                 errors.push(error.to_string());
             }
         }
@@ -346,7 +354,7 @@ pub(crate) fn build(req: &AskRequest) -> Result<Invocation, String> {
     let resolved = resolve_prompt(&req, &exchange_id, true)?;
     let mut invocation = build_prepared(&req, resolved.text.clone())?;
     if should_use_prompt_file(&req, &invocation, resolved.stateful.is_some()) {
-        invocation.replace_single_prompt_with_file("<PARLEY_PROMPT_FILE>")?;
+        invocation.replace_single_prompt_with_file(prompt_file_placeholder(&resolved))?;
     }
     Ok(invocation)
 }
@@ -359,6 +367,7 @@ fn resolve_prompt(
     let Some(ctx) = &req.context else {
         return Ok(ResolvedPrompt {
             text: req.prompt.clone(),
+            grok_context: None,
             stateful: None,
         });
     };
@@ -377,6 +386,7 @@ fn resolve_prompt(
                 req.prompt
             )
             },
+            grok_context: None,
             stateful: None,
         });
     }
@@ -440,8 +450,22 @@ fn resolve_prompt(
         interaction_profile.as_deref(),
         &req.prompt,
     );
+    let grok_context = if req.harness == "grok" && req.images.is_empty() {
+        Some(GrokContextPrompt::new(
+            exchange_id,
+            format!(
+                "{}=== PARLEY_CURRENT_REQUEST_V1 exchange={exchange_id} ===\n{}",
+                interaction_profile.as_deref().unwrap_or(""),
+                req.prompt
+            ),
+            frame_stateful_history(exchange_id, ctx, &plan),
+        )?)
+    } else {
+        None
+    };
     Ok(ResolvedPrompt {
         text,
+        grok_context,
         stateful: Some(StatefulPrompt {
             store,
             key,
@@ -459,6 +483,20 @@ fn frame_stateful_prompt(
     interaction_profile: Option<&str>,
     current_request: &str,
 ) -> String {
+    let mut prompt = frame_stateful_history(exchange_id, context, plan);
+    if let Some(profile) = interaction_profile {
+        prompt.push_str(profile);
+        if !profile.ends_with('\n') {
+            prompt.push('\n');
+        }
+    }
+    prompt.push_str(&format!(
+        "=== PARLEY_CURRENT_REQUEST_V1 exchange={exchange_id} ===\n{current_request}"
+    ));
+    prompt
+}
+
+fn frame_stateful_history(exchange_id: &str, context: &ContextRef, plan: &ContextPlan) -> String {
     let mode = if plan.kind == PlanKind::Seed {
         "seed"
     } else {
@@ -485,16 +523,31 @@ fn frame_stateful_prompt(
         prompt.push('\n');
     }
     prompt.push_str("=== END_UNTRUSTED_TRANSCRIPT ===\n");
-    if let Some(profile) = interaction_profile {
-        prompt.push_str(profile);
-        if !profile.ends_with('\n') {
-            prompt.push('\n');
-        }
-    }
-    prompt.push_str(&format!(
-        "=== PARLEY_CURRENT_REQUEST_V1 exchange={exchange_id} ===\n{current_request}"
-    ));
     prompt
+}
+
+fn prompt_file_placeholder(resolved: &ResolvedPrompt) -> &'static str {
+    if resolved.grok_context.is_some() {
+        "<PARLEY_PROMPT_FILE.json>"
+    } else {
+        "<PARLEY_PROMPT_FILE>"
+    }
+}
+
+fn create_invocation_prompt(
+    resolved: &ResolvedPrompt,
+    files: &mut InvocationFiles,
+) -> Result<PromptFile, String> {
+    match &resolved.grok_context {
+        Some(context) => {
+            files.delivered_input =
+                Some(PromptFile::create(&resolved.text).map_err(|error| error.to_string())?);
+            let path = files.delivered_input.as_ref().unwrap().path();
+            let serialized = context.serialize(path, &resolved.text)?;
+            PromptFile::create_json(&serialized).map_err(|error| error.to_string())
+        }
+        None => PromptFile::create(&resolved.text).map_err(|error| error.to_string()),
+    }
 }
 
 fn should_use_prompt_file(req: &AskRequest, invocation: &Invocation, stateful: bool) -> bool {
@@ -769,7 +822,7 @@ pub(crate) fn run_prepared_with_execution_lease(
                 &format!("prompt-file cleanup failed; agent was not started: {error}{suffix}"),
             ));
         }
-        let file = match PromptFile::create(&resolved.text) {
+        let file = match create_invocation_prompt(&resolved, &mut invocation_files) {
             Ok(file) => file,
             Err(error) => {
                 let suffix = invocation_files
@@ -1578,7 +1631,7 @@ pub(crate) fn run_cli(options: AskOptions) -> Result<(), String> {
         let mut invocation = build_prepared(&prepared, resolved.text.clone())?;
         let metadata =
             if should_use_prompt_file(&prepared, &invocation, resolved.stateful.is_some()) {
-                invocation.replace_single_prompt_with_file("<PARLEY_PROMPT_FILE>")?;
+                invocation.replace_single_prompt_with_file(prompt_file_placeholder(&resolved))?;
                 Some((
                     resolved.text.chars().count(),
                     format!("{:016x}", fnv1a_64(&resolved.text)),

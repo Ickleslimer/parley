@@ -80,7 +80,7 @@ fn stateful_dry_run_is_fully_non_mutating_and_reports_prompt_transport() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("--prompt-file"));
-    assert!(stdout.contains("<PARLEY_PROMPT_FILE>"));
+    assert!(stdout.contains("<PARLEY_PROMPT_FILE.json>"));
     assert!(stdout.contains("prompt_buffer"));
     assert!(stdout.contains("character_count"));
     assert!(stdout.contains("fingerprint"));
@@ -201,6 +201,89 @@ fn context_resolution_failure_logs_only_the_current_request_pair() {
     assert!(lines[1].contains("\"event_type\":\"error\""));
     assert!(lines[1].contains("\"status\":\"context_preflight_error\""));
     assert!(!state.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn oversized_current_query_fails_before_spawn_without_historical_text() {
+    let root = temp_dir("query-overflow");
+    let codex_home = root.join("codex-home");
+    let state = root.join("context-state");
+    let log = root.join("events.jsonl");
+    let cwd = root.join("worker");
+    fs::create_dir_all(&cwd).unwrap();
+    write_rollout(&codex_home, "source-session");
+    let output = par()
+        .args(["ask", "-h", "grok", "-p"])
+        .arg("猫".repeat(11_000))
+        .args([
+            "--context-from",
+            "codex:source-session",
+            "--context-mode",
+            "auto",
+            "--session-id",
+            "01a06582-d66e-7811-b0c9-0b0266e17903",
+            "--no-yolo",
+            "--cwd",
+        ])
+        .arg(&cwd)
+        .env("PARLEY_CODEX_HOME", &codex_home)
+        .env("PARLEY_CONTEXT_STATE_DIR", &state)
+        .env("PARLEY_EVENT_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("inline budget"));
+    let events = fs::read_to_string(&log).unwrap();
+    assert_eq!(events.lines().count(), 2);
+    assert!(events.contains("context_preflight_error"));
+    assert!(!events.contains("SEED_MARKER"));
+    assert!(!state.join("prompt-temp").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_spawn_cleans_both_owned_inputs_and_logs_the_canonical_frame() {
+    let root = temp_dir("structured-spawn-failure");
+    let codex_home = root.join("codex-home");
+    let state = root.join("context-state");
+    let log = root.join("events.jsonl");
+    let cwd = root.join("worker");
+    fs::create_dir_all(&cwd).unwrap();
+    write_rollout(&codex_home, "source-session");
+    let output = par()
+        .args([
+            "ask",
+            "-h",
+            "grok",
+            "-p",
+            "task: exact current",
+            "--context-from",
+            "codex:source-session",
+            "--context-mode",
+            "auto",
+            "--session-id",
+            "01a06582-d66e-7811-b0c9-0b0266e17903",
+            "--no-yolo",
+            "--cwd",
+        ])
+        .arg(&cwd)
+        .env("PARLEY_CODEX_HOME", &codex_home)
+        .env("PARLEY_CONTEXT_STATE_DIR", &state)
+        .env("PARLEY_EVENT_LOG", &log)
+        .env("PATH", root.join("missing-provider"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to start grok"));
+    let events = fs::read_to_string(&log).unwrap();
+    assert_eq!(events.lines().count(), 2);
+    assert!(events.contains("PARLEY_UNTRUSTED_CONTEXT_V1"));
+    assert!(events.contains("PARLEY_CURRENT_REQUEST_V1"));
+    assert!(events.contains("SEED_MARKER"));
+    assert!(events.contains("task: exact current"));
+    assert!(!events.contains("parley-untrusted://"));
+    assert_eq!(fs::read_dir(state.join("prompt-temp")).unwrap().count(), 0);
     fs::remove_dir_all(root).unwrap();
 }
 

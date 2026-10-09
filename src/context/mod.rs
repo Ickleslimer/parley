@@ -6,6 +6,7 @@
 
 mod error;
 mod excluded_bytes;
+mod grok_prompt;
 mod journal;
 mod oversized;
 mod parse;
@@ -17,6 +18,7 @@ mod root;
 mod sanitize;
 mod winfile;
 
+pub(crate) use grok_prompt::GrokContextPrompt;
 pub(crate) use journal::{ContextKey, CursorState, JournalStore, StateDirEnv};
 pub(crate) use plan::{ContextBounds, ContextPlan, PlanKind};
 pub(crate) use profile::load_interaction_profile_from_process;
