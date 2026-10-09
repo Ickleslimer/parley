@@ -199,6 +199,9 @@ pub(crate) fn escape_json(s: &str) -> String {
             '\n' => vec!['\\', 'n'],
             '\r' => vec!['\\', 'r'],
             '\t' => vec!['\\', 't'],
+            character if character <= '\u{1f}' => {
+                format!("\\u{:04x}", character as u32).chars().collect()
+            }
             c => vec![c],
         })
         .collect()
@@ -467,6 +470,17 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serializer_escapes_every_json_control_character() {
+        let text = (0u8..=31).map(char::from).collect::<String>();
+        let json = Json::Str(text.clone()).to_compact_string();
+        assert_eq!(
+            Json::parse_exact(&json).unwrap().as_str(),
+            Some(text.as_str())
+        );
+        assert!(!json.bytes().any(|byte| byte < 32));
+    }
 
     #[test]
     fn parses_simple_object() {
