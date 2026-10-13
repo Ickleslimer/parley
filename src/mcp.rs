@@ -1039,7 +1039,7 @@ fn call_tool(
             let request = parse_ask_request(args, default_cwd, policy)?;
             let harness = request.harness.clone();
             match ask::run_with_receipt(&request) {
-                Ok(outcome) => match outcome.captured.reply() {
+                Ok(outcome) => match outcome.reply_result {
                     Ok(reply) => {
                         if is_logged_grok_response(&outcome.receipt) {
                             *delivery = Some(outcome.receipt);

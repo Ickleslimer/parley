@@ -135,6 +135,7 @@ pub(crate) struct AskRequest {
 pub(crate) struct AskOutcome {
     pub(crate) captured: Captured,
     pub(crate) receipt: ExchangeReceipt,
+    pub(crate) reply_result: Result<String, String>,
 }
 
 pub(crate) struct AskFailure {
@@ -1279,6 +1280,7 @@ pub(crate) fn run_prepared_with_execution_lease(
             Ok(AskOutcome {
                 captured: out,
                 receipt,
+                reply_result,
             })
         }
         Err(error) => {
@@ -1697,6 +1699,7 @@ fn finalize_prepared_prompt(
         image_attachments::append_prompt_section(&mut prepared.prompt, &prepared.images)?;
         policy.apply_image_handoff_contract(&prepared.harness, &mut prepared.prompt);
     } else {
+        policy.apply_unattended_tool_guidance(&prepared.harness, &mut prepared.prompt);
         policy.apply_handoff_contract(&prepared.harness, &mut prepared.prompt);
     }
     Ok(())
@@ -1850,6 +1853,157 @@ fn parse_context_spec(spec: &str) -> ContextRef {
             mode_explicit: false,
             recovery: None,
         },
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod completion_result_tests {
+    use super::*;
+    use crate::json::Json;
+    use std::process::Command;
+
+    const OBSERVER_ERROR: &str = "native Grok turn ended with sanitized stop reason cancelled; no durable marked handoff report";
+
+    struct SwallowedCompletion;
+
+    impl AskSpawnObserver for SwallowedCompletion {
+        fn observe_output(&self, _stream: OutputStream, _chunk: &[u8]) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn completed_reply(&self, _captured: &Captured) -> Result<Option<String>, String> {
+            Err(OBSERVER_ERROR.to_string())
+        }
+    }
+
+    #[test]
+    fn observer_error_survives_capture_and_matches_the_exact_logged_error() {
+        let root = env::temp_dir().join(format!(
+            "parley-observer-result-{}-{}",
+            std::process::id(),
+            ExchangeLog::allocate_exchange_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let stub = root.join("stub.rs");
+        fs::write(&stub, r#"
+use std::{env, fs, io::Write};
+fn main() {
+    let trace = env::var("OBSERVER_STUB_TRACE").unwrap();
+    fs::OpenOptions::new().create(true).append(true).open(trace).unwrap().write_all(b"call\n").unwrap();
+    println!("SYNTHETIC_VISIBLE_OUTPUT");
+}
+"#).unwrap();
+        let compiled = Command::new("rustc")
+            .args(["--edition", "2021", "--crate-name", "observer_stub"])
+            .arg(&stub)
+            .arg("-o")
+            .arg(root.join("grok.exe"))
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let child = Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "ask::completion_result_tests::synthetic_observer_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("OBSERVER_TEST_ROOT", &root)
+            .env("OBSERVER_STUB_TRACE", root.join("trace.txt"))
+            .env(
+                "PATH",
+                format!("{};{}", root.display(), env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("trace.txt"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn synthetic_observer_child() {
+        let root = PathBuf::from(env::var_os("OBSERVER_TEST_ROOT").unwrap());
+        for key in env::vars_os().map(|(key, _)| key).collect::<Vec<_>>() {
+            if key.to_string_lossy().starts_with("PARLEY_") {
+                env::remove_var(key);
+            }
+        }
+        let log_path = root.join("events.jsonl");
+        env::set_var("PARLEY_EVENT_LOG", &log_path);
+        let request = AskRequest {
+            harness: "grok".to_string(),
+            prompt: "synthetic task".to_string(),
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            cwd: root.clone(),
+            permission_mode: None,
+            max_turns: None,
+            session_id: None,
+            resume_id: None,
+            conversation_mode: Some(ConversationMode::Isolated),
+            yolo: false,
+            context: None,
+            max_context_chars: None,
+            images: Vec::new(),
+            allow_subagents: false,
+        };
+        let failed = run_prepared_with_receipt_controlled(
+            &request,
+            &RuntimePolicy::default(),
+            None,
+            &CancellationToken::default(),
+            &SwallowedCompletion,
+        )
+        .unwrap_or_else(|failure| panic!("{}", failure.message));
+        assert!(failed.captured.success);
+        assert!(failed.captured.stdout.is_empty());
+        assert!(failed.captured.stderr.is_empty());
+        assert_eq!(
+            failed.captured.reply().unwrap_err(),
+            "exited without producing any output"
+        );
+        assert_eq!(
+            failed.reply_result.as_ref().err().map(String::as_str),
+            Some(OBSERVER_ERROR)
+        );
+        assert_eq!(failed.receipt.completion.event_type, "error");
+        let events = fs::read_to_string(&log_path).unwrap();
+        let completion = Json::parse(events.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            completion.get("error").and_then(Json::as_str),
+            Some(OBSERVER_ERROR)
+        );
+        assert!(!events.contains("SYNTHETIC_VISIBLE_OUTPUT"));
+        let ordinary = run_prepared_with_receipt_controlled(
+            &request,
+            &RuntimePolicy::default(),
+            None,
+            &CancellationToken::default(),
+            &NoopAskSpawnObserver,
+        )
+        .unwrap_or_else(|failure| panic!("{}", failure.message));
+        assert_eq!(ordinary.reply_result, ordinary.captured.reply());
+        assert_eq!(ordinary.reply_result.unwrap(), "SYNTHETIC_VISIBLE_OUTPUT");
+        assert_eq!(fs::read_to_string(log_path).unwrap().lines().count(), 4);
     }
 }
 

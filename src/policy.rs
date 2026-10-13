@@ -913,6 +913,15 @@ impl RuntimePolicy {
         self.grok_require_handoff_footer
     }
 
+    pub(crate) fn apply_unattended_tool_guidance(&self, harness: &str, prompt: &mut String) {
+        if harness != "grok" || self.grok_locked_permission_mode.as_deref() != Some("auto") {
+            return;
+        }
+        prompt.push_str("\n\nTWO CHAIRS UNATTENDED TOOL GUIDANCE\n");
+        prompt.push_str("This is a headless Auto-permission turn with closed stdin; no human approval can arrive through this transport. Prefer built-in read_file/grep/list_dir and direct read-only Git commands. Avoid shell pipelines, wrappers, and output selectors such as Select-Object when a built-in read or direct command suffices.\n");
+        prompt.push_str("If a tool is denied and the turn continues, use a genuinely different permitted read-only method or report the blocker. Do not repeat the denied command, escalate permissions, ask for approval through this transport, or claim approval was granted. This is guidance only, not a permission grant or a guarantee that native permission prompts cannot occur.\n");
+    }
+
     pub(crate) fn apply_handoff_contract(&self, harness: &str, prompt: &mut String) {
         if harness != "grok" || !self.grok_require_handoff_footer {
             return;
@@ -1932,6 +1941,33 @@ mod tests {
 
         let mut other = "task".to_string();
         policy.apply_handoff_contract("codex", &mut other);
+        assert_eq!(other, "task");
+    }
+
+    #[test]
+    fn unattended_guidance_is_only_for_locked_grok_auto_and_grants_nothing() {
+        let locked = RuntimePolicy {
+            grok_locked_permission_mode: Some("auto".to_string()),
+            ..RuntimePolicy::default()
+        };
+        let mut prompt = "task".to_string();
+        locked.apply_unattended_tool_guidance("grok", &mut prompt);
+        assert!(prompt.starts_with("task\n"));
+        assert!(prompt.contains("closed stdin"));
+        assert!(prompt.contains("Select-Object"));
+        assert!(prompt.contains("Do not repeat the denied command"));
+        assert!(prompt.contains("guidance only, not a permission grant"));
+        assert!(prompt.contains("native permission prompts cannot occur"));
+        let mut other = "task".to_string();
+        locked.apply_unattended_tool_guidance("codex", &mut other);
+        assert_eq!(other, "task");
+        RuntimePolicy::default().apply_unattended_tool_guidance("grok", &mut other);
+        assert_eq!(other, "task");
+        let different = RuntimePolicy {
+            grok_locked_permission_mode: Some("dontAsk".to_string()),
+            ..RuntimePolicy::default()
+        };
+        different.apply_unattended_tool_guidance("grok", &mut other);
         assert_eq!(other, "task");
     }
 
