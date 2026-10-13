@@ -719,7 +719,8 @@ impl RuntimePolicy {
             *source_harness = locked.clone();
         }
         if let Some(locked) = self.context_locked_mode {
-            if mode_explicit && *mode != locked {
+            let catch_up = locked == ContextMode::Auto && *mode == ContextMode::CatchUp;
+            if mode_explicit && *mode != locked && !catch_up {
                 return Err(format!(
                     "context mode is locked to {}; requested {}",
                     locked.as_str(),
@@ -731,6 +732,11 @@ impl RuntimePolicy {
             }
         }
 
+        if *mode == ContextMode::CatchUp && (allow_missing_target || recovery.is_some()) {
+            return Err(
+                "catchup requires an explicit existing resume_id and no recovery".to_string(),
+            );
+        }
         if *mode == ContextMode::Snapshot {
             if recovery.is_some() {
                 return Err("context recovery is only valid for uncertain auto resumes".to_string());
@@ -796,6 +802,11 @@ impl RuntimePolicy {
                 }
                 if recovery.is_some() {
                     return Err("context recovery is only valid for auto resume".to_string());
+                }
+            }
+            ContextMode::CatchUp => {
+                if resume_id.is_none() || session_id.is_some() {
+                    return Err("catchup requires resume_id, not session_id".to_string());
                 }
             }
             ContextMode::Snapshot => unreachable!(),
@@ -1311,6 +1322,113 @@ fn path_starts_with(path: &Path, root: &Path) -> bool {
         .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
         .collect::<Vec<_>>();
     path_components.starts_with(&root_components)
+}
+
+#[cfg(test)]
+mod catch_up_policy_tests {
+    use super::*;
+
+    #[test]
+    fn locked_catchup_preserves_source_target_and_recovery_guards() {
+        let policy = RuntimePolicy {
+            context_locked_source: Some("codex".to_string()),
+            context_locked_mode: Some(ContextMode::Auto),
+            ..RuntimePolicy::default()
+        };
+        for (target, source, source_session, session_id, resume_id, recovery, missing, succeeds) in [
+            (
+                "grok",
+                "codex",
+                "source",
+                None,
+                Some("target"),
+                None,
+                false,
+                true,
+            ),
+            (
+                "claude",
+                "codex",
+                "source",
+                None,
+                Some("target"),
+                None,
+                false,
+                false,
+            ),
+            (
+                "grok",
+                "grok",
+                "source",
+                None,
+                Some("target"),
+                None,
+                false,
+                false,
+            ),
+            (
+                "grok",
+                "codex",
+                "latest",
+                None,
+                Some("target"),
+                None,
+                false,
+                false,
+            ),
+            (
+                "grok",
+                "codex",
+                "source",
+                Some("new"),
+                None,
+                None,
+                false,
+                false,
+            ),
+            ("grok", "codex", "source", None, None, None, false, false),
+            (
+                "grok",
+                "codex",
+                "source",
+                None,
+                Some("target"),
+                Some(ContextRecovery::Replay),
+                false,
+                false,
+            ),
+            (
+                "grok",
+                "codex",
+                "source",
+                None,
+                Some("target"),
+                Some(ContextRecovery::Skip),
+                false,
+                false,
+            ),
+            ("grok", "codex", "source", None, None, None, true, false),
+        ] {
+            let mut source = source.to_string();
+            let mut mode = ContextMode::CatchUp;
+            let result = policy.apply_context(ContextPolicyRequest {
+                target_harness: target,
+                source_harness: &mut source,
+                source_session,
+                mode: &mut mode,
+                mode_explicit: true,
+                recovery,
+                max_context_chars: None,
+                session_id,
+                resume_id,
+                allow_missing_target: missing,
+            });
+            assert_eq!(result.is_ok(), succeeds);
+            if succeeds {
+                assert_eq!(mode, ContextMode::CatchUp);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

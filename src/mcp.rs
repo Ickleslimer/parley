@@ -608,7 +608,7 @@ fn tools_list_result() -> Json {
                     ("type", Json::Str("object".to_string())),
                     (
                         "description",
-                        Json::Str("Seed the call with another agent's session transcript.".to_string()),
+                        Json::Str("Seed the call with another agent's session transcript. catchup is synchronous-only, requires an existing resume_id and isolated mode, and accepts only the literal prompt 'Catch up shared context only.'.".to_string()),
                     ),
                     (
                         "properties",
@@ -622,7 +622,7 @@ fn tools_list_result() -> Json {
                                     (
                                         "enum",
                                         Json::Array(
-                                            ["snapshot", "auto", "seed", "delta"]
+                                            ["snapshot", "auto", "seed", "delta", "catchup"]
                                                 .into_iter()
                                                 .map(|value| Json::Str(value.to_string()))
                                                 .collect(),
@@ -1984,7 +1984,7 @@ mod tests {
                 .iter()
                 .filter_map(Json::as_str)
                 .collect::<Vec<_>>(),
-            vec!["snapshot", "auto", "seed", "delta"]
+            vec!["snapshot", "auto", "seed", "delta", "catchup"]
         );
         assert_eq!(
             context_properties

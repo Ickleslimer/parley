@@ -39,6 +39,7 @@ pub(crate) enum ContextMode {
     Auto,
     Seed,
     Delta,
+    CatchUp,
 }
 
 impl ContextMode {
@@ -48,8 +49,9 @@ impl ContextMode {
             "auto" => Ok(Self::Auto),
             "seed" => Ok(Self::Seed),
             "delta" => Ok(Self::Delta),
+            "catchup" => Ok(Self::CatchUp),
             _ => Err(format!(
-                "context mode must be snapshot, auto, seed, or delta, got {value}"
+                "context mode must be snapshot, auto, seed, delta, or catchup, got {value}"
             )),
         }
     }
@@ -60,6 +62,7 @@ impl ContextMode {
             Self::Auto => "auto",
             Self::Seed => "seed",
             Self::Delta => "delta",
+            Self::CatchUp => "catchup",
         }
     }
 }

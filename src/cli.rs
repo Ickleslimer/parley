@@ -467,6 +467,9 @@ Ask (agent-to-agent):
   par ask -h gr --context-from co:<id> --conversation-mode canonical -p \"...\"
                                   Derive and continue the canonical Grok peer session
   --context-recovery replay|skip Recover an uncertain auto-resume explicitly
+  --context-mode catchup          Receive one whole-turn prefix when exact delta is too large;
+                                  synchronous only, --conversation-mode isolated --resume-id <id>,
+                                  literal prompt: Catch up shared context only.
   par ask -h g -p \"...\" --max-context 8000 --dry-run
                                   Cap injected context; show the command, run nothing
   par ask -h gr -p \"...\" --no-yolo --permission-mode auto --reasoning-effort xhigh --session-id <uuid>

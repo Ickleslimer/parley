@@ -4,6 +4,29 @@
 
 # Parley
 
+### Oversized exact context deltas
+
+Ordinary auto/delta requests still include the complete unread transcript or
+fail closed at the configured limits. To drain an oversized backlog without
+discarding history, explicitly invoke synchronous `ask_agent` with
+`context_from.mode="catchup"`, the exact source session, `conversation_mode="isolated"`,
+the existing native Grok `resume_id`, and the literal prompt
+`Catch up shared context only.`. CLI equivalents are `--context-mode catchup`,
+`--conversation-mode isolated`, `--resume-id`, and that literal `-p` value.
+Isolated here selects the explicit existing native ID; it does not create or
+replace the canonical conversation. New targets, asynchronous jobs, images,
+arbitrary task prompts, recovery actions, and uncertain cursors are rejected.
+
+Each explicit call delivers one contiguous prefix of whole unread turns within
+the unchanged delta/hard caps. It labels remaining backlog and requires an
+exact range receipt before the existing cursor commit. No task work is allowed
+on a partial history. When the remainder fits, catch-up refuses; resume the
+ordinary auto/delta workflow. There is no automatic model loop or retry.
+An over-cap first unread turn still fails closed. A started catch-up without a
+valid receipt leaves the same uncertainty gates as other calls: do not resend,
+skip, or assume delivery automatically. Explicit replay of an uncertain range
+uses the existing recovery contract and must be deliberately evaluated.
+
 **Your coding agents are smarter together.**
 
 A **CLI** *and* an **MCP server** that convene a panel of the agents you already run — Claude, Codex, Gemini, Grok, and more — and fuse their answers into one.

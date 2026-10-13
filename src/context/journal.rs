@@ -15,8 +15,8 @@ use crate::signals::fnv1a_64;
 use super::error::{ContextError, ErrorKind};
 use super::parse::{optional_str, parse_json, required_object, required_str, required_u64};
 use super::plan::{
-    plan_delta, plan_replay, plan_seed, scan_evidence, ContextBounds, ContextPlan, MessageAnchor,
-    PlanKind,
+    plan_catch_up, plan_delta, plan_replay, plan_seed, scan_evidence, ContextBounds, ContextPlan,
+    MessageAnchor, PlanKind,
 };
 use super::reader::{ScanSummary, SharedJsonlReader};
 use super::root::{source_harness, ResolvedSource};
@@ -27,6 +27,104 @@ use super::winfile::{
 };
 
 static RECORD_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(all(test, windows))]
+mod catch_up_state_tests {
+    use super::*;
+
+    fn fixture() -> (JournalStore, ContextKey, ResolvedSource, ContextBounds) {
+        let root = std::env::temp_dir().join(format!(
+            "parley-catchup-state-{}-{}-{}",
+            std::process::id(),
+            timestamp_ms(),
+            RECORD_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"source\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"seed\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"seed\"}]}}\n"
+        )).unwrap();
+        let reader = SharedJsonlReader::open(&path).unwrap();
+        let source = ResolvedSource {
+            session_id: "source".to_string(),
+            path,
+            identity: reader.identity().clone(),
+        };
+        let store = JournalStore::open_at(root.join("state"));
+        let key = ContextKey::new("target", "codex", "source").unwrap();
+        let bounds = ContextBounds {
+            seed_max_chars: 100,
+            delta_max_chars: 8,
+            hard_max_chars: 100,
+        };
+        (store, key, source, bounds)
+    }
+
+    fn append_turn(source: &ResolvedSource, turn: &str, text: &str) {
+        let body = format!("{{\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"{turn}\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{text}\"}}]}}}}\n");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source.path)
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+    }
+
+    #[test]
+    fn catchup_advances_only_the_receipted_prefix_and_verifies_it_on_resume() {
+        let (store, key, source, bounds) = fixture();
+        assert!(store
+            .plan_resume_catch_up_read_only(&key, &source, &bounds)
+            .is_err());
+        let seed = store.plan_new_session_seed(&key, &source, &bounds).unwrap();
+        store
+            .append_in_flight(&key, &seed, "seed-exchange")
+            .unwrap();
+        store.commit(&key, &seed, "seed-exchange").unwrap();
+        append_turn(&source, "one", "AAAA");
+        append_turn(&source, "two", "BBBB");
+        append_turn(&source, "three", "CCCC");
+        let before = store.inspect(&key).unwrap();
+        let prefix = store
+            .plan_resume_catch_up_read_only(&key, &source, &bounds)
+            .unwrap();
+        assert_eq!(store.inspect(&key).unwrap(), before);
+        assert_eq!(prefix.start_offset, seed.end_offset);
+        assert_eq!(prefix.character_count, 8);
+        assert!(prefix.text.contains("AAAA") && prefix.text.contains("BBBB"));
+        assert!(!prefix.text.contains("CCCC"));
+        store
+            .append_in_flight(&key, &prefix, "catchup-exchange")
+            .unwrap();
+        assert!(store.plan_resume_catch_up(&key, &source, &bounds).is_err());
+        store.commit(&key, &prefix, "catchup-exchange").unwrap();
+        let body = std::fs::read_to_string(&source.path)
+            .unwrap()
+            .replace("CCCC", "DDDD");
+        std::fs::write(&source.path, body).unwrap();
+        let remaining = store.plan_resume_delta(&key, &source, &bounds).unwrap();
+        assert_eq!(remaining.start_offset, prefix.end_offset);
+        assert_eq!(remaining.character_count, 4);
+        assert!(remaining.text.contains("DDDD"));
+        assert!(store.plan_resume_catch_up(&key, &source, &bounds).is_err());
+    }
+
+    #[test]
+    fn over_cap_turn_leaves_committed_state_unchanged() {
+        let (store, key, source, bounds) = fixture();
+        let seed = store.plan_new_session_seed(&key, &source, &bounds).unwrap();
+        store
+            .append_in_flight(&key, &seed, "seed-exchange")
+            .unwrap();
+        store.commit(&key, &seed, "seed-exchange").unwrap();
+        append_turn(&source, "large", "0123456789");
+        let before = store.inspect(&key).unwrap();
+        assert!(store.plan_resume_catch_up(&key, &source, &bounds).is_err());
+        assert_eq!(store.inspect(&key).unwrap(), before);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CursorState {
@@ -282,6 +380,36 @@ impl JournalStore {
                 "in-flight context state cannot plan a resume delta",
             )),
         }
+    }
+
+    pub(crate) fn plan_resume_catch_up(
+        &self,
+        key: &ContextKey,
+        source: &ResolvedSource,
+        bounds: &ContextBounds,
+    ) -> Result<ContextPlan, ContextError> {
+        let _lock = self.lock_key(key)?;
+        self.plan_resume_catch_up_read_only(key, source, bounds)
+    }
+
+    pub(crate) fn plan_resume_catch_up_read_only(
+        &self,
+        key: &ContextKey,
+        source: &ResolvedSource,
+        bounds: &ContextBounds,
+    ) -> Result<ContextPlan, ContextError> {
+        let snapshot = self.inspect_locked(key)?;
+        if snapshot.state != CursorState::Committed {
+            return Err(ContextError::state(
+                "catchup requires committed context; it cannot recover absent, uncertain or in-flight state",
+            ));
+        }
+        self.verify_source_session(key, source)?;
+        let mut reader = SharedJsonlReader::open(&source.path)?;
+        self.verify_live_identity(source, reader.identity())?;
+        self.verify_identity(&snapshot, reader.identity())?;
+        self.verify_range(&snapshot, &mut reader)?;
+        plan_catch_up(source, &mut reader, snapshot.end_offset, bounds)
     }
 
     pub(crate) fn plan_uncertain_replay(
