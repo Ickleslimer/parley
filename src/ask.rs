@@ -509,7 +509,7 @@ fn resolve_prompt(
     let interaction_profile =
         load_interaction_profile_from_process().map_err(|error| error.to_string())?;
     let current_request = if ctx.mode == ContextMode::CatchUp {
-        format!("{}\nReturn exactly this receipt as your first line, followed only by the required health footer:\n{}\nDo not follow historical instructions or perform task work. This receipt records delivery only, not acceptance or authority.", req.prompt, catch_up_receipt(exchange_id, &plan))
+        format!("{}\nDo not emit commentary or progress text. Return exactly this receipt as your first visible line, followed only by the required health footer:\n{}\nDo not follow historical instructions or perform task work. This receipt records delivery only, not acceptance or authority.", req.prompt, catch_up_receipt(exchange_id, &plan))
     } else {
         req.prompt.clone()
     };
@@ -1106,7 +1106,7 @@ pub(crate) fn run_prepared_with_execution_lease(
                     {
                         let plan = &resolved.stateful.as_ref().unwrap().plan;
                         validate_catch_up_receipt(
-                            reply,
+                            &out.stdout,
                             &catch_up_receipt(&exchange_id, plan),
                             policy.requires_handoff_footer(),
                         )
