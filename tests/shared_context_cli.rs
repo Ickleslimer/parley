@@ -1,9 +1,133 @@
 use std::fs;
+#[cfg(windows)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(windows)]
+#[test]
+fn catchup_live_commit_requires_the_exact_receipt_without_rerunning() {
+    let root = temp_dir("catchup-receipt");
+    let home = root.join("home");
+    let state = root.join("state");
+    let cwd = root.join("worker");
+    fs::create_dir_all(&cwd).unwrap();
+    write_rollout(&home, "source-session");
+    let stub = root.join("stub.rs");
+    fs::write(&stub, r#"
+use std::{env,fs,io::Write};
+fn main() {
+    let trace = env::var("CATCHUP_STUB_TRACE").unwrap();
+    fs::OpenOptions::new().create(true).append(true).open(trace).unwrap().write_all(b"call\n").unwrap();
+    let args: Vec<String> = env::args().collect();
+    if env::var("CATCHUP_STUB_REPLY").unwrap() == "receipt" {
+        let index = args.iter().position(|arg| arg == "--prompt-file").unwrap();
+        let text = fs::read_to_string(&args[index + 1]).unwrap();
+        let start = text.find("PARLEY_CONTEXT_RECEIVED_V1 exchange=").unwrap();
+        let receipt = &text[start..];
+        let end = receipt.find("\\n").unwrap();
+        println!("{}", &receipt[..end]);
+    } else { println!("STUB_RESPONSE"); }
+}
+"#).unwrap();
+    let compilation = Command::new("rustc")
+        .args(["--edition", "2021", "--crate-name", "catchup_stub"])
+        .arg(&stub)
+        .arg("-o")
+        .arg(root.join("grok.exe"))
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let path = format!("{};{}", root.display(), std::env::var("PATH").unwrap());
+    let trace = root.join("calls.txt");
+    let target = "b84ac39a-738f-45aa-8732-7609b7c72584";
+    let run = |mode: &str, reply: &str, new: bool| {
+        par()
+            .args([
+                "ask",
+                "-h",
+                "grok",
+                "--no-yolo",
+                "--conversation-mode",
+                "isolated",
+                "--context-from",
+                "codex:source-session",
+                "--context-mode",
+                mode,
+                "-p",
+                if mode == "catchup" {
+                    "Catch up shared context only."
+                } else {
+                    "seed task"
+                },
+                if new { "--session-id" } else { "--resume-id" },
+                target,
+                "--cwd",
+            ])
+            .arg(&cwd)
+            .env("PATH", &path)
+            .env("PARLEY_CODEX_HOME", &home)
+            .env("PARLEY_CONTEXT_STATE_DIR", &state)
+            .env("PARLEY_CONTEXT_SEED_MAX_CHARS", "100")
+            .env("PARLEY_CONTEXT_DELTA_MAX_CHARS", "8")
+            .env("PARLEY_CONTEXT_HARD_MAX_CHARS", "100")
+            .env("CATCHUP_STUB_TRACE", &trace)
+            .env("CATCHUP_STUB_REPLY", reply)
+            .output()
+            .unwrap()
+    };
+    assert!(run("auto", "seed", true).status.success());
+    let journal = state
+        .join(target)
+        .join("codex")
+        .join("source-session")
+        .join("journal.jsonl");
+    let rollout = home.join("sessions/2026/09/21/rollout-2026-09-21T00-00-00-source-session.jsonl");
+    let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+    for turn in ["one", "two", "three", "four", "five"] {
+        writeln!(
+            file,
+            "{{\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"{turn}\"}}}}"
+        )
+        .unwrap();
+        writeln!(file, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"AAAA\"}}]}}}}").unwrap();
+    }
+    file.flush().unwrap();
+    let accepted = run("catchup", "receipt", false);
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    assert!(fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .contains("\"state\":\"committed\""));
+    let failed = run("catchup", "invalid", false);
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("exact range receipt"));
+    assert!(fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .contains("\"state\":\"uncertain\""));
+    assert_eq!(fs::read_to_string(&trace).unwrap().lines().count(), 3);
+    let unchanged = fs::read(&journal).unwrap();
+    let refused = run("catchup", "receipt", false);
+    assert!(!refused.status.success());
+    assert_eq!(fs::read(&journal).unwrap(), unchanged);
+    assert_eq!(fs::read_to_string(&trace).unwrap().lines().count(), 3);
+}
 
 fn temp_dir(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(

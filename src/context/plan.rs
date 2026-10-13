@@ -138,10 +138,8 @@ pub(crate) fn plan_delta(
     ))
 }
 
-#[allow(dead_code)]
 const CATCH_UP_CUT: &str = "catch-up stopped at the rejected turn boundary";
 
-#[allow(dead_code)]
 pub(crate) fn plan_catch_up(
     source: &ResolvedSource,
     reader: &mut SharedJsonlReader,
@@ -385,13 +383,11 @@ impl MessageCollector {
     }
 }
 
-#[allow(dead_code)]
 struct CatchUpSelection {
     messages: Vec<VisibleMessage>,
     cut: u64,
 }
 
-#[allow(dead_code)]
 struct OpenTurn {
     turn_id: String,
     start_offset: u64,
@@ -399,7 +395,6 @@ struct OpenTurn {
     chars: usize,
 }
 
-#[allow(dead_code)]
 struct CatchUpSelector {
     decoder: VisibleMessageDecoder,
     cursor: u64,
@@ -412,7 +407,6 @@ struct CatchUpSelector {
     cut: Option<u64>,
 }
 
-#[allow(dead_code)]
 impl CatchUpSelector {
     fn new(cursor: u64, bounds: &ContextBounds) -> Self {
         Self {
