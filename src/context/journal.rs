@@ -708,7 +708,12 @@ impl JournalStore {
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(snapshot, reader.identity())?;
         self.verify_range(snapshot, &mut reader)?;
-        plan_delta(source, &mut reader, snapshot.end_offset, bounds)
+        plan_delta(source, &mut reader, snapshot.end_offset, bounds).map_err(|mut error| {
+            if error.kind == ErrorKind::Overflow && error.message == "delta character count exceeds limit" {
+                error.message.push_str("; use explicit synchronous receipt-only context-mode catchup before continuing; never truncate or retry automatically");
+            }
+            error
+        })
     }
 
     fn inspect_locked(&self, key: &ContextKey) -> Result<CursorSnapshot, ContextError> {
