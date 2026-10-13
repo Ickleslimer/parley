@@ -666,7 +666,6 @@ fn run_worker(
     );
     match result {
         Ok(outcome) => {
-            // Post-observer completion result. Swallowed capture must not be recomputed.
             let reply = outcome.reply_result;
             let cancelled = cancellation.is_cancelled() || outcome.captured.cancelled;
             let timed_out = outcome.captured.timed_out;
