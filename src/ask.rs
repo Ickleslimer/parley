@@ -51,6 +51,11 @@ fn validate_catch_up_intent(req: &AskRequest) -> Result<bool, String> {
     if req.prompt != CATCH_UP_PROMPT || !req.images.is_empty() || req.allow_subagents {
         return Err(format!("catchup accepts only the literal prompt '{CATCH_UP_PROMPT}', without images or subagents"));
     }
+    if !req.context.as_ref().unwrap().mode_explicit {
+        return Err(
+            "catchup must be explicitly selected; it is never an injected default".to_string(),
+        );
+    }
     if req.resume_id.is_none()
         || req.session_id.is_some()
         || req.conversation_mode == Some(ConversationMode::Canonical)

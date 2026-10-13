@@ -698,6 +698,11 @@ impl RuntimePolicy {
     }
 
     pub(crate) fn apply_context(&self, request: ContextPolicyRequest<'_>) -> Result<(), String> {
+        if self.context_locked_mode == Some(ContextMode::CatchUp) {
+            return Err(
+                "catchup is an explicit operation, not a locked default context mode".to_string(),
+            );
+        }
         let ContextPolicyRequest {
             target_harness,
             source_harness,
