@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 #[cfg(test)]
 use crate::signals::fnv1a_64;
 
-use super::error::ContextError;
+use super::error::{ContextError, ErrorKind};
 use super::reader::{PhysicalRecord, ScanSummary, SharedJsonlReader};
 use super::root::ResolvedSource;
 use super::sanitize::{content_chars, render_messages, VisibleMessage, VisibleMessageDecoder};
@@ -134,6 +134,65 @@ pub(crate) fn plan_delta(
         &summary,
         start_offset,
         summary.complete_end,
+        false,
+    ))
+}
+
+#[allow(dead_code)]
+const CATCH_UP_CUT: &str = "catch-up stopped at the rejected turn boundary";
+
+#[allow(dead_code)]
+pub(crate) fn plan_catch_up(
+    source: &ResolvedSource,
+    reader: &mut SharedJsonlReader,
+    start_offset: u64,
+    bounds: &ContextBounds,
+) -> Result<ContextPlan, ContextError> {
+    if !source.identity.same_file(reader.identity()) {
+        return Err(ContextError::new(
+            ErrorKind::Replaced,
+            format!("source file identity changed for {}", source.session_id),
+        ));
+    }
+    let mut selector = CatchUpSelector::new(start_offset, bounds);
+    let selection = match reader.scan_from(start_offset, |record| selector.push(record)) {
+        Ok(summary) => selector.refuse_fitting_tail(&summary)?,
+        Err(error) if error.kind == ErrorKind::State && error.message == CATCH_UP_CUT => {
+            selector.confirmed_cut()?
+        }
+        Err(error) => return Err(error),
+    };
+    let mut decoder = VisibleMessageDecoder::default();
+    let mut messages = Vec::new();
+    let selected = reader.scan_until(start_offset, selection.cut, |record| {
+        if let Some(message) = decoder.push(&record)? {
+            messages.push(message);
+        }
+        Ok(())
+    })?;
+    if selected.complete_end != selection.cut {
+        return Err(ContextError::mismatch(
+            "catch-up byte range does not match the selected cut",
+        ));
+    }
+    if messages != selection.messages {
+        return Err(ContextError::mismatch(
+            "source changed while selecting the catch-up range",
+        ));
+    }
+    let limit = bounds.delta_max_chars.min(bounds.hard_max_chars);
+    if content_chars(&messages) as usize > limit {
+        return Err(ContextError::overflow(
+            "selected catch-up range exceeds the character limit",
+        ));
+    }
+    Ok(build_plan(
+        PlanKind::Delta,
+        source,
+        &messages,
+        &selected,
+        start_offset,
+        selection.cut,
         false,
     ))
 }
@@ -323,6 +382,196 @@ impl MessageCollector {
 
     fn finish(self) -> Vec<VisibleMessage> {
         self.messages
+    }
+}
+
+#[allow(dead_code)]
+struct CatchUpSelection {
+    messages: Vec<VisibleMessage>,
+    cut: u64,
+}
+
+#[allow(dead_code)]
+struct OpenTurn {
+    turn_id: String,
+    start_offset: u64,
+    messages: Vec<VisibleMessage>,
+    chars: usize,
+}
+
+#[allow(dead_code)]
+struct CatchUpSelector {
+    decoder: VisibleMessageDecoder,
+    cursor: u64,
+    limit: usize,
+    hard_is_tighter: bool,
+    accepted: Vec<VisibleMessage>,
+    accepted_chars: usize,
+    closed_ids: Vec<String>,
+    open: Option<OpenTurn>,
+    cut: Option<u64>,
+}
+
+#[allow(dead_code)]
+impl CatchUpSelector {
+    fn new(cursor: u64, bounds: &ContextBounds) -> Self {
+        Self {
+            decoder: VisibleMessageDecoder::default(),
+            cursor,
+            limit: bounds.delta_max_chars.min(bounds.hard_max_chars),
+            hard_is_tighter: bounds.hard_max_chars < bounds.delta_max_chars,
+            accepted: Vec::new(),
+            accepted_chars: 0,
+            closed_ids: Vec::new(),
+            open: None,
+            cut: None,
+        }
+    }
+
+    fn push(&mut self, record: PhysicalRecord) -> Result<(), ContextError> {
+        if self.cut.is_some() {
+            return Ok(());
+        }
+        let Some(message) = self.decoder.push(&record)? else {
+            return Ok(());
+        };
+        if message.start_offset < self.cursor || message.turn_start_offset < self.cursor {
+            return Err(ContextError::mismatch(
+                "catch-up cut does not advance the cursor",
+            ));
+        }
+        let message_chars = message.text.chars().count();
+        let same_turn = self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.turn_id == message.turn_id);
+        if !same_turn {
+            if self
+                .closed_ids
+                .iter()
+                .any(|turn_id| turn_id == &message.turn_id)
+            {
+                return Err(ContextError::mismatch(
+                    "catch-up turn boundary is not contiguous",
+                ));
+            }
+            if let Some(open) = self.open.take() {
+                self.commit_open(open);
+            }
+            if let Some(previous) = self.accepted.last() {
+                if message.turn_start_offset < previous.end_offset {
+                    return Err(ContextError::mismatch(
+                        "catch-up turn boundary is not contiguous",
+                    ));
+                }
+            }
+            self.open = Some(OpenTurn {
+                turn_id: message.turn_id.clone(),
+                start_offset: message.turn_start_offset,
+                messages: Vec::new(),
+                chars: 0,
+            });
+        }
+        let accepted_chars = self.accepted_chars;
+        let limit = self.limit;
+        let decision = {
+            let Some(open) = self.open.as_mut() else {
+                return Err(ContextError::mismatch(
+                    "catch-up turn boundary is not contiguous",
+                ));
+            };
+            if message.start_offset < open.start_offset {
+                return Err(ContextError::mismatch(
+                    "catch-up turn boundary is not contiguous",
+                ));
+            }
+            let fits = open
+                .chars
+                .checked_add(message_chars)
+                .and_then(|chars| accepted_chars.checked_add(chars))
+                .is_some_and(|count| count <= limit);
+            (fits, open.start_offset)
+        };
+        let (fits, cut) = decision;
+        if !fits {
+            self.open = None;
+            if self.accepted.is_empty() {
+                return Err(self.first_turn_error());
+            }
+            if cut <= self.cursor {
+                return Err(ContextError::mismatch(
+                    "catch-up cut does not advance the cursor",
+                ));
+            }
+            self.cut = Some(cut);
+            return Err(ContextError::state(CATCH_UP_CUT));
+        }
+        let Some(open) = self.open.as_mut() else {
+            return Err(ContextError::mismatch(
+                "catch-up turn boundary is not contiguous",
+            ));
+        };
+        open.chars += message_chars;
+        open.messages.push(message);
+        Ok(())
+    }
+
+    fn commit_open(&mut self, open: OpenTurn) {
+        self.accepted_chars = self.accepted_chars.saturating_add(open.chars);
+        self.closed_ids.push(open.turn_id);
+        self.accepted.extend(open.messages);
+    }
+
+    fn first_turn_error(&self) -> ContextError {
+        if self.hard_is_tighter {
+            ContextError::overflow("first unread turn exceeds hard_max_chars")
+        } else {
+            ContextError::overflow("first unread turn exceeds delta_max_chars")
+        }
+    }
+
+    fn confirmed_cut(&self) -> Result<CatchUpSelection, ContextError> {
+        let Some(cut) = self.cut else {
+            return Err(ContextError::mismatch(
+                "catch-up cut does not advance the cursor",
+            ));
+        };
+        if self.accepted.is_empty() || cut <= self.cursor {
+            return Err(ContextError::mismatch(
+                "catch-up cut does not advance the cursor",
+            ));
+        }
+        let unsafe_range = self.accepted.iter().any(|message| {
+            message.start_offset < self.cursor
+                || message.end_offset > cut
+                || message.turn_start_offset < self.cursor
+                || message.turn_start_offset >= cut
+        });
+        if unsafe_range {
+            return Err(ContextError::mismatch(
+                "catch-up cut does not advance the cursor",
+            ));
+        }
+        Ok(CatchUpSelection {
+            messages: self.accepted.clone(),
+            cut,
+        })
+    }
+
+    fn refuse_fitting_tail(&self, summary: &ScanSummary) -> Result<CatchUpSelection, ContextError> {
+        if self.cut.is_some() {
+            return Err(ContextError::mismatch(
+                "catch-up cut does not advance the cursor",
+            ));
+        }
+        if summary.record_count == 0 && self.accepted.is_empty() && self.open.is_none() {
+            return Err(ContextError::unsupported(
+                "catch-up requires unread history",
+            ));
+        }
+        Err(ContextError::unsupported(
+            "unread tail fits in an ordinary delta",
+        ))
     }
 }
 

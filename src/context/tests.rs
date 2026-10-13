@@ -99,6 +99,13 @@ fn user_msg(id: &str, text: &str) -> String {
     )
 }
 
+fn user_msg_turn(id: &str, turn: &str, text: &str) -> String {
+    format!(
+        r#"{{"timestamp":"2026-01-01T00:00:02.000Z","type":"response_item","payload":{{"type":"message","role":"user","id":"{id}","turn_id":"{turn}","content":[{{"type":"input_text","text":"{}"}}]}}}}"#,
+        esc(text)
+    )
+}
+
 fn assistant_msg(id: &str, text: &str, phase: Option<&str>) -> String {
     let phase = match phase {
         Some(phase) => format!(r#","phase":"{phase}""#),
@@ -1008,4 +1015,540 @@ fn persisted_journal_contains_no_transcript_strings() {
     assert!(!journal.contains(&home.to_string_lossy().to_string()));
     assert!(journal.contains("path_fingerprint"));
     assert!(!journal.contains("canonical_path"));
+}
+
+fn assert_catch_up_delta(plan: &super::plan::ContextPlan, source: &super::root::ResolvedSource) {
+    assert_eq!(plan.kind, PlanKind::Delta);
+    assert!(!plan.truncated_front);
+    assert!(plan.end_offset > plan.start_offset);
+    assert!(plan.character_count > 0);
+    assert_eq!(plan.source_session, source.session_id);
+    assert_eq!(plan.source_identity, source.identity);
+}
+
+fn push_crlf(body: &mut Vec<u8>, line: &str) {
+    body.extend_from_slice(line.as_bytes());
+    body.extend_from_slice(b"\r\n");
+}
+
+fn open_source(home: &Path, session: &str) -> (super::root::ResolvedSource, PathBuf) {
+    let source = resolve(home, session);
+    let path = source.path.clone();
+    (source, path)
+}
+
+fn catch_up(
+    source: &super::root::ResolvedSource,
+    path: &Path,
+    start: u64,
+    delta: usize,
+    hard: usize,
+) -> Result<super::plan::ContextPlan, super::error::ContextError> {
+    let mut reader = SharedJsonlReader::open(path).unwrap();
+    super::plan::plan_catch_up(source, &mut reader, start, &bounds(10_000, delta, hard))
+}
+
+fn read_messages(path: &Path) -> (u64, Vec<super::sanitize::VisibleMessage>) {
+    let mut reader = SharedJsonlReader::open(path).unwrap();
+    let batch = reader.read_from(0).unwrap();
+    let messages = visible_messages(&batch.records).unwrap();
+    (batch.complete_end, messages)
+}
+
+#[test]
+fn ordinary_delta_overflow_is_unchanged_and_catch_up_takes_the_next_prefix() {
+    let home = temp_dir("catch-prefix-home");
+    let session = "sess-catch-prefix";
+    let path = write_rollout(
+        &home,
+        session,
+        &jsonl(&[
+            session_meta(session),
+            turn_context("t1"),
+            user_msg("u1", "AAAA"),
+            turn_context("t2"),
+            user_msg("u2", "BBBB"),
+            turn_context("t3"),
+            user_msg("u3", "CCCC"),
+            turn_context("t4"),
+            user_msg("u4", "DDDD"),
+        ]),
+    );
+    let (source, _) = open_source(&home, session);
+    let mut reader = SharedJsonlReader::open(&path).unwrap();
+    let overflow =
+        super::plan::plan_delta(&source, &mut reader, 0, &bounds(100, 8, 100)).unwrap_err();
+    assert_eq!(overflow.kind, ErrorKind::Overflow);
+    assert_eq!(overflow.message, "delta character count exceeds limit");
+
+    let prefix = catch_up(&source, &path, 0, 8, 100).unwrap();
+    assert_catch_up_delta(&prefix, &source);
+    assert_eq!(prefix.text, "[user]\nAAAA\n\n[user]\nBBBB\n");
+    assert_eq!(prefix.character_count, 8);
+    assert_eq!(prefix.record_count, 5);
+    assert_eq!(prefix.first_turn_id.as_deref(), Some("t1"));
+    assert_eq!(prefix.last_turn_id.as_deref(), Some("t2"));
+    assert_eq!(prefix.first_message.as_ref().unwrap().message_id, "u1");
+    assert_eq!(prefix.last_message.as_ref().unwrap().message_id, "u2");
+    let (_, messages) = read_messages(&path);
+    assert_eq!(prefix.end_offset, messages[2].turn_start_offset);
+    assert!(prefix.end_offset < messages[2].start_offset);
+    assert!(!prefix.text.contains("CCCC"));
+    assert!(!prefix.text.contains("DDDD"));
+
+    let mut reader = SharedJsonlReader::open(&path).unwrap();
+    let next = super::plan::plan_delta(
+        &source,
+        &mut reader,
+        prefix.end_offset,
+        &bounds(100, 8, 100),
+    )
+    .unwrap();
+    assert_eq!(next.kind, PlanKind::Delta);
+    assert!(!next.truncated_front);
+    assert_eq!(next.start_offset, prefix.end_offset);
+    assert_eq!(next.text, "[user]\nCCCC\n\n[user]\nDDDD\n");
+    assert_eq!(next.character_count, 8);
+    assert_eq!(next.first_turn_id.as_deref(), Some("t3"));
+    assert_eq!(next.last_turn_id.as_deref(), Some("t4"));
+
+    let refused = catch_up(&source, &path, prefix.end_offset, 8, 100).unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Unsupported);
+    assert_eq!(refused.message, "unread tail fits in an ordinary delta");
+}
+
+#[test]
+fn catch_up_rolls_back_the_entire_overflowing_multi_message_turn() {
+    let home = temp_dir("catch-rollback-home");
+    let session = "sess-catch-rollback";
+    let path = write_rollout(
+        &home,
+        session,
+        &jsonl(&[
+            session_meta(session),
+            turn_context("t1"),
+            user_msg("u1", "AAAA"),
+            turn_context("t2"),
+            user_msg("u2", "BB"),
+            assistant_msg("a2", "CCCC", None),
+            turn_context("t3"),
+            user_msg("u3", "DDDD"),
+        ]),
+    );
+    let (source, _) = open_source(&home, session);
+    let plan = catch_up(&source, &path, 0, 8, 100).unwrap();
+    assert_catch_up_delta(&plan, &source);
+    assert_eq!(plan.text, "[user]\nAAAA\n");
+    assert_eq!(plan.character_count, 4);
+    assert_eq!(plan.record_count, 3);
+    assert_eq!(plan.first_turn_id.as_deref(), Some("t1"));
+    assert_eq!(plan.last_turn_id.as_deref(), Some("t1"));
+    let (_, messages) = read_messages(&path);
+    assert_eq!(messages[1].turn_id, messages[2].turn_id);
+    assert_eq!(messages[1].turn_start_offset, messages[2].turn_start_offset);
+    assert_eq!(plan.end_offset, messages[1].turn_start_offset);
+    assert!(plan.end_offset < messages[1].start_offset);
+    assert!(plan.end_offset < messages[2].start_offset);
+    assert!(!plan.text.contains("BB"));
+    assert!(!plan.text.contains("CCCC"));
+    assert!(!plan.text.contains("DDDD"));
+}
+
+#[test]
+fn catch_up_limits_unicode_by_scalar_count() {
+    let home = temp_dir("catch-unicode-home");
+    let session = "sess-catch-unicode";
+    let text = "café 😀";
+    assert_eq!(text.chars().count(), 6);
+    assert!(text.len() > text.chars().count());
+    let path = write_rollout(
+        &home,
+        session,
+        &jsonl(&[
+            session_meta(session),
+            turn_context("t1"),
+            user_msg("u1", text),
+            turn_context("t2"),
+            user_msg("u2", "ZZZZZZZ"),
+        ]),
+    );
+    let (source, _) = open_source(&home, session);
+    let plan = catch_up(&source, &path, 0, 6, 100).unwrap();
+    assert_catch_up_delta(&plan, &source);
+    assert_eq!(plan.character_count, 6);
+    assert!(plan.text.contains(text));
+    assert!(!plan.text.contains('Z'));
+    assert!(plan.text.len() > plan.character_count as usize);
+    let (_, messages) = read_messages(&path);
+    assert_eq!(plan.end_offset, messages[1].turn_start_offset);
+
+    let overflow = catch_up(&source, &path, 0, 5, 100).unwrap_err();
+    assert_eq!(overflow.kind, ErrorKind::Overflow);
+    assert_eq!(
+        overflow.message,
+        "first unread turn exceeds delta_max_chars"
+    );
+}
+
+#[test]
+fn catch_up_stops_at_the_hard_cap_without_raising_it() {
+    let home = temp_dir("catch-hard-home");
+    let session = "sess-catch-hard";
+    let path = write_rollout(
+        &home,
+        session,
+        &jsonl(&[
+            session_meta(session),
+            turn_context("t1"),
+            user_msg("u1", "AAAA"),
+            turn_context("t2"),
+            user_msg("u2", "BBBB"),
+            turn_context("t3"),
+            user_msg("u3", "CCCC"),
+        ]),
+    );
+    let (source, _) = open_source(&home, session);
+    let plan = catch_up(&source, &path, 0, 100, 8).unwrap();
+    assert_catch_up_delta(&plan, &source);
+    assert_eq!(plan.character_count, 8);
+    assert_eq!(plan.text, "[user]\nAAAA\n\n[user]\nBBBB\n");
+    assert!(!plan.text.contains("CCCC"));
+    let mut reader = SharedJsonlReader::open(&path).unwrap();
+    let ordinary =
+        super::plan::plan_delta(&source, &mut reader, 0, &bounds(100, 100, 8)).unwrap_err();
+    assert_eq!(ordinary.kind, ErrorKind::Overflow);
+
+    let fits = catch_up(&source, &path, 0, 100, 100).unwrap_err();
+    assert_eq!(fits.kind, ErrorKind::Unsupported);
+    assert_eq!(fits.message, "unread tail fits in an ordinary delta");
+}
+
+#[test]
+fn catch_up_refuses_a_fitting_tail_and_absent_history() {
+    let home = temp_dir("catch-fit-home");
+    let session = "sess-catch-fit";
+    let path = write_rollout(
+        &home,
+        session,
+        &jsonl(&[
+            session_meta(session),
+            turn_context("t1"),
+            user_msg("u1", "AAAA"),
+            turn_context("t2"),
+            user_msg("u2", "BBBB"),
+        ]),
+    );
+    let (source, _) = open_source(&home, session);
+    let fits = catch_up(&source, &path, 0, 100, 100).unwrap_err();
+    assert_eq!(fits.kind, ErrorKind::Unsupported);
+    assert_eq!(fits.message, "unread tail fits in an ordinary delta");
+    let mut reader = SharedJsonlReader::open(&path).unwrap();
+    let delta = super::plan::plan_delta(&source, &mut reader, 0, &bounds(100, 100, 100)).unwrap();
+    assert_eq!(delta.text, "[user]\nAAAA\n\n[user]\nBBBB\n");
+    assert_eq!(delta.character_count, 8);
+
+    let absent = catch_up(&source, &path, delta.end_offset, 100, 100).unwrap_err();
+    assert_eq!(absent.kind, ErrorKind::Unsupported);
+    assert_eq!(absent.message, "catch-up requires unread history");
+
+    let quiet = temp_dir("catch-quiet-home");
+    let quiet_session = "sess-catch-quiet";
+    let quiet_path = write_rollout(
+        &quiet,
+        quiet_session,
+        &jsonl(&[session_meta(quiet_session), reasoning()]),
+    );
+    let (quiet_source, _) = open_source(&quiet, quiet_session);
+    let quiet_catch = catch_up(&quiet_source, &quiet_path, 0, 100, 100).unwrap_err();
+    assert_eq!(quiet_catch.kind, ErrorKind::Unsupported);
+    assert_eq!(quiet_catch.message, "unread tail fits in an ordinary delta");
+    let mut reader = SharedJsonlReader::open(&quiet_path).unwrap();
+    let quiet_delta =
+        super::plan::plan_delta(&quiet_source, &mut reader, 0, &bounds(100, 100, 100)).unwrap();
+    assert!(quiet_delta.text.is_empty());
+    assert!(quiet_delta.end_offset > quiet_delta.start_offset);
+    assert!(quiet_delta.record_count >= 2);
+}
+
+#[test]
+fn catch_up_rejects_a_first_turn_that_cannot_fit() {
+    let home = temp_dir("catch-first-home");
+    let session = "sess-catch-first";
+    let path = write_rollout(
+        &home,
+        session,
+        &jsonl(&[
+            session_meta(session),
+            turn_context("t1"),
+            user_msg("u1", "HELLO"),
+            turn_context("t2"),
+            user_msg("u2", "Z"),
+        ]),
+    );
+    let (source, _) = open_source(&home, session);
+    let delta_cap = catch_up(&source, &path, 0, 4, 100).unwrap_err();
+    assert_eq!(delta_cap.kind, ErrorKind::Overflow);
+    assert_eq!(
+        delta_cap.message,
+        "first unread turn exceeds delta_max_chars"
+    );
+    let hard_cap = catch_up(&source, &path, 0, 100, 4).unwrap_err();
+    assert_eq!(hard_cap.kind, ErrorKind::Overflow);
+    assert_eq!(hard_cap.message, "first unread turn exceeds hard_max_chars");
+
+    let split = temp_dir("catch-first-split-home");
+    let split_session = "sess-catch-first-split";
+    let split_path = write_rollout(
+        &split,
+        split_session,
+        &jsonl(&[
+            session_meta(split_session),
+            turn_context("t1"),
+            user_msg("u1", "AB"),
+            assistant_msg("a1", "CDE", None),
+            turn_context("t2"),
+            user_msg("u2", "Z"),
+        ]),
+    );
+    let (split_source, _) = open_source(&split, split_session);
+    let partial = catch_up(&split_source, &split_path, 0, 4, 100).unwrap_err();
+    assert_eq!(partial.kind, ErrorKind::Overflow);
+    assert_eq!(partial.message, "first unread turn exceeds delta_max_chars");
+}
+
+#[test]
+fn catch_up_errors_on_malformed_or_oversized_records_inside_the_selected_range() {
+    let home = temp_dir("catch-bad-home");
+    let malformed_session = "sess-catch-malformed";
+    let malformed_path = write_rollout(
+        &home,
+        malformed_session,
+        &jsonl(&[
+            session_meta(malformed_session),
+            turn_context("t1"),
+            user_msg("u1", "AAAA"),
+            "{not-json}".to_string(),
+            turn_context("t2"),
+            user_msg("u2", "BBBBBBBB"),
+        ]),
+    );
+    let (malformed_source, _) = open_source(&home, malformed_session);
+    let malformed = catch_up(&malformed_source, &malformed_path, 0, 4, 100).unwrap_err();
+    assert_eq!(malformed.kind, ErrorKind::Malformed);
+
+    let oversized_session = "sess-catch-oversized";
+    let oversized_path = write_rollout(
+        &home,
+        oversized_session,
+        &jsonl(&[
+            session_meta(oversized_session),
+            turn_context("t1"),
+            user_msg("u1", "AAAA"),
+        ]),
+    );
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&oversized_path)
+        .unwrap();
+    let mut huge = br#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":""#.to_vec();
+    huge.extend(std::iter::repeat(b'x').take(700));
+    huge.extend(br#""}]}}"#);
+    huge.push(b'\n');
+    file.write_all(&huge).unwrap();
+    file.write_all(turn_context("t2").as_bytes()).unwrap();
+    file.write_all(b"\n").unwrap();
+    file.write_all(user_msg("u2", "BBBBBBBB").as_bytes())
+        .unwrap();
+    file.write_all(b"\n").unwrap();
+    file.flush().unwrap();
+    let (oversized_source, _) = open_source(&home, oversized_session);
+    let mut reader = SharedJsonlReader::open_with_limit(&oversized_path, 512).unwrap();
+    let oversized =
+        super::plan::plan_catch_up(&oversized_source, &mut reader, 0, &bounds(10_000, 4, 100))
+            .unwrap_err();
+    assert_eq!(oversized.kind, ErrorKind::Malformed);
+    assert!(oversized.message.contains("oversized"));
+    assert!(!oversized.message.contains(&"x".repeat(32)));
+}
+
+#[test]
+fn catch_up_preserves_excluded_records_bom_crlf_and_partial_tails() {
+    let home = temp_dir("catch-boundary-home");
+    let session = "sess-catch-boundary";
+    let path = write_rollout(&home, session, "");
+    let mut body = vec![0xEF, 0xBB, 0xBF];
+    push_crlf(&mut body, &session_meta(session));
+    push_crlf(&mut body, &turn_context("t1"));
+    push_crlf(&mut body, &user_msg("u1", "AAAA"));
+    body.extend_from_slice(
+        br#"{"timestamp":"x","type":"response_item","payload":{"type":"custom_tool_call_output","id":"one","output":"before "#,
+    );
+    body.push(0xf8);
+    body.extend_from_slice(b" after\"}}\r\n");
+    let mut compacted = br#"{"type":"compacted","payload":{"message":""#.to_vec();
+    compacted.extend(std::iter::repeat(b'x').take(700));
+    compacted.extend(br#""}}"#);
+    body.extend_from_slice(&compacted);
+    body.extend_from_slice(b"\r\n");
+    push_crlf(&mut body, &reasoning());
+    push_crlf(&mut body, &turn_context("t2"));
+    push_crlf(&mut body, &user_msg("u2", "BBBB"));
+    push_crlf(&mut body, &turn_context("t3"));
+    push_crlf(&mut body, &user_msg("u3", "CCCCCCCC"));
+    body.extend_from_slice(br#"{"type":"response_item","payload":{"type":"message""#);
+    fs::write(&path, &body).unwrap();
+
+    let (source, _) = open_source(&home, session);
+    let mut reader = SharedJsonlReader::open_with_limit(&path, 512).unwrap();
+    let plan =
+        super::plan::plan_catch_up(&source, &mut reader, 0, &bounds(10_000, 8, 100)).unwrap();
+    assert_catch_up_delta(&plan, &source);
+    assert_eq!(plan.start_offset, 0);
+    assert_eq!(plan.character_count, 8);
+    assert_eq!(plan.record_count, 8);
+    assert_eq!(plan.text, "[user]\nAAAA\n\n[user]\nBBBB\n");
+    assert!(!plan.text.contains("CCCCCCCC"));
+    assert!(!plan.text.contains("SYNTH_HIDDEN_REASONING"));
+    assert!(!plan.text.contains("before"));
+    assert!(plan.end_offset < body.len() as u64);
+    let exact = reader.read_until(0, plan.end_offset).unwrap();
+    assert_eq!(exact.fingerprint, plan.fingerprint);
+    assert_eq!(exact.record_count, plan.record_count);
+    assert_eq!(exact.skipped_oversized, 1);
+    assert_eq!(exact.skipped_invalid_utf8, 1);
+    let tail = reader.read_from(plan.end_offset).unwrap();
+    assert!(tail.incomplete_tail_len > 0);
+    assert!(tail
+        .records
+        .iter()
+        .any(|record| record.text.contains("CCCCCCCC")));
+    assert_ne!(tail.fingerprint, plan.fingerprint);
+}
+
+#[test]
+fn catch_up_prefix_fingerprint_ignores_a_later_tail_edit() {
+    let home = temp_dir("catch-fingerprint-home");
+    let session = "sess-catch-fingerprint";
+    let path = write_rollout(
+        &home,
+        session,
+        &jsonl(&[
+            session_meta(session),
+            turn_context("t1"),
+            user_msg("u1", "AAAA"),
+            turn_context("t2"),
+            user_msg("u2", "BBBB"),
+            turn_context("t3"),
+            user_msg("u3", "CCCCCCCC"),
+        ]),
+    );
+    let (source, _) = open_source(&home, session);
+    let prefix = catch_up(&source, &path, 0, 8, 100).unwrap();
+    let mut reader = SharedJsonlReader::open(&path).unwrap();
+    let before = reader.read_from(0).unwrap();
+    assert_eq!(
+        reader.read_until(0, prefix.end_offset).unwrap().fingerprint,
+        prefix.fingerprint
+    );
+    assert_ne!(before.fingerprint, prefix.fingerprint);
+
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(b"{not-json-tail}\n").unwrap();
+    file.write_all(user_msg("u4", "EDITED-TAIL").as_bytes())
+        .unwrap();
+    file.write_all(b"\n").unwrap();
+    file.flush().unwrap();
+
+    let (source, _) = open_source(&home, session);
+    let again = catch_up(&source, &path, 0, 8, 100).unwrap();
+    assert_eq!(again.fingerprint, prefix.fingerprint);
+    assert_eq!(again.end_offset, prefix.end_offset);
+    assert_eq!(again.text, prefix.text);
+    assert_eq!(again.record_count, prefix.record_count);
+    let mut reader = SharedJsonlReader::open(&path).unwrap();
+    let after = reader.read_from(0).unwrap();
+    assert_ne!(after.fingerprint, before.fingerprint);
+    assert_ne!(after.fingerprint, again.fingerprint);
+    assert_eq!(
+        reader.read_until(0, again.end_offset).unwrap().fingerprint,
+        again.fingerprint
+    );
+}
+
+#[test]
+fn catch_up_accepts_aligned_mid_turn_cursors_and_rejects_pathological_cuts() {
+    let home = temp_dir("catch-cursor-home");
+    let session = "sess-catch-cursor";
+    let path = write_rollout(
+        &home,
+        session,
+        &jsonl(&[
+            session_meta(session),
+            user_msg("u1", "AAAA"),
+            assistant_msg("a1", "BBBB", None),
+            assistant_msg("a2", "CCCC", None),
+            user_msg("u2", "DDDDDDDD"),
+        ]),
+    );
+    let (source, _) = open_source(&home, session);
+    let (_, messages) = read_messages(&path);
+    assert_eq!(messages[0].turn_id, messages[1].turn_id);
+    assert_eq!(messages[1].turn_id, messages[2].turn_id);
+    assert_ne!(messages[2].turn_id, messages[3].turn_id);
+    assert_eq!(messages[1].start_offset, messages[0].end_offset);
+
+    let whole = catch_up(&source, &path, 0, 8, 100).unwrap_err();
+    assert_eq!(whole.kind, ErrorKind::Overflow);
+    assert_eq!(whole.message, "first unread turn exceeds delta_max_chars");
+
+    let suffix = catch_up(&source, &path, messages[1].start_offset, 8, 100).unwrap();
+    assert_catch_up_delta(&suffix, &source);
+    assert_eq!(suffix.start_offset, messages[1].start_offset);
+    assert_eq!(suffix.text, "[assistant]\nBBBB\n\n[assistant]\nCCCC\n");
+    assert_eq!(suffix.character_count, 8);
+    assert_eq!(suffix.end_offset, messages[3].start_offset);
+    assert!(!suffix.text.contains("AAAA"));
+    assert!(!suffix.text.contains("DDDDDDDD"));
+    assert_eq!(suffix.first_message.as_ref().unwrap().message_id, "a1");
+    assert_eq!(suffix.last_message.as_ref().unwrap().message_id, "a2");
+
+    let split_remainder = catch_up(&source, &path, messages[1].start_offset, 6, 100).unwrap_err();
+    assert_eq!(split_remainder.kind, ErrorKind::Overflow);
+    assert_eq!(
+        split_remainder.message,
+        "first unread turn exceeds delta_max_chars"
+    );
+
+    let mid_record = catch_up(&source, &path, messages[1].start_offset + 1, 8, 100).unwrap_err();
+    assert_eq!(mid_record.kind, ErrorKind::Malformed);
+    let inside_record = catch_up(&source, &path, messages[0].end_offset - 2, 8, 100).unwrap_err();
+    assert_eq!(inside_record.kind, ErrorKind::Malformed);
+
+    let interleaved = temp_dir("catch-interleave-home");
+    let interleaved_session = "sess-catch-interleave";
+    let interleaved_path = write_rollout(
+        &interleaved,
+        interleaved_session,
+        &jsonl(&[
+            session_meta(interleaved_session),
+            user_msg_turn("m1", "t1", "AA"),
+            user_msg_turn("m2", "t2", "BB"),
+            user_msg_turn("m3", "t1", "CC"),
+            user_msg_turn("m4", "t3", "DDDDDDDD"),
+        ]),
+    );
+    let (interleaved_source, _) = open_source(&interleaved, interleaved_session);
+    let repeated = catch_up(&interleaved_source, &interleaved_path, 0, 8, 100).unwrap_err();
+    assert_eq!(repeated.kind, ErrorKind::Mismatch);
+    assert_eq!(repeated.message, "catch-up turn boundary is not contiguous");
+
+    let past_eof = catch_up(
+        &source,
+        &path,
+        fs::metadata(&path).unwrap().len().saturating_add(10),
+        8,
+        100,
+    )
+    .unwrap_err();
+    assert_eq!(past_eof.kind, ErrorKind::Truncated);
 }
