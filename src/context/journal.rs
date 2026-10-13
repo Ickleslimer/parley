@@ -124,6 +124,30 @@ mod catch_up_state_tests {
         assert!(store.plan_resume_catch_up(&key, &source, &bounds).is_err());
         assert_eq!(store.inspect(&key).unwrap(), before);
     }
+
+    #[test]
+    fn catchup_refuses_uncertain_and_restarted_in_flight_state() {
+        let (store, key, source, bounds) = fixture();
+        let seed = store.plan_new_session_seed(&key, &source, &bounds).unwrap();
+        store
+            .append_in_flight(&key, &seed, "seed-exchange")
+            .unwrap();
+        store.commit(&key, &seed, "seed-exchange").unwrap();
+        append_turn(&source, "one", "AAAA");
+        append_turn(&source, "two", "BBBB");
+        append_turn(&source, "three", "CCCC");
+        let prefix = store.plan_resume_catch_up(&key, &source, &bounds).unwrap();
+        store
+            .append_in_flight(&key, &prefix, "catchup-exchange")
+            .unwrap();
+        let restarted = JournalStore::open_at(source.path.parent().unwrap().join("state"));
+        assert!(restarted
+            .plan_resume_catch_up_read_only(&key, &source, &bounds)
+            .is_err());
+        store.mark_uncertain(&key, "catchup-exchange").unwrap();
+        assert!(store.plan_resume_catch_up(&key, &source, &bounds).is_err());
+        assert_eq!(store.inspect(&key).unwrap().state, CursorState::Uncertain);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
