@@ -108,15 +108,24 @@ fn safe_tool_name(value: Option<&Json>) -> Option<String> {
 }
 
 fn safe_status(value: Option<&Json>) -> Option<String> {
-    let value = value.and_then(Json::as_str)?;
-    Some(
-        match value {
-            "pending" | "in_progress" | "completed" | "failed" | "cancelled" | "end_turn"
-            | "max_tokens" | "max_turn_requests" | "refusal" | "tool_use" | "pause_turn" => value,
-            _ => "other",
-        }
-        .to_string(),
-    )
+    admitted_terminal_status(value.and_then(Json::as_str)).map(str::to_string)
+}
+
+pub(crate) fn admitted_terminal_status(value: Option<&str>) -> Option<&'static str> {
+    Some(match value? {
+        "pending" => "pending",
+        "in_progress" => "in_progress",
+        "completed" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        "end_turn" => "end_turn",
+        "max_tokens" => "max_tokens",
+        "max_turn_requests" => "max_turn_requests",
+        "refusal" => "refusal",
+        "tool_use" => "tool_use",
+        "pause_turn" => "pause_turn",
+        _ => "other",
+    })
 }
 
 fn validate_single_object(line: &str) -> Result<usize, String> {
@@ -254,6 +263,48 @@ mod tests {
         ] {
             assert!(decode_stream_line(line, 1).is_err(), "{line}");
         }
+    }
+
+    #[test]
+    fn terminal_statuses_stay_inside_the_closed_decoder_set() {
+        let cancelled = decode_stream_line(r#"{"type":"end","stopReason":"cancelled"}"#, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status.as_deref(), Some("cancelled"));
+
+        let limited = decode_stream_line(r#"{"type":"end","stopReason":"max_tokens"}"#, 9)
+            .unwrap()
+            .unwrap();
+        assert_eq!(limited.status.as_deref(), Some("max_tokens"));
+
+        let refused = decode_stream_line(r#"{"type":"end","stopReason":"refusal"}"#, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(refused.status.as_deref(), Some("refusal"));
+
+        let missing = decode_stream_line(r#"{"type":"end"}"#, 11)
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing.status, None);
+
+        let permission = decode_stream_line(
+            r#"{"type":"end","stopReason":"permission_cancelled","detail":"SECRET_CATEGORY"}"#,
+            12,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(permission.status.as_deref(), Some("other"));
+        assert_eq!(permission.visible_text, None);
+        let rendered = format!("{permission:?}");
+        assert!(!rendered.contains("permission_cancelled"));
+        assert!(!rendered.contains("SECRET_CATEGORY"));
+
+        let unknown =
+            decode_stream_line(r#"{"type":"end","stopReason":"SECRET_PROVIDER_STOP"}"#, 13)
+                .unwrap()
+                .unwrap();
+        assert_eq!(unknown.status.as_deref(), Some("other"));
+        assert!(!format!("{unknown:?}").contains("SECRET_PROVIDER_STOP"));
     }
 
     #[test]

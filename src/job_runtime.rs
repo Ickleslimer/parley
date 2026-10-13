@@ -28,7 +28,9 @@ use crate::policy::RuntimePolicy;
 use crate::process::{CancellationToken, Captured, OutputStream, Timeouts};
 use crate::profile_namespace;
 use crate::sha256::{hex_encode, sha256};
-use crate::stream_activity::{decode_stream_line, ActivityClass, SafeActivity};
+use crate::stream_activity::{
+    admitted_terminal_status, decode_stream_line, ActivityClass, SafeActivity,
+};
 
 const HANDOFF_SCHEMA_VERSION: u64 = 1;
 const PEER_ACTIVITY_SCHEMA_VERSION: u64 = 1;
@@ -664,19 +666,13 @@ fn run_worker(
     );
     match result {
         Ok(outcome) => {
-            let reply = outcome.captured.reply();
+            // Post-observer completion result. Swallowed capture must not be recomputed.
+            let reply = outcome.reply_result;
             let cancelled = cancellation.is_cancelled() || outcome.captured.cancelled;
-            let (state, error_code) = if cancelled {
-                (JobState::Cancelled, Some("cancelled"))
-            } else if outcome.captured.timed_out {
-                (JobState::TimedOut, Some("watchdog_timeout"))
-            } else if reply.is_ok() {
-                (JobState::Succeeded, None)
-            } else {
-                (JobState::Failed, Some("agent_failed"))
-            };
+            let timed_out = outcome.captured.timed_out;
+            let (state, error_code) = terminal_job_state(reply.is_ok(), cancelled, timed_out);
             let exact_reply = reply.as_ref().ok().cloned();
-            let exact_error = reply.err();
+            let exact_error = reply.as_ref().err().cloned();
             let transition = receipt_transition(state, &outcome.receipt, error_code);
             finish_terminal(
                 &inner,
@@ -707,6 +703,22 @@ fn run_worker(
         }
     }
     drop(execution_lease);
+}
+
+fn terminal_job_state(
+    reply_ok: bool,
+    cancelled: bool,
+    timed_out: bool,
+) -> (JobState, Option<&'static str>) {
+    if cancelled {
+        (JobState::Cancelled, Some("cancelled"))
+    } else if timed_out {
+        (JobState::TimedOut, Some("watchdog_timeout"))
+    } else if reply_ok {
+        (JobState::Succeeded, None)
+    } else {
+        (JobState::Failed, Some("agent_failed"))
+    }
 }
 
 fn open_recovered_store(
@@ -857,6 +869,7 @@ struct HandoffStream {
     next_visible_starts_message: bool,
     visible_message_start: Option<usize>,
     saw_end: bool,
+    end_status: Option<String>,
     parser_failed: Option<String>,
     last_persisted_activity: Option<ActivityRecord>,
     last_visible_persisted_ms: Option<u128>,
@@ -1173,6 +1186,8 @@ impl HandoffSession {
         }
         if activity.class == ActivityClass::End {
             stream.saw_end = true;
+            stream.end_status =
+                admitted_terminal_status(activity.status.as_deref()).map(str::to_string);
         }
         if matches!(
             activity.class,
@@ -1381,6 +1396,7 @@ impl HandoffSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let incomplete = !stream.pending.is_empty();
         let saw_end = stream.saw_end;
+        let end_status = stream.end_status.clone();
         let parser_error = stream.parser_failed.clone();
         drop(stream);
         let record = self.read()?;
@@ -1390,7 +1406,17 @@ impl HandoffSession {
             .map(|_| read_bounded_report(&report_path(&self.directory)))
             .transpose()?;
         let acknowledged = record.receipt_at_ms.is_some() && record.state == "acknowledged";
-        if captured.success && parser_error.is_none() && !incomplete && saw_end && acknowledged {
+        let has_report = report.is_some();
+        let normal_success = captured.success
+            && !captured.cancelled
+            && !captured.timed_out
+            && parser_error.is_none()
+            && !incomplete
+            && saw_end
+            && end_status.as_deref() == Some("end_turn")
+            && has_report
+            && acknowledged;
+        if normal_success {
             if let Some(report) = report {
                 self.update(|record| {
                     record.process_state = "exited".to_string();
@@ -1402,22 +1428,15 @@ impl HandoffSession {
             }
         }
         self.finish_without_success()?;
-        if let Some(error) = parser_error {
-            return Err(format!("streaming-json parser failed: {error}"));
-        }
-        if incomplete {
-            return Err("Grok streaming-json ended with an incomplete record".to_string());
-        }
-        if !saw_end {
-            return Err("Grok streaming-json omitted the terminal end record".to_string());
-        }
-        if report.is_none() {
-            return Err("Grok exited without a durable marked handoff report".to_string());
-        }
-        if !acknowledged {
-            return Err("Grok exited before Codex acknowledged the durable handoff".to_string());
-        }
-        Err(captured.failure_message())
+        Err(handoff_terminal_failure(
+            captured,
+            parser_error.as_deref(),
+            incomplete,
+            saw_end,
+            end_status.as_deref(),
+            has_report,
+            acknowledged,
+        ))
     }
 
     fn finish_without_success(&self) -> Result<(), String> {
@@ -1462,6 +1481,61 @@ impl HandoffSession {
         record.updated_at_ms = now_ms();
         commit_handoff(&self.directory, &record)
     }
+}
+
+fn handoff_terminal_failure(
+    captured: &Captured,
+    parser_error: Option<&str>,
+    incomplete: bool,
+    saw_end: bool,
+    end_status: Option<&str>,
+    has_report: bool,
+    acknowledged: bool,
+) -> String {
+    let stop_reason = if saw_end {
+        end_status.unwrap_or("missing")
+    } else {
+        "missing"
+    };
+    let stop_reason = if stop_reason == "missing" {
+        "missing"
+    } else {
+        admitted_terminal_status(Some(stop_reason)).unwrap_or("other")
+    };
+    let mut parts = Vec::new();
+    if let Some(error) = parser_error {
+        parts.push(format!("streaming-json parser failed: {error}"));
+    }
+    if captured.cancelled {
+        parts.push("cancelled before a complete reply was produced".to_string());
+    } else if captured.timed_out {
+        parts.push("timed out with no reply within the time budget".to_string());
+    }
+    if parser_error.is_none() && incomplete {
+        parts.push("Grok streaming-json ended with an incomplete record".to_string());
+    }
+    if parser_error.is_none() && !captured.cancelled && !captured.timed_out && !incomplete {
+        if !saw_end {
+            parts.push("Grok streaming-json omitted the terminal end record".to_string());
+        } else if stop_reason != "end_turn" {
+            parts.push("Grok streaming-json terminal stop was not end_turn".to_string());
+        } else if !captured.success {
+            parts.push("Grok process did not exit successfully".to_string());
+        } else if !has_report {
+            parts.push("Grok exited without a durable marked handoff report".to_string());
+        } else if !acknowledged {
+            parts.push("Grok exited before Codex acknowledged the durable handoff".to_string());
+        } else {
+            parts.push("Grok exited without a successful handoff completion".to_string());
+        }
+    }
+    parts.push(format!("native stop reason: {stop_reason}"));
+    if !has_report {
+        parts.push("durable handoff report missing".to_string());
+    } else if !acknowledged {
+        parts.push("handoff receipt missing".to_string());
+    }
+    parts.join("; ")
 }
 
 fn append_handoff_contract(
@@ -3698,5 +3772,269 @@ mod tests {
             })
             .unwrap_err()
             .contains("incomplete record"));
+    }
+
+    fn empty_capture(success: bool, timed_out: bool, cancelled: bool) -> Captured {
+        Captured {
+            stdout: String::new(),
+            stderr: String::new(),
+            success,
+            timed_out,
+            cancelled,
+        }
+    }
+
+    fn end_record(stop_reason: Option<&str>) -> String {
+        match stop_reason {
+            Some(reason) => format!(
+                "{{\"type\":\"end\",\"stopReason\":{}}}\n",
+                Json::Str(reason.to_string()).to_compact_string()
+            ),
+            None => "{\"type\":\"end\"}\n".to_string(),
+        }
+    }
+
+    fn sample_report(session: &HandoffSession) -> String {
+        format!(
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job={} handoff={} ===\nexact bounded report\n=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===",
+            session.job_id, session.handoff_id, session.handoff_id
+        )
+    }
+
+    fn store_acknowledged_report(session: &HandoffSession) -> String {
+        let report = sample_report(session);
+        session.persist_report(&report).unwrap();
+        acknowledge_handoff_record(&session.directory, &session.job_id, &session.handoff_id)
+            .unwrap();
+        report
+    }
+
+    fn feed_stdout(session: &HandoffSession, payload: &str) {
+        assert!(!session
+            .observe_output(OutputStream::Stdout, payload.as_bytes())
+            .unwrap());
+    }
+
+    #[test]
+    fn manual_cancel_and_watchdog_outrank_a_successful_reply_result() {
+        assert_eq!(
+            terminal_job_state(true, true, true),
+            (JobState::Cancelled, Some("cancelled"))
+        );
+        assert_eq!(
+            terminal_job_state(true, false, true),
+            (JobState::TimedOut, Some("watchdog_timeout"))
+        );
+        assert_eq!(
+            terminal_job_state(false, false, false),
+            (JobState::Failed, Some("agent_failed"))
+        );
+        assert_eq!(
+            terminal_job_state(true, false, false),
+            (JobState::Succeeded, None)
+        );
+    }
+
+    #[test]
+    fn cancelled_end_with_swallowed_output_keeps_the_sanitized_stop() {
+        let session = test_handoff_session("swallowed-cancelled-end");
+        feed_stdout(&session, &end_record(Some("cancelled")));
+        let error = session
+            .complete(&empty_capture(true, false, false))
+            .unwrap_err();
+        assert!(error.contains("terminal stop was not end_turn"));
+        assert!(error.contains("native stop reason: cancelled"));
+        assert!(error.contains("durable handoff report missing"));
+        assert!(!error.contains("exited without producing any output"));
+        assert!(!error.contains("permission_cancelled"));
+        assert_ne!(session.read().unwrap().phase, "completed");
+    }
+
+    #[test]
+    fn end_turn_without_a_durable_report_is_not_success() {
+        let session = test_handoff_session("end-turn-missing-report");
+        feed_stdout(&session, &end_record(Some("end_turn")));
+        let error = session
+            .complete(&empty_capture(true, false, false))
+            .unwrap_err();
+        assert!(error.contains("without a durable marked handoff report"));
+        assert!(error.contains("native stop reason: end_turn"));
+        assert!(error.contains("durable handoff report missing"));
+        assert!(!error.contains("handoff receipt missing"));
+    }
+
+    #[test]
+    fn non_success_end_after_acknowledged_report_does_not_promote() {
+        for reason in ["cancelled", "refusal", "max_tokens", "permission_cancelled"] {
+            let session = test_handoff_session(&format!("acked-non-success-{reason}"));
+            let report = store_acknowledged_report(&session);
+            feed_stdout(&session, &end_record(Some(reason)));
+            let error = session
+                .complete(&empty_capture(true, false, false))
+                .unwrap_err();
+            assert!(!error.contains(&report), "{reason}");
+            assert!(error.contains("terminal stop was not end_turn"), "{reason}");
+            let expected = if reason == "permission_cancelled" {
+                "other"
+            } else {
+                reason
+            };
+            assert!(
+                error.contains(&format!("native stop reason: {expected}")),
+                "{reason}: {error}"
+            );
+            assert!(!error.contains("permission_cancelled"));
+            assert!(
+                !error.contains("durable handoff report missing"),
+                "{reason}"
+            );
+            assert!(!error.contains("handoff receipt missing"), "{reason}");
+            let record = session.read().unwrap();
+            assert_eq!(record.state, "catastrophe_exit");
+            assert_ne!(record.phase, "completed");
+        }
+    }
+
+    #[test]
+    fn missing_and_unknown_terminal_reasons_stay_non_success() {
+        let missing_end = test_handoff_session("missing-end");
+        let missing_error = missing_end
+            .complete(&empty_capture(true, false, false))
+            .unwrap_err();
+        assert!(missing_error.contains("omitted the terminal end record"));
+        assert!(missing_error.contains("native stop reason: missing"));
+        assert!(missing_error.contains("durable handoff report missing"));
+        assert!(!missing_error.contains("end_turn"));
+
+        let absent_reason = test_handoff_session("absent-stop-reason");
+        feed_stdout(&absent_reason, &end_record(None));
+        let absent_error = absent_reason
+            .complete(&empty_capture(true, false, false))
+            .unwrap_err();
+        assert!(absent_error.contains("native stop reason: missing"));
+        assert!(absent_error.contains("terminal stop was not end_turn"));
+
+        let unknown = test_handoff_session("unknown-stop-reason");
+        feed_stdout(&unknown, &end_record(Some("SECRET_PROVIDER_STOP")));
+        let unknown_error = unknown
+            .complete(&empty_capture(false, false, false))
+            .unwrap_err();
+        assert!(unknown_error.contains("native stop reason: other"));
+        assert!(!unknown_error.contains("SECRET_PROVIDER_STOP"));
+        let persisted = format!(
+            "{}\n{}",
+            fs::read_to_string(snapshot_path(&unknown.directory)).unwrap(),
+            fs::read_to_string(journal_path(&unknown.directory)).unwrap()
+        );
+        assert!(!persisted.contains("SECRET_PROVIDER_STOP"));
+        assert!(persisted.contains("\"status\":\"other\""));
+    }
+
+    #[test]
+    fn parser_malformed_and_incomplete_records_keep_their_diagnostics() {
+        let malformed = test_handoff_session("malformed-end");
+        let observed = malformed
+            .observe_output(OutputStream::Stdout, b"{\"type\":\"end\"\n")
+            .unwrap_err();
+        assert!(observed.contains("truncated"));
+        let error = malformed
+            .complete(&empty_capture(true, false, false))
+            .unwrap_err();
+        assert!(error.contains("parser failed"));
+        assert!(error.contains("truncated"));
+        assert!(error.contains("native stop reason: missing"));
+        assert!(!error.contains("permission_cancelled"));
+
+        let incomplete = test_handoff_session("incomplete-tail");
+        feed_stdout(&incomplete, "{\"type\":\"text\",\"data\":\"tail\"}");
+        let error = incomplete
+            .complete(&empty_capture(true, false, false))
+            .unwrap_err();
+        assert!(error.contains("incomplete record"));
+        assert!(!error.contains("parser failed"));
+        assert!(error.contains("native stop reason: missing"));
+    }
+
+    #[test]
+    fn manual_cancel_and_watchdog_outrank_native_stop_status() {
+        let cancelled = test_handoff_session("manual-cancel-priority");
+        let report = store_acknowledged_report(&cancelled);
+        feed_stdout(&cancelled, &end_record(Some("end_turn")));
+        let error = cancelled
+            .complete(&empty_capture(true, true, true))
+            .unwrap_err();
+        assert!(error.starts_with("cancelled before a complete reply was produced"));
+        assert!(error.contains("native stop reason: end_turn"));
+        assert!(!error.contains("timed out"));
+        assert!(!error.contains(&report));
+        assert!(!error.contains("permission_cancelled"));
+        assert_ne!(cancelled.read().unwrap().phase, "completed");
+
+        let watchdog = test_handoff_session("watchdog-priority");
+        store_acknowledged_report(&watchdog);
+        feed_stdout(&watchdog, &end_record(Some("cancelled")));
+        let error = watchdog
+            .complete(&empty_capture(false, true, false))
+            .unwrap_err();
+        assert!(error.starts_with("timed out with no reply within the time budget"));
+        assert!(error.contains("native stop reason: cancelled"));
+        assert!(!error.contains("permission_cancelled"));
+        assert!(!error.contains("terminal stop was not end_turn"));
+        assert_eq!(watchdog.read().unwrap().state, "catastrophe_exit");
+    }
+
+    #[test]
+    fn unsuccessful_process_exit_after_end_turn_does_not_promote() {
+        let session = test_handoff_session("end-turn-nonzero");
+        store_acknowledged_report(&session);
+        feed_stdout(&session, &end_record(Some("end_turn")));
+        let error = session
+            .complete(&empty_capture(false, false, false))
+            .unwrap_err();
+        assert!(error.contains("did not exit successfully"));
+        assert!(error.contains("native stop reason: end_turn"));
+        assert!(!error.contains("durable handoff report missing"));
+        assert!(!error.contains("handoff receipt missing"));
+    }
+
+    #[test]
+    fn hidden_stream_payloads_are_not_persisted_or_returned() {
+        let session = test_handoff_session("hidden-payload");
+        let payload = format!(
+            "{{\"type\":\"thought\",\"data\":{}}}\n{{\"type\":\"tool_call\",\"toolName\":\"read_file\",\"status\":\"completed\",\"rawInput\":{{\"path\":{}}},\"content\":{}}}\n{}",
+            Json::Str("SECRET_REASONING".to_string()).to_compact_string(),
+            Json::Str("SECRET_PATH".to_string()).to_compact_string(),
+            Json::Str("SECRET_OUTPUT".to_string()).to_compact_string(),
+            end_record(Some("SECRET_PROVIDER_STOP"))
+        );
+        feed_stdout(&session, &payload);
+        let error = session
+            .complete(&empty_capture(true, false, false))
+            .unwrap_err();
+        assert!(error.contains("native stop reason: other"));
+        for forbidden in [
+            "SECRET_REASONING",
+            "SECRET_PATH",
+            "SECRET_OUTPUT",
+            "SECRET_PROVIDER_STOP",
+        ] {
+            assert!(!error.contains(forbidden), "{forbidden}");
+        }
+        let persisted = format!(
+            "{}\n{}",
+            fs::read_to_string(snapshot_path(&session.directory)).unwrap(),
+            fs::read_to_string(journal_path(&session.directory)).unwrap()
+        );
+        for forbidden in [
+            "SECRET_REASONING",
+            "SECRET_PATH",
+            "SECRET_OUTPUT",
+            "SECRET_PROVIDER_STOP",
+        ] {
+            assert!(!persisted.contains(forbidden), "{forbidden}");
+        }
+        assert!(persisted.contains("\"status\":\"other\""));
+        assert!(persisted.contains("\"class\":\"thought\""));
+        assert!(persisted.contains("\"class\":\"end\""));
     }
 }
