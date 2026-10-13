@@ -28,9 +28,9 @@ pub(crate) use prompt_file::{
 pub(crate) use root::{
     resolve_codex_rollout, resolve_codex_sessions_root, CodexHomeEnv, ResolvedSource,
 };
-pub(crate) use winfile::refuse_reparse_chain;
 #[cfg(test)]
 pub(crate) use winfile::SourceIdentity;
+pub(crate) use winfile::{open_shared_read, refuse_reparse_chain};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ContextMode {

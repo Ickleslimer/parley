@@ -633,7 +633,7 @@ pub(crate) fn prepare_for_job(req: &AskRequest) -> Result<(AskRequest, RuntimePo
                 .to_string(),
         );
     }
-    let (mut prepared, policy) = prepare_policy(req)?;
+    let (mut prepared, policy) = prepare_policy_with_mirror(req, false)?;
     policy.apply_handoff_contract(&prepared.harness, &mut prepared.prompt);
     Ok((prepared, policy))
 }
@@ -1449,6 +1449,13 @@ fn prepare(req: &AskRequest) -> Result<AskRequest, String> {
 }
 
 fn prepare_policy(req: &AskRequest) -> Result<(AskRequest, RuntimePolicy), String> {
+    prepare_policy_with_mirror(req, true)
+}
+
+fn prepare_policy_with_mirror(
+    req: &AskRequest,
+    mirror: bool,
+) -> Result<(AskRequest, RuntimePolicy), String> {
     let policy = RuntimePolicy::from_env()?;
     let mut prepared = req.clone();
     prepared.harness = normalize_harness(&prepared.harness);
@@ -1540,6 +1547,9 @@ fn prepare_policy(req: &AskRequest) -> Result<(AskRequest, RuntimePolicy), Strin
             return Err("context source harness is required".to_string());
         }
         context.harness = normalize_harness(&context.harness);
+    }
+    if mirror && crate::speed_mirror::wants_fast(&prepared, &policy, req.model.is_none()) {
+        prepared.model = Some("grok-4.7-build-fast".to_string());
     }
     Ok((prepared, policy))
 }

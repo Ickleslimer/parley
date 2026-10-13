@@ -124,6 +124,8 @@ pub(crate) struct RuntimePolicy {
     mcp_default_yolo: bool,
     disable_yolo: bool,
     grok_locked_model: Option<String>,
+    grok_allow_fast: bool,
+    codex_speed_dir: Option<PathBuf>,
     grok_locked_version: Option<String>,
     grok_locked_reasoning_effort: Option<String>,
     grok_locked_permission_mode: Option<String>,
@@ -210,6 +212,8 @@ impl Default for RuntimePolicy {
             mcp_default_yolo: true,
             disable_yolo: false,
             grok_locked_model: None,
+            grok_allow_fast: false,
+            codex_speed_dir: None,
             grok_locked_version: None,
             grok_locked_reasoning_effort: None,
             grok_locked_permission_mode: None,
@@ -268,6 +272,7 @@ impl RuntimePolicy {
         };
 
         let grok_locked_model = env_nonempty("PARLEY_GROK_LOCKED_MODEL");
+        let grok_allow_fast = env_bool("PARLEY_GROK_ALLOW_FAST")?.unwrap_or(false);
         let grok_locked_version = env_nonempty("PARLEY_GROK_LOCKED_VERSION");
         let grok_locked_reasoning_effort = env_nonempty("PARLEY_GROK_LOCKED_REASONING_EFFORT")
             .map(|value| normalize_reasoning_effort(&value))
@@ -314,6 +319,13 @@ impl RuntimePolicy {
         };
         let typed_roles_ready =
             env_bool("PARLEY_GROK_SUBAGENT_TYPED_ROLES_READY")?.unwrap_or(false);
+        validate_fast_profile(
+            grok_allow_fast,
+            grok_locked_model.as_deref(),
+            grok_locked_reasoning_effort.as_deref(),
+            grok_locked_version.as_deref(),
+            typed_roles_ready,
+        )?;
         if typed_roles_ready && grok_subagent_mode != GrokSubagentMode::Guarded {
             return Err(
                 "PARLEY_GROK_SUBAGENT_TYPED_ROLES_READY requires PARLEY_GROK_SUBAGENT_MODE=guarded"
@@ -400,6 +412,24 @@ impl RuntimePolicy {
             .transpose()?;
         let context_require_explicit_session =
             env_bool("PARLEY_CONTEXT_REQUIRE_EXPLICIT_SESSION")?.unwrap_or(false);
+        let codex_speed_dir = if env_bool("PARLEY_GROK_MIRROR_CODEX_FAST")?.unwrap_or(false) {
+            if !grok_allow_fast
+                || context_locked_source.as_deref() != Some("codex")
+                || !context_require_explicit_session
+            {
+                return Err("Codex speed mirroring requires the Fast opt-in and explicit locked Codex context".to_string());
+            }
+            let directory = PathBuf::from(
+                env_nonempty("PARLEY_CODEX_SPEED_DIR")
+                    .ok_or("Codex speed mirroring requires PARLEY_CODEX_SPEED_DIR")?,
+            );
+            if !directory.is_absolute() {
+                return Err("PARLEY_CODEX_SPEED_DIR must be absolute".to_string());
+            }
+            Some(directory)
+        } else {
+            None
+        };
         let grok_default_conversation_mode = env_nonempty("PARLEY_GROK_DEFAULT_CONVERSATION_MODE")
             .map(|value| ConversationMode::parse(&value))
             .transpose()?
@@ -494,6 +524,8 @@ impl RuntimePolicy {
             mcp_default_yolo: env_bool("PARLEY_MCP_DEFAULT_YOLO")?.unwrap_or(true),
             disable_yolo: env_bool("PARLEY_DISABLE_YOLO")?.unwrap_or(false),
             grok_locked_model,
+            grok_allow_fast,
+            codex_speed_dir,
             grok_locked_version,
             grok_locked_reasoning_effort,
             grok_locked_permission_mode,
@@ -573,13 +605,20 @@ impl RuntimePolicy {
 
         if let Some(locked) = &self.grok_locked_model {
             if let Some(requested) = model.as_deref() {
-                if requested != locked {
+                if requested != locked
+                    && !(self.grok_allow_fast
+                        && locked == "grok-4.7"
+                        && self.grok_locked_reasoning_effort.as_deref() == Some("xhigh")
+                        && requested == "grok-4.7-build-fast")
+                {
                     return Err(format!(
                         "Grok model is locked to {locked}; requested {requested}"
                     ));
                 }
             }
-            *model = Some(locked.clone());
+            if model.is_none() {
+                *model = Some(locked.clone());
+            }
         }
         if let Some(locked) = &self.grok_locked_reasoning_effort {
             if let Some(requested) = reasoning_effort.as_deref() {
@@ -800,6 +839,10 @@ impl RuntimePolicy {
         self.grok_locked_model.as_deref()
     }
 
+    pub(crate) fn codex_speed_dir(&self) -> Option<&Path> {
+        self.codex_speed_dir.as_deref()
+    }
+
     pub(crate) fn grok_locked_version(&self) -> Option<&str> {
         self.grok_locked_version.as_deref()
     }
@@ -964,6 +1007,27 @@ fn env_nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn validate_fast_profile(
+    enabled: bool,
+    model: Option<&str>,
+    effort: Option<&str>,
+    version: Option<&str>,
+    typed_roles_ready: bool,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    if model != Some("grok-4.7") || effort != Some("xhigh") || version.is_none() {
+        return Err(
+            "PARLEY_GROK_ALLOW_FAST requires locked grok-4.7, xhigh, and CLI version".to_string(),
+        );
+    }
+    if typed_roles_ready {
+        return Err("PARLEY_GROK_ALLOW_FAST requires native Grok children to remain disabled pending separate canaries".to_string());
+    }
+    Ok(())
 }
 
 fn normalize_reasoning_effort(value: &str) -> Result<String, String> {
@@ -1215,7 +1279,7 @@ fn windows_short_path(path: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(OsString::from_wide(&output)))
 }
 
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     if value.len() != 36 {
         return false;
     }
@@ -1899,6 +1963,145 @@ mod tests {
             expected,
             "grok 1.0.40 (eb1a2256660d)-evil"
         ));
+    }
+
+    #[test]
+    fn fast_profile_requires_the_exact_locked_pair_and_disabled_children() {
+        let version = Some("grok 1.0.44 (5b807183dd79)");
+        assert!(
+            validate_fast_profile(true, Some("grok-4.7"), Some("xhigh"), version, false).is_ok()
+        );
+        for (model, effort, pinned_version, children) in [
+            (None, Some("xhigh"), version, false),
+            (Some("grok-4.6"), Some("xhigh"), version, false),
+            (Some("grok-4.7-build-fast"), Some("xhigh"), version, false),
+            (Some("grok-4.7"), Some("high"), version, false),
+            (Some("grok-4.7"), Some("xhigh"), None, false),
+            (Some("grok-4.7"), Some("xhigh"), version, true),
+        ] {
+            assert!(validate_fast_profile(true, model, effort, pinned_version, children).is_err());
+        }
+        assert!(validate_fast_profile(false, None, None, None, true).is_ok());
+    }
+
+    #[test]
+    fn fast_toggle_is_opt_in_per_request_and_preserves_every_other_lock() {
+        for enabled in [false, true] {
+            let policy = RuntimePolicy {
+                grok_allow_fast: enabled,
+                grok_locked_model: Some("grok-4.7".to_string()),
+                grok_locked_reasoning_effort: Some("xhigh".to_string()),
+                grok_locked_permission_mode: Some("auto".to_string()),
+                disable_yolo: true,
+                grok_require_session_id: true,
+                grok_max_turns: Some(30),
+                ..RuntimePolicy::default()
+            };
+            for resume in [false, true] {
+                for (requested, effort, permission, yolo, passthrough, accepted) in [
+                    (None, None, None, false, vec![], true),
+                    (
+                        Some("grok-4.7"),
+                        Some("xhigh"),
+                        Some("auto"),
+                        false,
+                        vec![],
+                        true,
+                    ),
+                    (
+                        Some("grok-4.7-build-fast"),
+                        None,
+                        None,
+                        false,
+                        vec![],
+                        enabled,
+                    ),
+                    (
+                        Some("grok-4.7-build-fast-extra"),
+                        None,
+                        None,
+                        false,
+                        vec![],
+                        false,
+                    ),
+                    (Some("grok-4.6"), None, None, false, vec![], false),
+                    (
+                        Some("grok-4.7-build-fast"),
+                        Some("high"),
+                        None,
+                        false,
+                        vec![],
+                        false,
+                    ),
+                    (
+                        Some("grok-4.7-build-fast"),
+                        None,
+                        Some("bypassPermissions"),
+                        false,
+                        vec![],
+                        false,
+                    ),
+                    (Some("grok-4.7-build-fast"), None, None, true, vec![], false),
+                    (
+                        Some("grok-4.7"),
+                        None,
+                        None,
+                        false,
+                        vec!["--model=grok-4.7-build-fast"],
+                        false,
+                    ),
+                    (
+                        Some("grok-4.7-build-fast"),
+                        None,
+                        None,
+                        false,
+                        vec!["--effort=high"],
+                        false,
+                    ),
+                    (
+                        Some("grok-4.7-build-fast"),
+                        None,
+                        None,
+                        false,
+                        vec!["--agents={}"],
+                        false,
+                    ),
+                ] {
+                    let mut model = requested.map(str::to_string);
+                    let mut reasoning = effort.map(str::to_string);
+                    let mut mode = permission.map(str::to_string);
+                    let mut turns = None;
+                    let identifier = "12345678-1234-4234-8234-123456789abc";
+                    let passthrough = passthrough
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    let result = policy.apply_request(PolicyRequest {
+                        harness: "grok",
+                        yolo,
+                        model: &mut model,
+                        reasoning_effort: &mut reasoning,
+                        permission_mode: &mut mode,
+                        max_turns: &mut turns,
+                        session_id: (!resume).then_some(identifier),
+                        resume_id: resume.then_some(identifier),
+                        passthrough: &passthrough,
+                    });
+                    assert_eq!(
+                        result.is_ok(),
+                        accepted,
+                        "{requested:?}, {effort:?}, {resume}, {enabled}"
+                    );
+                    if accepted {
+                        assert_eq!(model.as_deref(), Some(requested.unwrap_or("grok-4.7")));
+                        assert_eq!(reasoning.as_deref(), Some("xhigh"));
+                        assert_eq!(mode.as_deref(), Some("auto"));
+                        assert_eq!(turns.as_deref(), Some("30"));
+                    }
+                }
+            }
+            assert_eq!(policy.grok_locked_model(), Some("grok-4.7"));
+        }
     }
 
     #[test]

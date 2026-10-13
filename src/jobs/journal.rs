@@ -2206,6 +2206,30 @@ mod tests {
     }
 
     #[test]
+    fn automatic_speed_intent_is_idempotent_and_distinct_from_explicit_models() {
+        let fixture = Fixture::new("codex");
+        let mut automatic = spec(JOB_A, "same automatic task");
+        automatic.request.model = None;
+        let created = fixture.store.begin(&automatic).unwrap();
+        assert!(created.created());
+        let before = fs::read(fixture.journal(JOB_A)).unwrap();
+        for model in ["grok-4.7", "grok-4.7-build-fast"] {
+            let mut executing = automatic.clone();
+            executing.request.model = Some(model.to_string());
+            assert_ne!(
+                request_fingerprint(&automatic).unwrap(),
+                request_fingerprint(&executing).unwrap()
+            );
+            assert!(!fixture.store.begin(&automatic).unwrap().created());
+            assert_eq!(fs::read(fixture.journal(JOB_A)).unwrap(), before);
+            assert_eq!(
+                fixture.store.begin(&executing).unwrap_err().kind,
+                JobErrorKind::Conflict
+            );
+        }
+    }
+
+    #[test]
     fn transitions_are_durable_and_illegal_edges_do_not_append() {
         let fixture = Fixture::new("codex");
         fixture.store.begin(&spec(JOB_A, "alpha")).unwrap();

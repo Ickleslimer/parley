@@ -173,6 +173,8 @@ impl JobRuntime {
         validate_handoff_turn_request(spec.handoff_mode, spec.request.max_turns.as_deref())?;
 
         let (mut request, policy) = ask::prepare_for_job(&spec.request)?;
+        let mirror_automatic = spec.request.model.is_none() && policy.codex_speed_dir().is_some();
+        let mirror_fast = crate::speed_mirror::wants_fast(&request, &policy, mirror_automatic);
         if request.harness != "grok" {
             return Err("start_agent_job supports only Grok".to_string());
         }
@@ -209,6 +211,9 @@ impl JobRuntime {
             .is_some_and(GuardedSubagentLaunch::has_children);
         if let Some(plan) = &spec.lane_plan {
             append_parent_contract(&mut request.prompt, plan, &spec.job_id);
+        }
+        if mirror_automatic {
+            request.model = None;
         }
         spec.request = request;
 
@@ -250,6 +255,16 @@ impl JobRuntime {
             .map_err(|error| error.to_string())?;
         if let BeginOutcome::Existing(view) = begin {
             return self.hydrate(view);
+        }
+        if mirror_automatic {
+            spec.request.model = Some(
+                if mirror_fast {
+                    "grok-4.7-build-fast"
+                } else {
+                    "grok-4.7"
+                }
+                .to_string(),
+            );
         }
         let job_id = begin.view().job_id.clone();
         let handoff = if spec.handoff_mode == HandoffMode::Required {
