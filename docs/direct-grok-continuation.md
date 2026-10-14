@@ -26,6 +26,23 @@ The request is framed as `PARLEY_USER_CONTINUATION_REQUEST_V1`. Event-log record
 
 ## Evidence and review
 
+Archived manifests are parsed as metadata without dereferencing their grant
+paths. Relocated, missing, or junction-backed historical worktrees therefore
+do not prevent an unrelated ordinary Grok call from starting. Structural grant
+validation still rejects unsafe relative paths and malformed grants. Records,
+journals, hashes, and schema v1 are not rewritten or discarded.
+
+The ordinary-call review gate checks both lexical overlap and resolvable
+canonical aliases before examining the applicable journal. This identity lookup
+can only add a review block; it grants no filesystem authority. Expiry never
+clears outstanding evidence, interrupted work, or stale review. Publication and
+every direct continuation execution retain the existing no-reparse grant checks,
+exact worktree/root checks, permission canaries, and fingerprint validation.
+Alias detection needs paths that still resolve. Schema v1 contains no durable
+worktree identity for following a move after its old path is deleted. Such a
+move requires independent evidence review; missing paths do not demonstrate
+recovery, approval, or permission to resume a direct continuation.
+
 After Grok exits, Parley captures the exact reply or error, Git-visible and watcher-observed changed paths, post-turn fingerprints, and an explicit `validation_state: not_executed` in create-new evidence. The broker never runs Cargo, npm, Python, tests, build scripts, or other worktree-loaded code after Grok edits; Codex performs validation only after recovering and reviewing the sealed diff. Repository-local Git aliases, executable filters, external diff or merge drivers, includes, and command-bearing core settings refuse observation before Git starts. Journals and evidence contain no credentials, environment dump, raw tool payload, or command-argument transcript. Evidence integrity is verified before it is shown or used for recovery.
 
 Showing the exact result in the detail app records a user receipt. Receipt means only that the result reached the user; it is not approval, scientific acceptance, recovery, or continuity authorization. Every ordinary Grok call or job in the published worktree, including explicit isolated sessions, remains blocked until Codex retrieves the evidence, independently reviews the actual diff and tests, and records a matching review through the locked MCP profile. A live broker holds a separate runtime lock. If the broker disappears before sealing, the next gate observation records `broker_interrupted` and keeps Grok work blocked for inspection and republication. Parley never retries Grok automatically.

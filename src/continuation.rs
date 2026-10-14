@@ -380,7 +380,7 @@ pub(crate) fn require_reviewed(cwd: &Path) -> Result<(), String> {
 
 fn require_reviewed_in(cwd: &Path, manifests: Vec<(StatePaths, Manifest)>) -> Result<(), String> {
     for (paths, manifest) in manifests {
-        if !paths_overlap(&manifest.worktree, cwd) {
+        if !review_paths_overlap(&manifest.worktree, cwd) {
             continue;
         }
         let state = read_journal_with_orphan_recovery(&paths, &manifest.manifest_id)?;
@@ -1800,6 +1800,14 @@ fn path_is_granted(relative: &str, grants: &[PathGrant]) -> bool {
 }
 
 fn parse_grants(value: Option<&Json>, worktree: &Path) -> Result<Vec<PathGrant>, String> {
+    let grants = parse_grant_metadata(value)?;
+    for grant in &grants {
+        validate_grant_target(worktree, &grant.path)?;
+    }
+    Ok(grants)
+}
+
+fn parse_grant_metadata(value: Option<&Json>) -> Result<Vec<PathGrant>, String> {
     let values = value
         .and_then(Json::as_array)
         .ok_or_else(|| "writable_paths must be an array".to_string())?;
@@ -1821,7 +1829,6 @@ fn parse_grants(value: Option<&Json>, worktree: &Path) -> Result<Vec<PathGrant>,
             .ok_or_else(|| "writable path requires path".to_string())?;
         let normalized = normalize_relative_text(text)?;
         let relative = PathBuf::from(normalized.replace('/', "\\"));
-        validate_grant_target(worktree, &relative)?;
         grants.push(PathGrant {
             path: relative,
             kind,
@@ -2528,6 +2535,16 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     path_starts_with(left, right) || path_starts_with(right, left)
 }
 
+fn review_paths_overlap(left: &Path, right: &Path) -> bool {
+    if paths_overlap(left, right) {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => paths_overlap(&left, &right),
+        _ => false,
+    }
+}
+
 fn object(values: Vec<(&str, Json)>) -> Json {
     Json::Object(
         values
@@ -2648,7 +2665,7 @@ fn manifest_from_json(value: &Json) -> Result<Manifest, String> {
         return Err("unsupported continuation manifest schema".to_string());
     }
     let worktree = PathBuf::from(required_string(value, "worktree")?);
-    let grants = parse_grants(value.get("grants"), &worktree)?;
+    let grants = parse_grant_metadata(value.get("grants"))?;
     reject_validation_commands(value.get("validation_commands"))?;
     Ok(Manifest {
         manifest_id: required_string(value, "manifest_id")?,
@@ -3316,6 +3333,213 @@ mod tests {
         run(&["config", "user.name", "Parley Test"]);
         run(&["config", "user.email", "parley@example.invalid"]);
         root
+    }
+
+    #[cfg(windows)]
+    fn create_test_junction(target: &Path, alias: &Path) {
+        use std::os::windows::process::CommandExt;
+
+        let output = Command::new("C:\\Windows\\System32\\cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(alias)
+            .arg(target)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "synthetic junction creation failed"
+        );
+    }
+
+    #[test]
+    fn archived_manifest_read_does_not_require_its_worktree() {
+        let paths = test_paths("archive-missing-worktree");
+        paths.ensure().unwrap();
+        let worktree = paths.root.join("missing-worktree");
+        let mut manifest = test_manifest(&paths, &worktree);
+        manifest.expires_at_ms = 0;
+        let archive = paths
+            .manifests
+            .join(format!("{}.json", manifest.manifest_id));
+        create_new_json(&archive, &manifest_to_json(&manifest)).unwrap();
+        let original = fs::read(&archive).unwrap();
+
+        assert_eq!(latest_manifest(&paths).unwrap(), Some(manifest.clone()));
+        assert!(require_reviewed_in(
+            &paths.root.join("unrelated-worktree"),
+            vec![(paths.clone(), manifest)]
+        )
+        .is_ok());
+        assert_eq!(fs::read(&archive).unwrap(), original);
+        assert!(!worktree.exists());
+        assert!(!paths.journal.exists());
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[test]
+    fn archived_manifest_selection_retains_old_records() {
+        let paths = test_paths("archive-selection");
+        paths.ensure().unwrap();
+        let older = test_manifest(&paths, &paths.root.join("retired-worktree"));
+        let mut newest = test_manifest(&paths, &paths.root.join("current-worktree"));
+        newest.manifest_id = "22222222-2222-4222-8222-222222222222".to_string();
+        newest.created_at_ms = older.created_at_ms + 1;
+        let older_path = paths.manifests.join(format!("{}.json", older.manifest_id));
+        create_new_json(&older_path, &manifest_to_json(&older)).unwrap();
+        create_new_json(
+            &paths.manifests.join(format!("{}.json", newest.manifest_id)),
+            &manifest_to_json(&newest),
+        )
+        .unwrap();
+        let original = fs::read(&older_path).unwrap();
+
+        assert_eq!(latest_manifest(&paths).unwrap(), Some(newest));
+        assert_eq!(fs::read(&older_path).unwrap(), original);
+        assert_eq!(fs::read_dir(&paths.manifests).unwrap().count(), 2);
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn archived_grant_metadata_still_rejects_unsafe_structure() {
+        let paths = test_paths("archive-unsafe-metadata");
+        let manifest = test_manifest(&paths, &paths.root.join("absent-worktree"));
+        for path in [
+            "../escape",
+            "C:/escape",
+            ".git/config",
+            "src/*",
+            "CON",
+            "src:stream",
+        ] {
+            let mut record = manifest_to_json(&manifest);
+            if let Json::Object(fields) = &mut record {
+                fields.insert(
+                    "grants".to_string(),
+                    Json::Array(vec![object(vec![
+                        ("kind", Json::Str("file".to_string())),
+                        ("path", Json::Str(path.to_string())),
+                    ])]),
+                );
+            }
+            assert!(manifest_from_json(&record).is_err(), "accepted {path}");
+        }
+        let invalid_kind = Json::parse(r#"[{"kind":"writer","path":"src"}]"#).unwrap();
+        assert!(parse_grant_metadata(Some(&invalid_kind)).is_err());
+        assert!(parse_grant_metadata(None).is_err());
+        let too_many = Json::Array(
+            (0..=MAX_GRANTS)
+                .map(|_| {
+                    object(vec![
+                        ("kind", Json::Str("tree".to_string())),
+                        ("path", Json::Str("src".to_string())),
+                    ])
+                })
+                .collect(),
+        );
+        assert!(parse_grant_metadata(Some(&too_many)).is_err());
+    }
+
+    #[test]
+    fn expired_relevant_manifest_keeps_unreviewed_evidence_blocked() {
+        let paths = test_paths("expired-review-gate");
+        paths.ensure().unwrap();
+        let worktree = paths.root.join("worktree");
+        let mut manifest = test_manifest(&paths, &worktree);
+        manifest.expires_at_ms = 0;
+        let continuation_id = "22222222-2222-4222-8222-222222222222";
+        let evidence = test_evidence(continuation_id, &manifest.manifest_id);
+        write_evidence(&paths, &evidence).unwrap();
+        append_transition(
+            &paths.journal,
+            transition(
+                &manifest.manifest_id,
+                Some(continuation_id),
+                "sealed",
+                vec![("evidence_hash", Json::Str(evidence.evidence_hash))],
+            ),
+        )
+        .unwrap();
+        let journal = fs::read(&paths.journal).unwrap();
+        let error = require_reviewed_in(&worktree, vec![(paths.clone(), manifest)]).unwrap_err();
+        assert!(error.contains("until Codex reviews"));
+        assert_eq!(fs::read(&paths.journal).unwrap(), journal);
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn archived_junction_does_not_poison_unrelated_review_preflight() {
+        let paths = test_paths("archive-junction");
+        paths.ensure().unwrap();
+        let worktree = paths.root.join("relocated-worktree");
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        let alias = paths.root.join("old-worktree");
+        create_test_junction(&worktree, &alias);
+        let mut manifest = test_manifest(&paths, &alias);
+        manifest.expires_at_ms = 0;
+        let archive = paths
+            .manifests
+            .join(format!("{}.json", manifest.manifest_id));
+        create_new_json(&archive, &manifest_to_json(&manifest)).unwrap();
+        let original = fs::read(&archive).unwrap();
+
+        let loaded = latest_manifest(&paths).unwrap().unwrap();
+        assert_eq!(loaded, manifest);
+        assert!(require_reviewed_in(
+            &paths.root.join("unrelated-worktree"),
+            vec![(paths.clone(), loaded)]
+        )
+        .is_ok());
+        assert!(parse_grants(manifest_to_json(&manifest).get("grants"), &alias).is_err());
+        assert!(validate_grant_target(&alias, Path::new("src")).is_err());
+        assert_eq!(fs::read(&archive).unwrap(), original);
+        assert!(!paths.journal.exists());
+        fs::remove_dir(&alias).unwrap();
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn review_gate_recognizes_relocated_alias_without_authorizing_it() {
+        let paths = test_paths("review-alias");
+        paths.ensure().unwrap();
+        let current_lanes = paths.root.join("current-lanes");
+        let worktree = current_lanes.join("relocated-worktree");
+        let descendant = worktree.join("src");
+        fs::create_dir_all(&descendant).unwrap();
+        let sibling = current_lanes.join("relocated-worktree-old");
+        fs::create_dir_all(&sibling).unwrap();
+        let retired_lanes = paths.root.join("retired-lanes");
+        fs::create_dir_all(&retired_lanes).unwrap();
+        let alias = retired_lanes.join("old-worktree");
+        create_test_junction(&worktree, &alias);
+        let mut manifest = test_manifest(&paths, &alias);
+        manifest.expires_at_ms = 0;
+        let continuation_id = "22222222-2222-4222-8222-222222222222";
+        let evidence = test_evidence(continuation_id, &manifest.manifest_id);
+        write_evidence(&paths, &evidence).unwrap();
+        append_transition(
+            &paths.journal,
+            transition(
+                &manifest.manifest_id,
+                Some(continuation_id),
+                "sealed",
+                vec![("evidence_hash", Json::Str(evidence.evidence_hash))],
+            ),
+        )
+        .unwrap();
+        for cwd in [&worktree, &descendant, &current_lanes] {
+            assert!(!paths_overlap(&alias, cwd));
+            let error =
+                require_reviewed_in(cwd, vec![(paths.clone(), manifest.clone())]).unwrap_err();
+            assert!(error.contains("until Codex reviews"));
+        }
+        assert!(require_reviewed_in(&sibling, vec![(paths.clone(), manifest)]).is_ok());
+        assert!(validate_grant_target(&alias, Path::new("src")).is_err());
+        fs::remove_dir(&alias).unwrap();
+        fs::remove_dir_all(paths.root).unwrap();
     }
 
     #[test]
