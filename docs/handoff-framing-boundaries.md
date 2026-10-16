@@ -71,3 +71,23 @@ Promotion and registered-client verification remain separate gates; the old
 registered processes are never externally stopped. The Workbench footer now
 has its own exact-image VM evidence; its final integrated peer review remains
 a Workbench task, not acceptance inferred from this parser review.
+
+## Registered activation
+
+Final source checkpoint1f09830. Both candidate binaries were staged side by
+side with the rollback10ff1c48 build preserved. The private configuration was
+backed up; a parsed structural comparison proved only the development and
+Workbench command fields changed. All locks, version/model/effort, scopes,
+context, health and handoff configuration remained identical.
+
+The supported mailbox returned queued for global MCP reload. No registered
+process was externally stopped and no app restart or window operation occurred.
+Both actual registered clients then completed round trips on the new image.
+Development host verification returned verified,14tools, catalog hash
+bdf4d2af4047ce1f96df48d98527de099dcf521fb26bc8aab56e817d8279305f.
+Workbench explicitly started job9ad3be74-77de-4eba-9811-1a16fdc824ad with request
+event1792148549455-49828-2 from verified new-image PID49828. It resumes the
+original native session in its original cwd, using explicit replay of the
+uncertain transcript range, not skip, session replacement or journal editing.
+The old failed job is preserved. Its final Workbench review outcome is separate
+and must still be received before claiming that handoff closed.
