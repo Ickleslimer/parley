@@ -267,7 +267,7 @@ pub fn run_hook() -> i32 {
         Ok(payload) => payload,
         Err(_) => {
             if scope_claimed {
-                emit_hook(&deny("PreToolUse", "parley-handoff: deny malformed hook"));
+                return finish_hook(&deny("PreToolUse", "parley-handoff: deny malformed hook"));
             }
             return 0;
         }
@@ -281,8 +281,7 @@ pub fn run_hook() -> i32 {
         system_now_ms(),
         scope_claimed,
     );
-    emit_hook(&output);
-    0
+    finish_hook(&output)
 }
 
 fn run_result<F>(role: HelperKind, action: F) -> i32
@@ -477,10 +476,13 @@ fn evaluate_stop(
         return deny("Stop", static_failure(kind));
     }
     match prepare(binding, facts, HelperKind::Hook, now_ms, false) {
-        Ok(record) if record.durable_unacknowledged() => {
-            deny("Stop", "parley-handoff: deny unacknowledged handoff")
+        Ok(record) if record.receipt_observed() || record.state == "catastrophe_exit" => {
+            HookOutput::silent()
         }
-        Ok(_) => HookOutput::silent(),
+        Ok(record) if record.durable_unacknowledged() => {
+            deny("Stop", "parley-handoff: receipt pending; invoke the exact zero-argument wait command from the handoff contract, then stop only after receipt; do not repeat the report")
+        }
+        Ok(_) => deny("Stop", "parley-handoff: durable report and explicit Codex receipt required; finish the acknowledged handoff contract before stopping"),
         Err(kind) => deny("Stop", static_failure(kind)),
     }
 }
@@ -537,8 +539,27 @@ fn command_text(tool_input: &serde_json::Map<String, Value>) -> Result<Option<St
 }
 
 fn event_name(event: &serde_json::Map<String, Value>) -> Result<Option<String>, FailKind> {
-    Ok(string_field(event, &["hook_event_name", "hookEventName"])?
-        .map(|value| value.to_ascii_lowercase()))
+    let mut found = None;
+    for key in ["hook_event_name", "hookEventName"] {
+        if let Some(value) = event.get(key) {
+            let value = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or(FailKind::Malformed)?;
+            let mut normalized = value.to_ascii_lowercase();
+            if normalized == "pre_tool_use" {
+                normalized = "pretooluse".to_string();
+            }
+            if found
+                .as_ref()
+                .is_some_and(|existing| existing != &normalized)
+            {
+                return Err(FailKind::Malformed);
+            }
+            found = Some(normalized);
+        }
+    }
+    Ok(found)
 }
 
 fn string_field(
@@ -655,7 +676,10 @@ fn static_failure(kind: FailKind) -> &'static str {
 }
 
 fn deny(event: &str, reason: &'static str) -> HookOutput {
-    let body = json!({
+    let body = if event == "Stop" {
+        json!({ "decision": "block", "reason": reason })
+    } else {
+        json!({
         "decision": "deny",
         "reason": reason,
         "permissionDecision": "deny",
@@ -665,7 +689,8 @@ fn deny(event: &str, reason: &'static str) -> HookOutput {
             "permissionDecision": "deny",
             "permissionDecisionReason": reason,
         }
-    });
+        })
+    };
     HookOutput {
         decision: HookDecision::Deny,
         stdout: Some(body.to_string()),
@@ -709,9 +734,15 @@ fn read_stdin() -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn emit_hook(output: &HookOutput) {
+fn finish_hook(output: &HookOutput) -> i32 {
     if let Some(stdout) = &output.stdout {
         let _ = writeln!(io::stdout(), "{stdout}");
+    }
+    if output.decision == HookDecision::Deny {
+        eprintln!("parley-handoff: blocked; complete the acknowledged handoff contract before stopping or using a controlled helper");
+        2
+    } else {
+        0
     }
 }
 

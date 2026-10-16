@@ -555,6 +555,189 @@ fn existing_v2_alert_file_is_preserved_without_rewrite() {
 }
 
 #[test]
+fn stop_gate_uses_native_block_protocol_for_every_unreceived_state() {
+    let world = world();
+    let binding = bound(&world);
+    let facts = facts(&world, &world.hook, PID, &[]);
+    for state in ["pending", "ready", "awaiting_ack", "detached_unacked"] {
+        write_records(&world, &[record(state, Some(9_000_000), None)]);
+        let output = evaluate_hook(&stop_event(&world.cwd), Some(&binding), Some(&facts), 5_000);
+        assert_eq!(output.decision, HookDecision::Deny, "{state}");
+        let encoded = output.stdout.unwrap();
+        let wire: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(wire["decision"], "block", "{state}");
+        assert_eq!(wire.as_object().unwrap().len(), 2);
+        assert!(wire["reason"].as_str().unwrap().contains("handoff"));
+        for secret in [
+            "SECRET_PROMPT",
+            "GROK_EXCERPT_SECRET",
+            "REPORT_SECRET",
+            CAPABILITY,
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+    }
+    for state in ["acknowledged", "catastrophe_exit"] {
+        let receipt = (state == "acknowledged").then_some(4_000);
+        write_records(&world, &[record(state, Some(9_000_000), receipt)]);
+        let output = evaluate_hook(&stop_event(&world.cwd), Some(&binding), Some(&facts), 5_000);
+        assert_eq!(output.decision, HookDecision::Silent, "{state}");
+        assert!(output.stdout.is_none());
+    }
+    write_records(&world, &[record("awaiting_ack", Some(9_000_000), None)]);
+    for active in [false, true] {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "hookEventName": "stop",
+            "sessionId": TARGET,
+            "cwd": world.cwd.display().to_string(),
+            "stopHookActive": active,
+            "lastAssistantMessage": "SECRET_VISIBLE_REPORT"
+        }))
+        .unwrap();
+        let output = evaluate_hook(&payload, Some(&binding), Some(&facts), 5_000);
+        let encoded = output.stdout.unwrap();
+        let wire: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(wire["decision"], "block");
+        assert!(!encoded.contains("SECRET_VISIBLE_REPORT"));
+    }
+}
+
+#[test]
+fn native_event_aliases_agree_after_documented_normalization() {
+    let world = world();
+    write_records(&world, &[record("awaiting_ack", Some(9_000_000), None)]);
+    let binding = bound(&world);
+    let facts = facts(&world, &world.hook, PID, &[]);
+    let stop = serde_json::to_vec(&serde_json::json!({
+        "hook_event_name": "Stop",
+        "hookEventName": "stop",
+        "sessionId": TARGET,
+        "cwd": world.cwd.display().to_string()
+    }))
+    .unwrap();
+    let output = evaluate_hook(&stop, Some(&binding), Some(&facts), 5_000);
+    let wire: Value = serde_json::from_str(&output.stdout.unwrap()).unwrap();
+    assert_eq!(wire["decision"], "block");
+    assert!(wire["reason"].as_str().unwrap().contains("receipt pending"));
+    let shell = serde_json::to_vec(&serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "hookEventName": "pre_tool_use",
+        "sessionId": TARGET,
+        "cwd": world.cwd.display().to_string(),
+        "toolName": "run_terminal_command",
+        "toolInputTruncated": false,
+        "toolInput": {"command": world.peek.display().to_string()}
+    }))
+    .unwrap();
+    let output = evaluate_hook(&shell, Some(&binding), Some(&facts), 5_000);
+    assert_eq!(output.decision, HookDecision::Silent);
+    assert!(output.stdout.is_none());
+}
+
+#[test]
+fn stop_gate_binding_failures_still_use_block_not_tool_denial() {
+    let world = world();
+    write_records(&world, &[record("awaiting_ack", Some(9_000_000), None)]);
+    let binding = bound(&world);
+    let facts = facts(&world, &world.hook, PID, &[]);
+    let mut wrong = binding.clone();
+    wrong.capability = "wrong".to_string();
+    for payload in [
+        stop_event(&world.cwd),
+        serde_json::to_vec(&serde_json::json!({"hookEventName": "stop"})).unwrap(),
+    ] {
+        let output = evaluate_hook(&payload, Some(&wrong), Some(&facts), 5_000);
+        let wire: Value = serde_json::from_str(&output.stdout.unwrap()).unwrap();
+        assert_eq!(wire["decision"], "block");
+        assert!(wire.get("permissionDecision").is_none());
+        assert!(wire.get("hookSpecificOutput").is_none());
+    }
+}
+
+#[test]
+fn hook_process_blocks_until_receipt_and_keeps_rejected_payloads_private() {
+    let world = world();
+    let hook = env!("CARGO_BIN_EXE_parley-handoff-hook");
+    let run = |payload: &[u8]| {
+        let mut child = Command::new(hook)
+            .env_clear()
+            .env("PARLEY_HANDOFF_STATE_DIR", &world.state)
+            .env("PARLEY_HANDOFF_JOB_DIR", &world.job)
+            .env("PARLEY_HANDOFF_JOB_ID", JOB)
+            .env("PARLEY_HANDOFF_ID", HANDOFF)
+            .env("PARLEY_HANDOFF_CAPABILITY", CAPABILITY)
+            .env("PARLEY_HANDOFF_SOURCE_SESSION_ID", SOURCE)
+            .env("PARLEY_HANDOFF_TARGET_SESSION_ID", TARGET)
+            .env("PARLEY_HANDOFF_PEER_PEEK_EXE", &world.peek)
+            .env("PARLEY_HANDOFF_WAIT_EXE", &world.wait_exe)
+            .env("PARLEY_HANDOFF_ALERT_EXE", &world.alert_exe)
+            .env("PARLEY_HANDOFF_HOOK_EXE", hook)
+            .current_dir(&world.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(payload);
+        child.wait_with_output().unwrap()
+    };
+    for state in [
+        "pending",
+        "ready",
+        "awaiting_ack",
+        "acknowledged",
+        "catastrophe_exit",
+    ] {
+        let mut stored = record(
+            state,
+            Some(u64::MAX / 2),
+            (state == "acknowledged").then_some(7),
+        );
+        stored.process_id = Some(u64::from(std::process::id()));
+        write_records(&world, &[stored]);
+        let before = fs::read(world.job.join("journal.jsonl")).unwrap();
+        let output = run(&stop_event(&world.cwd));
+        if matches!(state, "acknowledged" | "catastrophe_exit") {
+            assert!(output.status.success(), "{state}");
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(output.status.code(), Some(2), "{state}");
+            let wire: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(wire["decision"], "block", "{state}");
+        }
+        assert_eq!(before, fs::read(world.job.join("journal.jsonl")).unwrap());
+        assert!(!world.job.join("snapshot.json").exists());
+        assert!(fs::read_dir(&world.inbox).unwrap().next().is_none());
+    }
+    for payload in [
+        b"{SECRET_REJECTED_PAYLOAD".to_vec(),
+        vec![b'x'; 256 * 1024 + 1],
+        serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "Stop",
+            "hookEventName": "pre_tool_use",
+            "prompt": "SECRET_REJECTED_PAYLOAD"
+        }))
+        .unwrap(),
+    ] {
+        let output = run(&payload);
+        assert_eq!(output.status.code(), Some(2));
+        for bytes in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            for secret in ["SECRET_REJECTED_PAYLOAD", CAPABILITY, "REPORT_SECRET"] {
+                assert!(!text.contains(secret));
+            }
+        }
+    }
+    let unsafe_command = format!("{} --extra", world.peek.display());
+    let output = run(&shell_event(&world.cwd, &unsafe_command));
+    assert_eq!(output.status.code(), Some(2));
+    let wire: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(wire["decision"], "deny");
+    assert_eq!(wire["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+}
+
+#[test]
 fn hook_denies_unsafe_invocations_and_gates_stop_without_touching_unrelated_calls() {
     let world = world();
     write_rollout(&world, "VISIBLE_CODEX_NOTE");
@@ -651,7 +834,7 @@ fn hook_denies_unsafe_invocations_and_gates_stop_without_touching_unrelated_call
 
     write_records(&world, &[record("pending", Some(9_000_000), None)]);
     let output = evaluate_hook(&stop_event(&world.cwd), Some(&binding), Some(&facts), 5_000);
-    assert_eq!(output.decision, HookDecision::Silent);
+    assert_eq!(output.decision, HookDecision::Deny);
 
     write_records(&world, &[record("acknowledged", Some(9_000_000), Some(7))]);
     let output = evaluate_hook(&stop_event(&world.cwd), Some(&binding), Some(&facts), 5_000);
@@ -708,10 +891,10 @@ fn helper_binaries_reject_arguments_and_peek_stays_nonjudgmental() {
         .unwrap();
     partial.stdin.take().unwrap().write_all(&payload).unwrap();
     let partial = partial.wait_with_output().unwrap();
-    assert!(partial.status.success());
+    assert_eq!(partial.status.code(), Some(2));
     assert!(String::from_utf8(partial.stdout)
         .unwrap()
-        .contains("\"decision\":\"deny\""));
+        .contains("\"decision\":\"block\""));
 }
 
 fn renamed_helper(world: &World) -> String {
