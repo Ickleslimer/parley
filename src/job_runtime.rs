@@ -1492,14 +1492,15 @@ fn handoff_terminal_failure(
     acknowledged: bool,
 ) -> String {
     let stop_reason = if saw_end {
-        end_status.unwrap_or("missing")
+        end_status
+            .and_then(|status| admitted_terminal_status(Some(status)))
+            .unwrap_or("missing")
+    } else if parser_error.is_some() {
+        "unobserved_after_parser_error"
+    } else if incomplete {
+        "unobserved_after_incomplete_record"
     } else {
         "missing"
-    };
-    let stop_reason = if stop_reason == "missing" {
-        "missing"
-    } else {
-        admitted_terminal_status(Some(stop_reason)).unwrap_or("other")
     };
     let mut parts = Vec::new();
     if let Some(error) = parser_error {
@@ -1553,6 +1554,7 @@ fn append_handoff_contract(
         "=== TWO_CHAIRS_HANDOFF_READY_V1 job={job_id} handoff={} ===\n<self-contained exact report>\n=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===\n",
         handoff.handoff_id, handoff.handoff_id
     ));
+    prompt.push_str("Start the report message with two LF newline characters before the start marker, even after earlier commentary. Each marker must be unadorned on its own line: no indentation, bullets, backticks, code fences, or prose on that line. Consecutive visible text fragments are concatenated exactly; message boundaries do not insert newline characters.\n");
     prompt.push_str("The durable report inside those markers must itself contain every other locked response requirement, including the complete TWO_CHAIRS_HANDOFF footer when required. Put that footer before the end marker, and emit no visible report text outside the markers.\n");
     prompt.push_str("After emitting the complete block, remain in this same turn and invoke exactly the following zero-argument wait command. It waits at most five minutes and reports receipt/deadline evidence; repeat it only while receipt remains pending:\n");
     prompt.push_str(&config.wait_command);
@@ -1671,7 +1673,19 @@ fn extract_handoff_report(
         && visible.as_bytes().get(start - 1) != Some(&b'\n')
         && accepted_start_boundary != Some(start)
     {
-        return Err("handoff start marker is not on its own line".to_string());
+        let boundary = match accepted_start_boundary {
+            None => "absent",
+            Some(boundary) if boundary < start => "before_marker",
+            Some(_) => "after_marker",
+        };
+        let preceding = match visible.as_bytes()[start - 1] {
+            b'\r' => "cr",
+            byte if byte.is_ascii_whitespace() => "whitespace",
+            _ => "other",
+        };
+        return Err(format!(
+            "handoff start marker is not on its own line; boundary={boundary}; preceding={preceding}"
+        ));
     }
     let body_start = start + start_marker.len();
     let remainder = &visible[body_start..];
@@ -3062,6 +3076,8 @@ mod tests {
         assert!(prompt.contains("including the complete TWO_CHAIRS_HANDOFF footer when required"));
         assert!(prompt.contains("Put that footer before the end marker"));
         assert!(prompt.contains("emit no visible report text outside the markers"));
+        assert!(prompt.contains("two LF newline characters before the start marker"));
+        assert!(prompt.contains("Each marker must be unadorned on its own line"));
     }
 
     fn text_stream_record(text: &str) -> String {
@@ -3276,6 +3292,140 @@ mod tests {
                 .unwrap_err()
                 .contains("own line")
         );
+    }
+
+    #[test]
+    fn rejected_handoff_classifies_boundaries_without_echoing_content() {
+        let session = test_handoff_session("rejected-framing-boundaries");
+        let start = format!(
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job={} handoff={} ===",
+            session.job_id, session.handoff_id
+        );
+        let end = format!(
+            "=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===",
+            session.handoff_id
+        );
+        let malformed = format!("SECRET_INLINE {start}\nSECRET_REPORT 猫\n{end}");
+        let payload = format!(
+            "{}\n{{\"type\":\"thought\",\"data\":\"SECRET_REASONING\"}}\n{{\"type\":\"tool_call\",\"rawInput\":\"SECRET_INPUT\",\"rawOutput\":\"SECRET_OUTPUT\"}}\n{}\n",
+            text_stream_record("opening commentary"), text_stream_record(&malformed)
+        );
+        let error = session
+            .observe_output(OutputStream::Stdout, payload.as_bytes())
+            .unwrap_err();
+        assert_eq!(error, "handoff start marker is not on its own line; boundary=before_marker; preceding=whitespace");
+        let record = session.read().unwrap();
+        assert!(record.excerpt.chars().count() <= session.config.excerpt_chars);
+        assert!(record.report_fingerprint.is_none());
+        assert!(!session.report_is_durable());
+        assert!(!report_path(&session.directory).exists());
+        let persisted = format!(
+            "{}\n{}",
+            fs::read_to_string(snapshot_path(&session.directory)).unwrap(),
+            fs::read_to_string(journal_path(&session.directory)).unwrap()
+        );
+        for forbidden in [
+            "SECRET_REASONING",
+            "SECRET_INPUT",
+            "SECRET_OUTPUT",
+            "SECRET_INLINE",
+            "SECRET_REPORT",
+        ] {
+            assert!(!persisted.contains(forbidden));
+            assert!(!error.contains(forbidden));
+        }
+        assert!(acknowledge_handoff_record(
+            &session.directory,
+            &session.job_id,
+            &session.handoff_id
+        )
+        .is_err());
+        session.finish_without_success().unwrap();
+        assert_eq!(session.read().unwrap().state, "catastrophe_exit");
+
+        let flattened = format!("commentary{start}\nreport\n{end}");
+        assert_eq!(
+            extract_handoff_report(&flattened, &session.job_id, &session.handoff_id, None)
+                .unwrap_err(),
+            "handoff start marker is not on its own line; boundary=absent; preceding=other"
+        );
+        let carriage = format!("commentary\r{start}\nreport\n{end}");
+        assert!(
+            extract_handoff_report(&carriage, &session.job_id, &session.handoff_id, None)
+                .unwrap_err()
+                .ends_with("boundary=absent; preceding=cr")
+        );
+    }
+
+    #[test]
+    fn explicit_report_newlines_survive_fragmented_stream_without_tool_boundary() {
+        let session = test_handoff_session("explicit-report-newlines");
+        let report = format!(
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job={} handoff={} ===\nexact 猫 report\n=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===",
+            session.job_id, session.handoff_id, session.handoff_id
+        );
+        let payload = format!(
+            "{}\n{{\"type\":\"thought\",\"data\":\"SECRET_REASONING\"}}\n{}\n{{\"type\":\"end\",\"stopReason\":\"end_turn\"}}\n",
+            text_stream_record("opening commentary without trailing newline"),
+            text_stream_record(&format!("\n\n{report}"))
+        );
+        for chunk in payload.as_bytes().chunks(7) {
+            session.observe_output(OutputStream::Stdout, chunk).unwrap();
+        }
+        assert_eq!(
+            read_bounded_report(&report_path(&session.directory)).unwrap(),
+            report
+        );
+        acknowledge_handoff_record(&session.directory, &session.job_id, &session.handoff_id)
+            .unwrap();
+        assert_eq!(
+            session
+                .complete(&Captured {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    success: true,
+                    timed_out: false,
+                    cancelled: false,
+                })
+                .unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn parser_abort_does_not_claim_an_unobserved_native_stop_was_missing() {
+        let captured = Captured {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            timed_out: false,
+            cancelled: false,
+        };
+        let aborted = handoff_terminal_failure(
+            &captured,
+            Some("framing rejected"),
+            false,
+            false,
+            None,
+            false,
+            false,
+        );
+        assert!(aborted.contains("native stop reason: unobserved_after_parser_error"));
+        assert!(!aborted.contains("omitted the terminal end"));
+        assert!(!aborted.contains("native stop reason: missing"));
+        let observed = handoff_terminal_failure(
+            &captured,
+            Some("later rejected"),
+            false,
+            true,
+            Some("end_turn"),
+            false,
+            false,
+        );
+        assert!(observed.contains("native stop reason: end_turn"));
+        let missing = handoff_terminal_failure(&captured, None, false, false, None, false, false);
+        assert!(missing.contains("native stop reason: missing"));
+        assert!(missing.contains("omitted the terminal end"));
     }
 
     #[test]
@@ -3941,7 +4091,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("parser failed"));
         assert!(error.contains("truncated"));
-        assert!(error.contains("native stop reason: missing"));
+        assert!(error.contains("native stop reason: unobserved_after_parser_error"));
         assert!(!error.contains("permission_cancelled"));
 
         let incomplete = test_handoff_session("incomplete-tail");
@@ -3951,7 +4101,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("incomplete record"));
         assert!(!error.contains("parser failed"));
-        assert!(error.contains("native stop reason: missing"));
+        assert!(error.contains("native stop reason: unobserved_after_incomplete_record"));
     }
 
     #[test]
