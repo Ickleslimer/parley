@@ -139,7 +139,7 @@ Only five existing managed hook command fields changed; every other hook
 field, the MCP configuration, registered server images, settings and GUI were
 left unchanged. The exact previous binaries/configuration and all failed
 canaries remain under the local `handoff-receipt-gate-20261016` evidence directory.
-No MCP restart, process termination, automatic retry, receipt inference,
+No MCP restart, registered-process termination, automatic retry, receipt inference,
 desktop manipulation, scientific change, or push occurred.
 
 This is an installed helper/registration hotfix, not a new GUI release. The
@@ -147,6 +147,18 @@ health registration generator is corrected in source and its release binaries
 are built; existing rollback GUI installers are not relabelled as new builds.
 Normal supervisor startup does not rewrite hooks. A later GUI package must be
 built from the corrected source rather than reinstalling a rollback package.
+
+The matching health supervisor was subsequently promoted in place so current
+installation refresh/removal also recognizes the corrected commands. Exact
+old PID 22344 exited after its graceful shutdown request; new PID 47116 runs
+the verified installed image, SHA-256
+`b56d631c94b9cc384ba4b0d4add9b573f9caefed47dac78e5928d462d0b3dc85`.
+The initial controller could not verify the GUI-subsystem control process's
+exit code and stopped before replacement; independent inspection proved the
+old supervisor was gone and the old image/rollback were intact. A separate
+guarded completion performed the replacement and hidden non-UI restart. That
+controller failure is retained, not described as a passed exit-code check.
+The viewer and registered MCP processes were untouched.
 
 Separate diagnostic exposed by activating the previously inert health hook:
 the development profile's health query is denied as out-of-scope. Its footer
