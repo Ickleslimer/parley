@@ -208,6 +208,69 @@ fn upgrade_replaces_managed_entries_without_removing_unrelated_hooks() {
 }
 
 #[test]
+fn reinstall_migrates_legacy_commands_and_preserves_unrelated_handlers() {
+    let home = common::TempHome::new("hook-command-migration");
+    let install = fake_install(&home);
+    let grok_home = home.paths.root.join("grok");
+    let hook_path = grok_home.join("hooks").join(HOOK_FILE_NAME);
+    let health = install.join("parley-health-hook.exe");
+    let lane = lane_hook(&install);
+    let handoff = handoff_hook(&install);
+    install_hooks(&grok_home, &health, &lane, &handoff).unwrap();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+    for (event, index, path) in [
+        ("PreToolUse", 0, &health),
+        ("PreToolUse", 1, &lane),
+        ("PreToolUse", 2, &handoff),
+        ("StopFailure", 0, &health),
+        ("Stop", 0, &handoff),
+    ] {
+        document["hooks"][event][index]["hooks"][0]["command"] =
+            serde_json::json!(format!("\"{}\"", path.display()));
+    }
+    let unrelated =
+        serde_json::json!({"type": "command", "command": "unrelated.exe", "timeout": 7});
+    document["hooks"]["Stop"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .push(unrelated.clone());
+    std::fs::write(&hook_path, serde_json::to_vec(&document).unwrap()).unwrap();
+    install_hooks(&grok_home, &health, &lane, &handoff).unwrap();
+    let migrated = std::fs::read(&hook_path).unwrap();
+    assert_ne!(migrated, serde_json::to_vec_pretty(&document).unwrap());
+    install_hooks(&grok_home, &health, &lane, &handoff).unwrap();
+    assert_eq!(migrated, std::fs::read(&hook_path).unwrap());
+    assert!(remove_hooks(&grok_home).unwrap());
+    let remaining: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+    assert_eq!(
+        remaining["hooks"]["Stop"][0]["hooks"],
+        serde_json::json!([unrelated])
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn template_variable_paths_are_rejected_before_writing_hook_configuration() {
+    let home = common::TempHome::new("hook-template-path");
+    let install = fake_install(&home);
+    let special = install.join("dollar$path");
+    std::fs::create_dir_all(&special).unwrap();
+    let health = special.join("parley-health-hook.exe");
+    std::fs::write(&health, b"synthetic-image").unwrap();
+    let grok_home = home.paths.root.join("grok");
+    assert!(install_hooks(
+        &grok_home,
+        &health,
+        &lane_hook(&install),
+        &handoff_hook(&install)
+    )
+    .is_err());
+    assert!(!grok_home.join("hooks").join(HOOK_FILE_NAME).exists());
+}
+
+#[test]
 fn configure_refuses_installation_without_the_lane_hook() {
     let home = common::TempHome::new("configure-missing-lane");
     let install = fake_install(&home);

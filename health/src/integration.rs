@@ -13,6 +13,7 @@ pub const HOOK_FILE_NAME: &str = "two-chairs-peer-health.json";
 const HEALTH_HOOK_NAME: &str = "parley-health-hook.exe";
 const LANE_HOOK_NAME: &str = "parley-lane-hook.exe";
 const HANDOFF_HOOK_NAME: &str = "parley-handoff-hook.exe";
+const WINDOWS_HOOK_SUFFIX: &str = "'; if ((Get-Variable LASTEXITCODE -ValueOnly -ErrorAction Ignore) -is [int]) { exit (Get-Variable LASTEXITCODE -ValueOnly) }; exit 2";
 
 pub fn configure_r3(
     health_paths: &HealthPaths,
@@ -197,12 +198,52 @@ fn event_has_managed_hook(value: &Value, event: &str, name: &str) -> bool {
 }
 
 fn command_targets_named_hook(command: &str, name: &str) -> bool {
-    let command = command.trim().trim_matches('"').replace('/', "\\");
+    let command = command.trim();
+    if command.chars().any(char::is_control) {
+        return false;
+    }
+    let target = if let Some(encoded) = command
+        .strip_prefix("& '")
+        .and_then(|value| value.strip_suffix(WINDOWS_HOOK_SUFFIX))
+    {
+        let decoded = encoded.replace("''", "'");
+        if command != hook_command(Path::new(&decoded)) {
+            return false;
+        }
+        decoded
+    } else {
+        let Some(legacy) = command
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        else {
+            return false;
+        };
+        if legacy.contains('"') {
+            return false;
+        }
+        legacy.to_string()
+    };
+    if !Path::new(&target).is_absolute() {
+        return false;
+    }
+    let command = target.replace('/', "\\");
     command
         .rsplit('\\')
         .next()
         .map(|candidate| candidate.eq_ignore_ascii_case(name))
         .unwrap_or(false)
+}
+
+fn hook_command(executable: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "& '{}{}",
+            executable.to_string_lossy().replace('\'', "''"),
+            WINDOWS_HOOK_SUFFIX
+        )
+    } else {
+        format!("\"{}\"", executable.to_string_lossy())
+    }
 }
 
 fn command_targets_managed_hook(command: &str) -> bool {
@@ -217,13 +258,24 @@ fn append_managed_entries(
     lane_hook_exe: &Path,
     handoff_hook_exe: &Path,
 ) -> Result<(), HealthError> {
+    for path in [health_hook_exe, lane_hook_exe, handoff_hook_exe] {
+        if !path.is_absolute()
+            || path.to_str().is_none()
+            || path.to_string_lossy().chars().any(char::is_control)
+            || (cfg!(windows) && path.to_string_lossy().contains('$'))
+        {
+            return Err(HealthError::msg(
+                "hook executable path is not a safe absolute path",
+            ));
+        }
+    }
     let hooks = value
         .get_mut("hooks")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| HealthError::msg("Grok hook document has no hooks object"))?;
-    let health_command = format!("\"{}\"", health_hook_exe.to_string_lossy());
-    let lane_command = format!("\"{}\"", lane_hook_exe.to_string_lossy());
-    let handoff_command = format!("\"{}\"", handoff_hook_exe.to_string_lossy());
+    let health_command = hook_command(health_hook_exe);
+    let lane_command = hook_command(lane_hook_exe);
+    let handoff_command = hook_command(handoff_hook_exe);
     let pretool = hooks
         .entry("PreToolUse")
         .or_insert_with(|| Value::Array(Vec::new()))
