@@ -16,8 +16,10 @@ Grok4.7/XHigh co-framed this repair through the locked development profile in
 native session496cf3af-7bc0-8e84-bcce-ab909a0dbd32. Its findings drove closed
 boundary/preceding-byte classifications, unchanged strict validation, and the
 distinction between an unobserved stop after abort and a fully parsed absent
-end. A follow-up synchronous review could not restore that remote session
-(404). No report, receipt or success is inferred from that failure, and no
+end. A follow-up synchronous review from a different cwd could not restore
+that session (404); its local record still exists under the original cwd.
+This is not evidence that the original history was lost. No report, receipt
+or success is inferred from that failure, and no
 native session or context journal is rewritten to make it pass.
 
 The report instructions now explicitly require two LF characters before the
@@ -34,7 +36,7 @@ unobserved_after_parser_error, unobserved_after_incomplete_record, an observed
 closed stop reason, and a fully parsed missing end. Receipt, process-success,
 durability and end_turn requirements remain unchanged.
 
-Tests cover absent and nonmatching boundaries, CR/whitespace/other preceding
+Tests cover absent, before-marker and after-marker boundaries, CR/space/tab/other preceding
 classes, split markers and UTF-8, explicit newlines after commentary without
 a tool boundary, secret non-persistence, refusal of premature receipt, and
 stop diagnostics. Existing collision, exact-report, timeout/cancel, containment
@@ -44,6 +46,28 @@ updated. An exploratory rejected-tail persistence test failed, then that
 approach was discarded following Grok's recommendation; persistence did not
 expand.
 
-Root format, tests455passed4ignored plus8integration, strict clippy and release
-build pass. Candidate live review, promotion, registered-client verification
-and the separate Workbench footer evidence are not yet acceptance claims.
+An acknowledged candidate review delivered a durable report, accepted explicit
+receipt and exited0 through the corrected contract, without a parser failure.
+Job8cfb33b6-35a4-4be0-a092-6e49860c4218, native session2f737c9b-b995-4e33-a50e-e0947076fa22,
+Grok4.7/XHigh. Its consequential dissent was the missing after-marker regression
+and overbroad coverage wording. Codex added that observe-path case, tab coverage
+and negative incomplete-stop assertions before promotion. Its receipt was
+delivery only, not code approval. The candidate harness reached graceful EOF
+and its local controller timed out, but the exact known server kept draining
+the same job; the registered development client received its report and
+recorded receipt. An independently held process handle verified server exit0,
+without termination or a duplicate launch. Failed harness evidence is retained.
+
+After the correction, root format,456unit tests4ignored plus8CLI integration,
+strict clippy and release build pass. Final binary SHA-256:
+8aede163c8f6abd4378bce45bf575f55b0bdd7af2ac4defae76ec7dac456b7be.
+Grok's same-cwd focused follow-up in session2f737c9b accepted both corrections
+with concrete reasoning against the actual diff. Production logic did not
+change after its candidate review. Root Cargo files remain unchanged.
+
+Candidate review/controller/test logs are preserved under
+`D:\Workplaces\R3 Bio\.parley-evidence\handoff-framing-boundaries-20261016`.
+Promotion and registered-client verification remain separate gates; the old
+registered processes are never externally stopped. The Workbench footer now
+has its own exact-image VM evidence; its final integrated peer review remains
+a Workbench task, not acceptance inferred from this parser review.

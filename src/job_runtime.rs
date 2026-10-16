@@ -3429,6 +3429,54 @@ mod tests {
     }
 
     #[test]
+    fn marker_completed_after_a_tool_boundary_is_not_retroactively_accepted() {
+        let session = test_handoff_session("marker-before-tool-boundary");
+        let start = format!(
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job={} handoff={} ===",
+            session.job_id, session.handoff_id
+        );
+        let end = format!(
+            "=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={} ===",
+            session.handoff_id
+        );
+        let payload = format!(
+            "{}\n{{\"type\":\"tool_call_update\",\"status\":\"completed\",\"rawOutput\":\"SECRET_TOOL\"}}\n{}\n",
+            text_stream_record(&format!("commentary{}", &start[..10])),
+            text_stream_record(&format!("{}\nSECRET_REJECTED_REPORT\n{end}", &start[10..]))
+        );
+        let error = session
+            .observe_output(OutputStream::Stdout, payload.as_bytes())
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "handoff start marker is not on its own line; boundary=after_marker; preceding=other"
+        );
+        assert!(!session.report_is_durable());
+        assert!(!report_path(&session.directory).exists());
+        assert!(acknowledge_handoff_record(
+            &session.directory,
+            &session.job_id,
+            &session.handoff_id
+        )
+        .is_err());
+        let persisted = format!(
+            "{}\n{}",
+            fs::read_to_string(snapshot_path(&session.directory)).unwrap(),
+            fs::read_to_string(journal_path(&session.directory)).unwrap()
+        );
+        for forbidden in ["SECRET_TOOL", "SECRET_REJECTED_REPORT"] {
+            assert!(!error.contains(forbidden));
+            assert!(!persisted.contains(forbidden));
+        }
+        let tabbed = format!("commentary\t{start}\nreport\n{end}");
+        assert!(
+            extract_handoff_report(&tabbed, &session.job_id, &session.handoff_id, None)
+                .unwrap_err()
+                .ends_with("boundary=absent; preceding=whitespace")
+        );
+    }
+
+    #[test]
     fn fragmented_stream_persists_only_safe_activity_and_exact_report() {
         let session = test_handoff_session("fragmented-stream");
         session.process_created(42).unwrap();
@@ -4102,6 +4150,8 @@ mod tests {
         assert!(error.contains("incomplete record"));
         assert!(!error.contains("parser failed"));
         assert!(error.contains("native stop reason: unobserved_after_incomplete_record"));
+        assert!(!error.contains("native stop reason: missing"));
+        assert!(!error.contains("omitted the terminal end"));
     }
 
     #[test]
