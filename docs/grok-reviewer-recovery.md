@@ -62,6 +62,12 @@ private-data screening or secret-removal boundary.
 
 ## Recover and verify deliberately
 
+For long-lived reviewers, use the optional hash-pinned working brief when
+preparing ordinary requests; see `grok-working-brief.md`. It preserves selected
+decisions and evidence references as historical data, not current authority.
+Exact retrieval of one aged output is separate from cursor replay. Neither
+operation changes native history or authorizes recovery of an uncertain cursor.
+
 1. Inspect the exact registered profile, binary hash, original cwd and native
    session. Do not infer the active build from a repository's main checkout.
 2. Preserve a create-new byte-exact copy and SHA-256 of the specific cursor
