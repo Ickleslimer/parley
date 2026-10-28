@@ -34,6 +34,7 @@ mod speed_mirror;
 mod stream_activity;
 #[cfg(windows)]
 mod winjob;
+mod working_brief;
 
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};

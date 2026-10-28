@@ -34,6 +34,8 @@ pub(crate) struct ResolvedSource {
     pub session_id: String,
     pub path: PathBuf,
     pub identity: SourceIdentity,
+    pub parts: Vec<super::lineage::SourcePart>,
+    pub selection: Option<(PathBuf, PathBuf)>,
 }
 
 pub(crate) fn resolve_codex_sessions_root(env: &CodexHomeEnv) -> Result<PathBuf, ContextError> {
@@ -72,37 +74,52 @@ pub(crate) fn resolve_codex_rollout(
     let root = canonical_path(sessions_root);
     let rollouts = collect_unique_rollouts(&root)?;
     let mut matches = Vec::new();
-    for path in rollouts {
+    for path in &rollouts {
         let likely_match = path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.contains(session_id));
-        match leading_session_id(&path) {
-            Ok(Some(id)) if id == session_id => matches.push(path),
+        match leading_session_id(path) {
+            Ok(Some(id)) if id == session_id => matches.push(path.clone()),
             Ok(_) => {}
             Err(error) if likely_match => return Err(error),
             Err(_) => {}
         }
     }
-    match matches.len() {
-        0 => Err(ContextError::not_found(format!(
+    let mut selection = None;
+    let selected = if matches.is_empty() {
+        return Err(ContextError::not_found(format!(
             "codex session {session_id} not found"
-        ))),
-        1 => {
-            let path = matches.pop().unwrap();
-            let file = open_shared_read(&path)?;
-            let identity = source_identity(&file, &path)?;
-            Ok(ResolvedSource {
-                session_id: session_id.to_string(),
-                path,
-                identity,
-            })
+        )));
+    } else if let Some(active) = super::active_index::active_rollout(
+        root.parent()
+            .ok_or_else(|| ContextError::malformed("Codex sessions root has no home"))?,
+        session_id,
+    )? {
+        let active = std::fs::canonicalize(&active)?;
+        if !active.starts_with(&root) || !matches.iter().any(|path| canonical_path(path) == active)
+        {
+            return Err(ContextError::mismatch(
+                "Codex active rollout is outside the resolved session sources",
+            ));
         }
-        _ => Err(ContextError::new(
-            super::error::ErrorKind::Duplicate,
-            format!("duplicate Codex rollouts for session {session_id}"),
-        )),
-    }
+        selection = Some((root.parent().unwrap().to_path_buf(), active.clone()));
+        Ok(active)
+    } else {
+        match matches.len() {
+            0 => Err(ContextError::not_found(format!(
+                "codex session {session_id} not found"
+            ))),
+            1 => Ok(matches.pop().unwrap()),
+            _ => Err(ContextError::new(
+                super::error::ErrorKind::Duplicate,
+                format!("duplicate Codex rollouts for session {session_id}"),
+            )),
+        }
+    }?;
+    let mut source = super::lineage::resolve(&root, session_id, selected, &rollouts)?;
+    source.selection = selection;
+    Ok(source)
 }
 
 pub(crate) fn source_harness() -> &'static str {
@@ -117,6 +134,11 @@ fn collect_unique_rollouts(root: &Path) -> Result<Vec<PathBuf>, ContextError> {
     queue.push_back(root.to_path_buf());
     while let Some(dir) = queue.pop_front() {
         let canon = canonical_path(&dir);
+        if !canon.starts_with(root) {
+            return Err(ContextError::mismatch(
+                "Codex rollout directory escapes sessions root",
+            ));
+        }
         if !seen_dirs.insert(canon.to_string_lossy().into_owned()) {
             continue;
         }

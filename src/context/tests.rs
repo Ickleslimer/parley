@@ -16,6 +16,10 @@ use std::os::windows::fs::OpenOptionsExt;
 
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(windows)]
+#[path = "paginated_tests.rs"]
+mod paginated;
+
 const SYNTH_STRINGS: &[&str] = &[
     "SYNTH_USER_ALPHA",
     "SYNTH_COMMENTARY_CHARLIE",

@@ -16,6 +16,10 @@ pub(crate) struct ExecutionLease {
 }
 
 impl ExecutionLease {
+    pub(crate) fn is_active(&self) -> bool {
+        !self._files.is_empty()
+    }
+
     pub(crate) fn acquire_for_request(req: &AskRequest, owner: &str) -> Result<Self, String> {
         Self::acquire_request_and_worktrees(req, Vec::new(), owner)
     }

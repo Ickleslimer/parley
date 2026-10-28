@@ -28,6 +28,17 @@ impl Json {
         Ok(value)
     }
 
+    pub(crate) fn parse_unique(input: &str) -> Result<Self, String> {
+        let mut parser = Parser::new(input);
+        parser.unique_keys = true;
+        let value = parser.parse_value()?;
+        parser.skip_whitespace();
+        if parser.pos != parser.input.len() {
+            return Err("unexpected trailing JSON data".to_string());
+        }
+        Ok(value)
+    }
+
     pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Object(map) => map.get(key),
@@ -210,6 +221,7 @@ pub(crate) fn escape_json(s: &str) -> String {
 struct Parser<'a> {
     input: &'a [u8],
     pos: usize,
+    unique_keys: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -217,6 +229,7 @@ impl<'a> Parser<'a> {
         Self {
             input: input.as_bytes(),
             pos: 0,
+            unique_keys: false,
         }
     }
 
@@ -358,7 +371,10 @@ impl<'a> Parser<'a> {
             let key = self.parse_string()?;
             self.expect(b':')?;
             let value = self.parse_value()?;
-            map.insert(key, value);
+            let duplicate = map.insert(key, value).is_some();
+            if self.unique_keys && duplicate {
+                return Err("duplicate JSON key".to_string());
+            }
             self.skip_whitespace();
             match self.peek() {
                 Some(b',') => {

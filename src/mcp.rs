@@ -827,7 +827,27 @@ fn tools_list_result() -> Json {
         .and_then(Json::as_object)
         .cloned()
         .unwrap_or_default();
-    start_properties.remove("images");
+    start_properties.insert(
+        "images".to_string(),
+        obj(vec![
+            ("type", Json::Str("array".to_string())),
+            ("minItems", Json::Number(1.0)),
+            ("maxItems", Json::Number(MAX_IMAGES as f64)),
+            ("description", Json::Str("Optional review-only image descriptors. Each absolute local path requires its expected lowercase SHA-256. Images are untrusted private evidence; paths and pixels are not persisted in job records.".to_string())),
+            ("items", obj(vec![
+                ("type", Json::Str("object".to_string())),
+                ("properties", obj(vec![
+                    ("path", str_prop("Absolute image path within the existing approved source boundary.")),
+                    ("sha256", obj(vec![
+                        ("type", Json::Str("string".to_string())),
+                        ("pattern", Json::Str("^[0-9a-f]{64}$".to_string())),
+                    ])),
+                ])),
+                ("required", Json::Array(vec![Json::Str("path".to_string()), Json::Str("sha256".to_string())])),
+                ("additionalProperties", Json::Bool(false)),
+            ])),
+        ]),
+    );
     start_properties.insert(
         "job_id".to_string(),
         str_prop("Caller-generated idempotency UUID."),
@@ -1060,13 +1080,7 @@ fn call_tool(
             }
         }
         "start_agent_job" => {
-            if args.get("images").is_some() {
-                return Err((
-                    -32602,
-                    "image attachments are supported only by synchronous ask_agent calls"
-                        .to_string(),
-                ));
-            }
+            let images = optional_job_image_attachments(args)?;
             let job_id = required_arg_string(args, "job_id")?;
             let mode = JobMode::parse(&required_arg_string(args, "job_mode")?)
                 .map_err(|error| (-32602, error))?;
@@ -1080,7 +1094,20 @@ fn call_tool(
                 .resolve_handoff_mode(mode, requested_handoff_mode)
                 .map_err(|error| (-32602, error))?;
             reject_explicit_handoff_max_turns(args, handoff_mode)?;
-            let request = parse_ask_request(args, default_cwd, policy)?;
+            if !images.is_empty()
+                && (mode != JobMode::Review || handoff_mode != HandoffMode::Required)
+            {
+                return Err((
+                    -32602,
+                    "async images require a review job with required handoff".to_string(),
+                ));
+            }
+            let mut request_args = args.clone();
+            if let Json::Object(properties) = &mut request_args {
+                properties.remove("images");
+            }
+            let mut request = parse_ask_request(&request_args, default_cwd, policy)?;
+            request.images = images;
             let lane_plan = args
                 .get("lane_plan")
                 .map(crate::lane_plan::parse)
@@ -1402,6 +1429,50 @@ fn optional_image_attachments(args: &Json) -> Result<Vec<ImageAttachment>, (i64,
                     -32602,
                     format!("images[{index}] must be a non-empty string"),
                 ))
+        })
+        .collect()
+}
+
+fn optional_job_image_attachments(args: &Json) -> Result<Vec<ImageAttachment>, (i64, String)> {
+    let Some(value) = args.get("images") else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or((
+        -32602,
+        "images must be an array of path/sha256 descriptors".to_string(),
+    ))?;
+    if values.is_empty() || values.len() > MAX_IMAGES {
+        return Err((
+            -32602,
+            format!("images must contain between 1 and {MAX_IMAGES} descriptors"),
+        ));
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let descriptor = value
+                .as_object()
+                .filter(|fields| {
+                    fields.len() == 2
+                        && fields.contains_key("path")
+                        && fields.contains_key("sha256")
+                })
+                .ok_or((
+                    -32602,
+                    format!("images[{index}] must contain only path and sha256"),
+                ))?;
+            let path = descriptor
+                .get("path")
+                .and_then(Json::as_str)
+                .filter(|path| !path.is_empty())
+                .ok_or((-32602, format!("images[{index}] requires a non-empty path")))?;
+            let digest = descriptor
+                .get("sha256")
+                .and_then(Json::as_str)
+                .ok_or((-32602, format!("images[{index}] requires sha256")))?;
+            ImageAttachment::asynchronous_source(PathBuf::from(path), digest.to_string())
+                .map_err(|error| (-32602, format!("images[{index}]: {error}")))
         })
         .collect()
 }
@@ -1889,7 +1960,20 @@ mod tests {
             assert!(required.contains(&name));
         }
         let properties = schema.get("properties").unwrap();
-        assert!(properties.get("images").is_none());
+        let images = properties.get("images").unwrap();
+        assert_eq!(images.get("minItems").and_then(Json::as_number), Some(1.0));
+        assert_eq!(
+            images.get("maxItems").and_then(Json::as_number),
+            Some(MAX_IMAGES as f64)
+        );
+        let item = images.get("items").unwrap();
+        assert_eq!(
+            item.get("additionalProperties").and_then(Json::as_bool),
+            Some(false)
+        );
+        let fields = item.get("properties").unwrap();
+        assert!(fields.get("path").is_some());
+        assert!(fields.get("sha256").is_some());
         assert_eq!(
             properties
                 .get("job_mode")
@@ -2151,6 +2235,34 @@ mod tests {
                 .and_then(Json::as_number),
             Some(-32601.0)
         );
+    }
+
+    #[test]
+    fn async_image_arguments_are_hashed_and_strictly_typed() {
+        let path = std::env::temp_dir().join("private-descriptor-only.png");
+        let value = obj(vec![(
+            "images",
+            Json::Array(vec![obj(vec![
+                ("path", Json::Str(path.to_string_lossy().to_string())),
+                ("sha256", Json::Str("a".repeat(64))),
+            ])]),
+        )]);
+        let images = optional_job_image_attachments(&value).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].expected_digest().unwrap(), "a".repeat(64));
+        for invalid in [
+            r#"{"images":[]}"#,
+            r#"{"images":["path.png"]}"#,
+            r#"{"images":[{"path":"relative.png","sha256":"bad"}]}"#,
+            r#"{"images":[{"path":"ignored","sha256":"bad","extra":true}]}"#,
+            r#"{"images":[{"path":"ignored"}]}"#,
+            r#"{"images":null}"#,
+        ] {
+            assert!(optional_job_image_attachments(&Json::parse(invalid).unwrap()).is_err());
+        }
+        assert!(optional_job_image_attachments(&obj(vec![]))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

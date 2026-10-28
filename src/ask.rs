@@ -9,7 +9,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -156,6 +156,25 @@ pub(crate) struct AskSpawnReceipt {
 }
 
 pub(crate) trait AskSpawnObserver: Send + Sync {
+    fn image_handoff_wait_exe(&self) -> Option<&Path> {
+        None
+    }
+
+    fn image_stage_root(&self) -> Option<&Path> {
+        None
+    }
+
+    fn configure_image_invocation(&self, _invocation: &mut Invocation) -> Result<(), String> {
+        Err("managed image invocation requires a genuine handoff binding".to_string())
+    }
+
+    fn observe_activity(
+        &self,
+        _activity: crate::stream_activity::SafeActivity,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     fn configure_invocation(&self, _invocation: &mut Invocation) -> Result<(), String> {
         Ok(())
     }
@@ -268,6 +287,25 @@ impl OutputObserver for ProcessObserverAdapter<'_> {
     }
 
     fn pause_overall_clock(&self) -> bool {
+        self.observer.pause_execution_clock()
+    }
+
+    fn timeout_reason(&self) -> Option<String> {
+        self.observer.timeout_reason()
+    }
+}
+
+impl crate::stream_activity::ManagedActivityObserver for ProcessObserverAdapter<'_> {
+    fn configure_image_invocation(&self, invocation: &mut Invocation) -> Result<(), String> {
+        self.observer.configure_image_invocation(invocation)
+    }
+
+    fn activity(&self, activity: crate::stream_activity::SafeActivity) -> Result<(), String> {
+        self.observer.observe_activity(activity)?;
+        self.commit_ready_context()
+    }
+
+    fn pause_execution_clock(&self) -> bool {
         self.observer.pause_execution_clock()
     }
 
@@ -716,15 +754,40 @@ pub(crate) fn prepare_for_job(req: &AskRequest) -> Result<(AskRequest, RuntimePo
                 .to_string(),
         );
     }
-    if !req.images.is_empty() {
-        return Err(
-            "image attachments are supported only by synchronous ask_agent/par ask calls"
-                .to_string(),
-        );
+    for image in &req.images {
+        image.expected_digest()?;
     }
     let (mut prepared, policy) = prepare_policy_with_mirror(req, false)?;
-    policy.apply_handoff_contract(&prepared.harness, &mut prepared.prompt);
+    if prepared.images.is_empty() {
+        policy.apply_handoff_contract(&prepared.harness, &mut prepared.prompt);
+    } else {
+        validate_image_request(&prepared)?;
+        for image in &prepared.images {
+            image.expected_digest()?;
+        }
+        policy.apply_image_handoff_contract(&prepared.harness, &mut prepared.prompt);
+    }
     Ok((prepared, policy))
+}
+
+pub(crate) fn inspect_job_images(
+    req: &mut AskRequest,
+    policy: &RuntimePolicy,
+) -> Result<(), String> {
+    if req.images.is_empty() {
+        return Ok(());
+    }
+    validate_image_request(req)?;
+    let target = req
+        .resume_id
+        .as_deref()
+        .ok_or_else(|| "image_session_required".to_string())?;
+    session::validate_grok_image_session(target, &req.cwd)?;
+    image_attachments::inspect_all(&mut req.images, &req.cwd, policy.restrict_image_sources())
+}
+
+pub(crate) fn append_job_images(req: &mut AskRequest) -> Result<(), String> {
+    image_attachments::append_prompt_section(&mut req.prompt, &req.images)
 }
 
 pub(crate) fn run_prepared_with_receipt_controlled(
@@ -755,6 +818,26 @@ pub(crate) fn run_prepared_with_execution_lease(
     _execution_lease: &ExecutionLease,
 ) -> Result<AskOutcome, AskFailure> {
     let exchange_id = ExchangeLog::allocate_exchange_id();
+    let (prompt, working_brief) = crate::working_brief::attach(req, &exchange_id, _execution_lease);
+    let mut request_with_brief = req.clone();
+    request_with_brief.prompt = prompt;
+    let req = &request_with_brief;
+    if !req.images.is_empty() {
+        let target = req
+            .resume_id
+            .as_deref()
+            .ok_or_else(|| "image_session_required".to_string())
+            .and_then(|id| session::validate_grok_image_session(id, &req.cwd));
+        if let Err(error) = target {
+            return Err(preflight_failure(
+                req,
+                &req.prompt,
+                exchange_id,
+                "image_preflight_error",
+                &format!("image session validation failed; agent was not started: {error}"),
+            ));
+        }
+    }
     let resolved = match resolve_prompt(req, &exchange_id, false) {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -780,7 +863,11 @@ pub(crate) fn run_prepared_with_execution_lease(
                 "image attachments are not supported by asynchronous or guarded jobs; agent was not started",
             ));
         }
-        match ImageBundle::stage(&req.images, temporary_file_max_age) {
+        let staged = match observer.image_stage_root() {
+            Some(root) => ImageBundle::stage_in(&req.images, root, temporary_file_max_age),
+            None => ImageBundle::stage(&req.images, temporary_file_max_age),
+        };
+        match staged {
             Ok(bundle) => invocation_files.image_bundle = Some(bundle),
             Err(error) => {
                 return Err(preflight_failure(
@@ -1277,6 +1364,11 @@ pub(crate) fn run_prepared_with_execution_lease(
                 .with_captured_reply(usable_reply)
                 .with_execution_state(out.timed_out, out.cancelled));
             }
+            if out.success && !out.timed_out && !out.cancelled {
+                if let (Some(brief), Ok(reply)) = (working_brief, reply_result.as_deref()) {
+                    brief.complete(reply, &receipt);
+                }
+            }
             Ok(AskOutcome {
                 captured: out,
                 receipt,
@@ -1371,31 +1463,58 @@ fn run_image_invocation(run: ImageRun<'_, '_>) -> Result<Captured, String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| req.cwd.clone());
     let grants: [crate::jobs::PathGrant; 0] = [];
-    let mut outcome = crate::grok_acp::run_observed(
-        AcpRequest {
-            cwd: &cwd,
-            session,
-            prompt,
-            model,
-            reasoning_effort,
-            grants: &grants,
-            cancellation,
-            timeout: timeouts.overall,
-            idle_timeout: timeouts.idle,
-            profile: AcpProfile::Images {
-                broker_exe: &broker_exe,
-                bundle_dir: bundle.root(),
-                health_query_exe: policy.image_health_query_exe(),
-            },
+    let wait_exe = observer.observer.image_handoff_wait_exe();
+    let request = AcpRequest {
+        cwd: &cwd,
+        session,
+        prompt,
+        model,
+        reasoning_effort,
+        grants: &grants,
+        cancellation,
+        timeout: timeouts.overall,
+        idle_timeout: timeouts.idle,
+        profile: AcpProfile::Images {
+            broker_exe: &broker_exe,
+            bundle_dir: bundle.root(),
+            health_query_exe: policy.image_health_query_exe(),
+            handoff_wait_exe: wait_exe,
         },
-        |process_id| SpawnObserver::process_created(observer, process_id),
-        |process_id| SpawnObserver::process_resumed(observer, process_id),
-    )?;
+    };
+    let created = |process_id| SpawnObserver::process_created(observer, process_id);
+    let resumed = |process_id| SpawnObserver::process_resumed(observer, process_id);
+    let mut outcome = match wait_exe {
+        Some(_) => crate::grok_acp::run_managed_observed(request, observer, created, resumed),
+        None => crate::grok_acp::run_observed(request, created, resumed),
+    }?;
     if let Err(error) = bundle.validate_consumption(policy.image_health_query_exe().is_some()) {
         outcome.error = Some(match outcome.error {
             Some(existing) => format!("{existing}; {error}"),
             None => error,
         });
+    }
+    if wait_exe.is_some() {
+        if let Err(error) = bundle.validate_handoff_consumption() {
+            outcome.error = Some(match outcome.error {
+                Some(existing) => format!("{existing}; {error}"),
+                None => error,
+            });
+        }
+    }
+    if wait_exe.is_some() && outcome.error.is_none() && !outcome.cancelled && !outcome.timed_out {
+        crate::stream_activity::ManagedActivityObserver::activity(
+            observer,
+            crate::stream_activity::SafeActivity {
+                class: crate::stream_activity::ActivityClass::End,
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                tool_name: None,
+                status: Some("end_turn".to_string()),
+                visible_text: None,
+            },
+        )?;
     }
     let success = outcome.error.is_none()
         && outcome
@@ -1660,6 +1779,25 @@ fn prepare_policy_with_mirror(
         prepared.model = Some("grok-4.7-build-fast".to_string());
     }
     Ok((prepared, policy))
+}
+
+fn validate_image_request(prepared: &AskRequest) -> Result<(), String> {
+    if prepared.harness != "grok"
+        || prepared.yolo
+        || prepared.provider.is_some()
+        || prepared.allow_subagents
+    {
+        return Err(
+            "images require Grok without bypass, provider override or subagents".to_string(),
+        );
+    }
+    if prepared.session_id.is_some() || prepared.resume_id.is_none() {
+        return Err(
+            "images require an existing Grok session and its original working directory"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn finalize_prepared_prompt(
@@ -2170,6 +2308,7 @@ mod tests {
                 volume_serial: 1,
                 file_index: 2,
                 canonical_path: "fingerprint-only".to_string(),
+                history: Vec::new(),
             },
             source_session: "source-session".to_string(),
             start_offset: 10,
@@ -2346,9 +2485,9 @@ mod tests {
     }
 
     #[test]
-    fn asynchronous_job_preparation_rejects_images_before_staging() {
+    fn asynchronous_job_preparation_rejects_unverified_descriptors_before_staging() {
         let request = image_request(Path::new(r"C:\missing\capture.png"));
         let error = prepare_for_job(&request).unwrap_err();
-        assert!(error.contains("synchronous ask_agent/par ask"));
+        assert!(error.contains("expected SHA-256"));
     }
 }
