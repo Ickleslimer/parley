@@ -29,7 +29,7 @@ New-Item -ItemType Directory -Path $edgeProfile -Force | Out-Null
 $serverOut = Join-Path $output "vite.stdout.log"
 $serverErr = Join-Path $output "vite.stderr.log"
 $server = Start-Process -FilePath $node `
-    -ArgumentList @($serverScript) `
+    -ArgumentList @("`"$serverScript`"") `
     -WorkingDirectory $viewerRoot `
     -WindowStyle Hidden `
     -RedirectStandardOutput $serverOut `
@@ -59,9 +59,23 @@ $fixtures = @(
     @{ File = "detail-activity-840x560.png"; Query = "view=detail&fixture=short-exchange&tab=activity"; Width = 840; Height = 560 },
     @{ File = "detail-sources-search-1120x760.png"; Query = "view=detail&fixture=search-results&tab=sources"; Width = 1120; Height = 760 },
     @{ File = "detail-settings-empty-1120x760.png"; Query = "view=detail&fixture=empty&tab=settings"; Width = 1120; Height = 760 },
+    @{ File = "detail-settings-minimum-840x560.png"; Query = "view=detail&fixture=empty&tab=settings"; Width = 840; Height = 560 },
+    @{ File = "detail-settings-200-840x560.png"; Query = "view=detail&fixture=empty&tab=settings&text-scale=2"; Width = 840; Height = 560 },
+    @{ File = "detail-settings-200-reduced-1120x760.png"; Query = "view=detail&fixture=empty&tab=settings&text-scale=2"; Width = 1120; Height = 760; ReducedMotion = $true },
     @{ File = "detail-error-840x560.png"; Query = "view=detail&fixture=source-error&tab=event"; Width = 840; Height = 560 },
     @{ File = "detail-reduced-motion-1120x760.png"; Query = "view=detail&fixture=maximum-exchange&tab=event"; Width = 1120; Height = 760; ReducedMotion = $true },
-    @{ File = "detail-text-scale-200-1120x760.png"; Query = "view=detail&fixture=maximum-exchange&tab=event&text-scale=2"; Width = 1120; Height = 760 }
+    @{ File = "detail-text-scale-200-1120x760.png"; Query = "view=detail&fixture=maximum-exchange&tab=event&text-scale=2"; Width = 1120; Height = 760 },
+    @{ File = "detail-long-evidence-1104x760.png"; Query = "view=detail&fixture=maximum-exchange&tab=event"; Width = 1104; Height = 760 },
+    @{ File = "detail-long-evidence-840x560.png"; Query = "view=detail&fixture=maximum-exchange&tab=event"; Width = 840; Height = 560 },
+    @{ File = "detail-handoff-preview-1120x760.png"; Query = "view=detail&fixture=handoff-preview&tab=event"; Width = 1120; Height = 760 },
+    @{ File = "detail-handoff-preview-840x560.png"; Query = "view=detail&fixture=handoff-preview"; Width = 840; Height = 560 },
+    @{ File = "detail-composer-draft-840x560.png"; Query = "view=detail&fixture=short-exchange&composer=open"; Width = 840; Height = 560 },
+    @{ File = "detail-composer-draft-200-1120x760.png"; Query = "view=detail&fixture=short-exchange&composer=open&text-scale=2"; Width = 1120; Height = 760 },
+    @{ File = "detail-composer-reviewed-1120x760.png"; Query = "view=detail&fixture=short-exchange&composer=open&continuation=reviewed"; Width = 1120; Height = 760 },
+    @{ File = "detail-composer-reviewed-1920x1080.png"; Query = "view=detail&fixture=short-exchange&composer=open&continuation=reviewed"; Width = 1920; Height = 1080 },
+    @{ File = "detail-utilities-empty-count-1120x760.png"; Query = "view=detail&fixture=short-exchange&menu=open&attention=none"; Width = 1120; Height = 760 },
+    @{ File = "detail-utilities-pending-840x560.png"; Query = "view=detail&fixture=short-exchange&menu=open"; Width = 840; Height = 560 },
+    @{ File = "detail-utilities-text-scale-200-1120x760.png"; Query = "view=detail&fixture=short-exchange&menu=open&attention=none&text-scale=2"; Width = 1120; Height = 760 }
 )
 
 try {
@@ -94,10 +108,10 @@ try {
             "--no-first-run",
             "--no-proxy-server",
             "--run-all-compositor-stages-before-draw",
-            "--user-data-dir=$edgeProfile",
+            "--user-data-dir=`"$edgeProfile`"",
             "--virtual-time-budget=3000",
             "--window-size=$($fixture.Width),$($fixture.Height)",
-            "--screenshot=$path"
+            "--screenshot=`"$path`""
         )
         if ($fixture.ReducedMotion) {
             $arguments += "--force-prefers-reduced-motion"

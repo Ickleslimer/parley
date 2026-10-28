@@ -16,7 +16,7 @@ const fixtureMount = readFileSync(
 
 describe("synthetic capture contract", () => {
   it("covers every frozen surface, state, viewport, tab, and text scale", () => {
-    expect(REQUIRED_FIXTURES).toHaveLength(25);
+    expect(REQUIRED_FIXTURES).toHaveLength(30);
     for (const fixture of REQUIRED_FIXTURES) {
       const query = [
         `view=${fixture.surface}`,
@@ -58,11 +58,17 @@ describe("synthetic capture contract", () => {
     expect(captureScript).toContain('"--headless=new"');
     expect(captureScript).toContain('"--disable-background-networking"');
     expect(captureScript).not.toContain('"--hide-scrollbars"');
-    expect(captureScript).toContain('"--user-data-dir=$edgeProfile"');
+    expect(captureScript).toContain('"--user-data-dir=`"$edgeProfile`""');
     expect(captureScript).toContain('"http://127.0.0.1:1420/__fixture_shutdown"');
     expect(captureScript).toContain("WaitForExit(5000)");
     expect(captureScript).toContain("-WindowStyle Hidden");
     expect(captureScript).not.toMatch(/WindowStyle\s+(?:Normal|Maximized|Minimized)/i);
+  });
+
+  it("quotes Windows paths containing spaces for every launched program", () => {
+    expect(captureScript).toContain('-ArgumentList @("`"$serverScript`"")');
+    expect(captureScript).toContain('"--screenshot=`"$path`""');
+    expect(captureScript).toContain('"--user-data-dir=`"$edgeProfile`""');
   });
 
   it("keeps missing artwork absent after asynchronous fixture rendering", () => {

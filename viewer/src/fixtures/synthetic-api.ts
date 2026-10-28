@@ -74,6 +74,8 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
               ? "Synthetic transport failure. No model speech was delivered."
               : scenario === "maximum-exchange"
                 ? maximumExcerpt("The evidence remains exact, readable, and attributed after the full review. ")
+                : scenario === "handoff-preview"
+                  ? "We agree on the narrow preview change. The exact evidence remains available.\n\nDECISION\nchosen: preserve colleague speech"
                 : "The paper surfaces preserve exact content and the controls remain keyboard reachable.",
           excerptExtracted: false,
         });
@@ -135,7 +137,9 @@ export function createSyntheticFixture(scenario: FixtureScenario): SyntheticFixt
         completion.eventKey,
         content(
           completion,
-          scenario === "maximum-exchange"
+          scenario === "handoff-preview"
+            ? `=== TWO_CHAIRS_HANDOFF_READY_V1 job=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee handoff=11111111-2222-4333-8444-555555555555 ===\n${completion.excerpt}\n\nTWO_CHAIRS_HANDOFF\npeer: codex\nevidence_class: usage_sample\nincident_id: none\nas_of_ms: 42\ncontinuity: not_authorized\n=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff=11111111-2222-4333-8444-555555555555 ===`
+            : scenario === "maximum-exchange"
             ? `${completion.excerpt}\n\n${"Exact synthetic body. ".repeat(3_200)}`
             : completion.excerpt,
         ),

@@ -74,6 +74,10 @@
 }
 
 .widget-surface-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
   min-width: 0;
   min-height: var(--target-min);
   padding: 0.4rem 0.65rem;

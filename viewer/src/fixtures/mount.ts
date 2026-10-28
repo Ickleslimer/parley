@@ -27,6 +27,7 @@ const SCENARIOS = new Set<FixtureScenario>([
   "collapsed",
   "expanded",
   "completion",
+  "handoff-preview",
 ]);
 
 export function mountSyntheticFixture(
@@ -40,6 +41,49 @@ export function mountSyntheticFixture(
     : "short-exchange";
   const params = new URLSearchParams(window.location.search);
   const fixture = createSyntheticFixture(scenario);
+  if (params.get("attention") === "none") {
+    const readHealth = fixture.api.getPeerHealth;
+    const readActivity = fixture.api.getPeerActivity;
+    fixture.api.getPeerHealth = async () => ({
+      ...await readHealth(),
+      activeIncidents: [],
+      unreadCount: 0,
+    });
+    fixture.api.getPeerActivity = async () => ({
+      ...await readActivity(),
+      handoffs: [],
+    });
+  }
+  if (params.get("continuation") === "reviewed") {
+    const readStatus = fixture.api.getContinuationStatus;
+    fixture.api.getContinuationStatus = async () => ({
+      ...await readStatus(),
+      state: "reviewed",
+      manifestId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      worktreeName: "Synthetic task",
+      writablePaths: ["src/synthetic-task.ts"],
+      expiresAtMs: 1_900_000_000_000,
+      continuationCount: 1,
+      latest: {
+        schemaVersion: 1,
+        continuationId: "11111111-2222-4333-8444-555555555555",
+        manifestId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        state: "succeeded",
+        prompt: "Synthetic task request.",
+        reply: "Synthetic task completed.",
+        error: null,
+        exchangeId: "synthetic-direct-exchange",
+        requestEventId: "synthetic-direct-request",
+        completionEventId: "synthetic-direct-response",
+        changedPaths: ["src/synthetic-task.ts"],
+        validationState: "not_executed",
+        diffFingerprint: "a".repeat(64),
+        evidenceHash: "b".repeat(64),
+        completedAtMs: 1_800_000_000_000,
+        userReceived: true,
+      },
+    });
+  }
   const fixtureWidth = positiveFixtureDimension(params.get("fixture-width"));
   const fixtureHeight = positiveFixtureDimension(params.get("fixture-height"));
   if (fixtureWidth && fixtureHeight) {
@@ -66,6 +110,18 @@ export function mountSyntheticFixture(
   } else {
     mountDetail(root, fixture.api);
     void prepareDetailFixture(root, scenario, params.get("tab"));
+    if (params.get("menu") === "open") {
+      root.querySelector<HTMLButtonElement>('[data-region="studio-utilities"]')?.click();
+    }
+    if (params.get("composer") === "open") {
+      const composer = root.querySelector<HTMLDetailsElement>(".continuation-dock");
+      const message = root.querySelector<HTMLTextAreaElement>(".continuation-input");
+      if (composer && message) {
+        composer.open = true;
+        message.value = "Synthetic draft for Grok.";
+        message.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    }
   }
   if (scenario === "missing-image") {
     queueMicrotask(() => {
@@ -99,7 +155,7 @@ async function prepareDetailFixture(
       }
     }
   }
-  await activateStudioSurface(root, tab);
+  await activateStudioSurface(root, tab, scenario === "maximum-exchange" || scenario === "handoff-preview");
 }
 
 async function waitForElement<T extends Element>(
@@ -116,7 +172,11 @@ async function waitForElement<T extends Element>(
   return null;
 }
 
-async function activateStudioSurface(root: HTMLElement, value: string | null): Promise<void> {
+async function activateStudioSurface(
+  root: HTMLElement,
+  value: string | null,
+  selectCompletion = false,
+): Promise<void> {
   if (value !== "event" && value !== "activity" && value !== "sources" && value !== "settings") {
     return;
   }
@@ -125,7 +185,10 @@ async function activateStudioSurface(root: HTMLElement, value: string | null): P
       root,
       ".studio-focus-row[data-event-key]",
     );
-    message?.click();
+    const selection = selectCompletion
+      ? root.querySelectorAll<HTMLButtonElement>(".studio-focus-row[data-event-key]")[1]
+      : message;
+    selection?.click();
     return;
   }
   const utilities = await waitForElement<HTMLButtonElement>(

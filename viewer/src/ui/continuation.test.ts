@@ -18,10 +18,11 @@ const HASH = "a".repeat(64);
 afterEach(() => {
   document.body.replaceChildren();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("direct Grok continuation", () => {
-  it("fails closed when no task is published", async () => {
+  it("allows drafting but refuses sending when no task is published", async () => {
     const api = continuationApi(absentStatus());
     const view = mount(api);
     await vi.waitFor(() => {
@@ -31,11 +32,89 @@ describe("direct Grok continuation", () => {
     expect(view.section.querySelector("summary")?.textContent).toContain(
       "No task is currently published",
     );
-    expect(view.section.querySelector<HTMLTextAreaElement>("textarea")?.disabled).toBe(true);
+    expect(view.section.querySelector<HTMLTextAreaElement>("textarea")?.disabled).toBe(false);
     expect(view.section.querySelector<HTMLButtonElement>(".continuation-send")?.disabled).toBe(
       true,
     );
     view.stop();
+  });
+
+  it.each(["reviewed", "expired", "ambiguous", "running"])(
+    "keeps the draft editable while sending is blocked in %s state",
+    async (state) => {
+      vi.useFakeTimers();
+      const submit = vi.fn();
+      const view = mount(continuationApi(armedStatus({ state }), { submitContinuation: submit }));
+      await vi.advanceTimersByTimeAsync(0);
+      view.section.querySelector<HTMLDetailsElement>(".continuation-dock")!.open = true;
+      const textarea = view.section.querySelector<HTMLTextAreaElement>("textarea")!;
+      expect(textarea.disabled).toBe(false);
+      textarea.focus();
+      textarea.value = "Keep this exact draft.\n🧬";
+      textarea.setSelectionRange(5, 11);
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(document.activeElement).toBe(textarea);
+      expect(textarea.value).toBe("Keep this exact draft.\n🧬");
+      expect(textarea.selectionStart).toBe(5);
+      expect(textarea.selectionEnd).toBe(11);
+      expect(view.section.querySelector<HTMLButtonElement>(".continuation-send")?.disabled).toBe(true);
+      view.section.querySelector<HTMLFormElement>("form")!.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+      expect(submit).not.toHaveBeenCalled();
+      view.stop();
+      vi.useRealTimers();
+    },
+  );
+
+  it("preserves draft and caret through task changes and failed status polls", async () => {
+    vi.useFakeTimers();
+    let next = armedStatus();
+    let unavailable = false;
+    const submit = vi.fn();
+    const api = continuationApi(next, {
+      getContinuationStatus: async () => {
+        if (unavailable) {
+          throw new Error("offline");
+        }
+        return next;
+      },
+      submitContinuation: submit,
+    });
+    const view = mount(api);
+    await vi.advanceTimersByTimeAsync(0);
+    view.section.querySelector<HTMLDetailsElement>(".continuation-dock")!.open = true;
+    const textarea = view.section.querySelector<HTMLTextAreaElement>("textarea")!;
+    textarea.focus();
+    textarea.value = "Draft for the published task.";
+    textarea.setSelectionRange(6, 9);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(view.section.querySelector<HTMLButtonElement>(".continuation-send")?.disabled).toBe(false);
+
+    unavailable = true;
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(textarea.disabled).toBe(false);
+    expect(view.section.querySelector<HTMLButtonElement>(".continuation-send")?.disabled).toBe(true);
+    view.section.querySelector<HTMLFormElement>("form")!.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    expect(submit).not.toHaveBeenCalled();
+
+    unavailable = false;
+    next = armedStatus({ state: "reviewed" });
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(textarea.disabled).toBe(false);
+    expect(view.section.querySelector<HTMLButtonElement>(".continuation-send")?.disabled).toBe(true);
+    next = armedStatus();
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(view.section.querySelector<HTMLButtonElement>(".continuation-send")?.disabled).toBe(false);
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.value).toBe("Draft for the published task.");
+    expect(textarea.selectionStart).toBe(6);
+    expect(textarea.selectionEnd).toBe(9);
+    view.stop();
+    vi.useRealTimers();
   });
 
   it("sends only the exact bounded message supplied by the user", async () => {
@@ -54,6 +133,87 @@ describe("direct Grok continuation", () => {
     await vi.waitFor(() => {
       expect(submit).toHaveBeenCalledWith("Please finish the published tests.");
     });
+    view.stop();
+  });
+
+  it("keeps the next draft editable and retains it when submission fails", async () => {
+    let rejectSubmission = (_error: Error): void => undefined;
+    const submit = vi.fn(() => new Promise<{ continuationId: string; state: string }>((_resolve, reject) => {
+      rejectSubmission = reject;
+    }));
+    const view = mount(continuationApi(armedStatus(), { submitContinuation: submit }));
+    await vi.waitFor(() => {
+      expect(view.section.textContent).toContain("Ready for a direct message");
+    });
+    view.section.querySelector<HTMLDetailsElement>(".continuation-dock")!.open = true;
+    const textarea = view.section.querySelector<HTMLTextAreaElement>("textarea")!;
+    textarea.focus();
+    textarea.value = "Keep the exact submitted message.\n🧬";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    const form = view.section.querySelector<HTMLFormElement>("form")!;
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(submit).toHaveBeenCalledWith("Keep the exact submitted message.\n🧬");
+    expect(textarea.disabled).toBe(false);
+    expect(textarea.readOnly).toBe(false);
+    expect(document.activeElement).toBe(textarea);
+    textarea.value = "My next draft.";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+
+    rejectSubmission(new Error("submission refused"));
+    await vi.waitFor(() => {
+      expect(view.section.textContent).toContain("Grok did not accept");
+    });
+    expect(textarea.readOnly).toBe(false);
+    expect(textarea.value).toBe("My next draft.");
+    expect(document.activeElement).toBe(textarea);
+    view.stop();
+  });
+
+  it("ignores status reads from before submission and never clears a newer draft", async () => {
+    vi.useFakeTimers();
+    let completeSubmit = (): void => undefined;
+    let completeOldPoll = (): void => undefined;
+    let reads = 0;
+    const api = continuationApi(armedStatus(), {
+      getContinuationStatus: async () => {
+        reads += 1;
+        if (reads === 2) {
+          return new Promise<ContinuationStatus>((resolve) => {
+            completeOldPoll = () => resolve(armedStatus());
+          });
+        }
+        return reads === 1 ? armedStatus() : armedStatus({ state: "running" });
+      },
+      submitContinuation: () => new Promise((resolve) => {
+        completeSubmit = () => resolve({ continuationId: ID, state: "running" });
+      }),
+    });
+    const view = mount(api);
+    await vi.advanceTimersByTimeAsync(0);
+    view.section.querySelector<HTMLDetailsElement>(".continuation-dock")!.open = true;
+    const textarea = view.section.querySelector<HTMLTextAreaElement>("textarea")!;
+    textarea.value = "Exact submitted message.";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(1_500);
+    view.section.querySelector<HTMLFormElement>("form")!.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    textarea.value = "Next unsent draft.";
+    textarea.setSelectionRange(4, 8);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    completeSubmit();
+    await vi.advanceTimersByTimeAsync(0);
+    completeOldPoll();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(view.section.querySelector<HTMLButtonElement>(".continuation-send")?.disabled).toBe(true);
+    expect(textarea.value).toBe("Next unsent draft.");
+    expect(textarea.selectionStart).toBe(4);
+    expect(textarea.selectionEnd).toBe(8);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(view.section.textContent).toContain("Grok is working");
+    expect(view.section.querySelector<HTMLButtonElement>(".continuation-send")?.disabled).toBe(true);
     view.stop();
   });
 

@@ -61,6 +61,8 @@ struct InteractiveRuntimeDiagnostic<'a> {
     event_type: &'a str,
     reason: Option<DesktopFallbackReason>,
     detail: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement_context: Option<&'a interactive_surface::PlacementFailureDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1098,13 +1100,17 @@ fn retryable_startup_position_denial(error: &str) -> bool {
 }
 
 fn defer_startup_position<R: Runtime>(app: &AppHandle<R>, error: String) {
+    let placement = interactive_surface::take_placement_failure_diagnostic();
     let state = app.state::<AppState>();
     state.defer_surface_startup();
-    let _ = record_interactive_diagnostic(
+    let placement = placement
+        .map(|diagnostic| diagnostic.with_startup_attempt(state.surface_startup_attempt_count()));
+    let _ = record_interactive_diagnostic_with_placement(
         app,
         "surface-startup-position-deferred",
         Some(DesktopFallbackReason::SurfaceZOrderInvalid),
         Some(&error),
+        placement.as_ref(),
     );
     if let Err(hide_error) = interactive_surface::hide_surface(app) {
         fallback_interactive(
@@ -1154,6 +1160,16 @@ fn record_interactive_diagnostic<R: Runtime>(
     reason: Option<DesktopFallbackReason>,
     detail: Option<&str>,
 ) -> Result<(), String> {
+    record_interactive_diagnostic_with_placement(app, event_type, reason, detail, None)
+}
+
+fn record_interactive_diagnostic_with_placement<R: Runtime>(
+    app: &AppHandle<R>,
+    event_type: &str,
+    reason: Option<DesktopFallbackReason>,
+    detail: Option<&str>,
+    placement_context: Option<&interactive_surface::PlacementFailureDiagnostic>,
+) -> Result<(), String> {
     let diagnostic = InteractiveRuntimeDiagnostic {
         schema_version: 1,
         timestamp_ms: SystemTime::now()
@@ -1164,6 +1180,7 @@ fn record_interactive_diagnostic<R: Runtime>(
         event_type,
         reason,
         detail,
+        placement_context,
     };
     let directory = app
         .path()
@@ -1641,12 +1658,14 @@ mod tests {
             event_type: "fallback",
             reason: Some(DesktopFallbackReason::SurfaceDocumentNotReady),
             detail: Some("widget-surface document did not report readiness"),
+            placement_context: None,
         })
         .expect("diagnostic serialization");
 
         assert_eq!(value["schemaVersion"], 1);
         assert_eq!(value["eventType"], "fallback");
         assert_eq!(value["reason"], "surface-document-not-ready");
+        assert!(value.get("placementContext").is_none());
         assert_eq!(
             value["detail"],
             "widget-surface document did not report readiness"
@@ -1666,6 +1685,41 @@ mod tests {
         assert_eq!(
             latched_surface_action(true, false),
             LatchedSurfaceAction::ConfirmDestroyed
+        );
+    }
+
+    #[test]
+    fn placement_identity_is_a_sibling_not_policy_or_detail_text() {
+        let error = format!(
+            "failed to place desktop-band helper above Explorer: {}",
+            std::io::Error::from_raw_os_error(5)
+        );
+        let placement =
+            interactive_surface::diagnostic_fixture("style-owner-parent-geometry-viewport")
+                .with_startup_attempt(1);
+        let value = serde_json::to_value(InteractiveRuntimeDiagnostic {
+            schema_version: 1,
+            timestamp_ms: 42,
+            event_type: "surface-startup-position-deferred",
+            reason: Some(DesktopFallbackReason::SurfaceZOrderInvalid),
+            detail: Some(&error),
+            placement_context: Some(&placement),
+        })
+        .unwrap();
+        assert_eq!(value["detail"], error);
+        assert_eq!(
+            value["placementContext"]["anchor"]["class"],
+            "style-owner-parent-geometry-viewport"
+        );
+        assert_eq!(value["placementContext"]["startupAttempt"], 1);
+        assert!(retryable_startup_position_denial(&error));
+        assert_eq!(
+            classify_surface_failure(&error),
+            DesktopFallbackReason::SurfaceZOrderInvalid
+        );
+        assert_eq!(
+            classify_surface_failure(&format!("{error} class=style-owner")),
+            DesktopFallbackReason::SurfaceStyleInvalid
         );
     }
 

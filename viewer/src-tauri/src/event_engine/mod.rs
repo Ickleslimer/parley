@@ -2,6 +2,7 @@ mod engine;
 mod excerpt;
 mod keys;
 mod parse;
+mod search;
 mod source;
 mod store;
 mod types;

@@ -14,6 +14,34 @@ const source = readFileSync(
 );
 
 describe("studio drawer chrome", () => {
+  it("contains long exact text without shrinking drawer controls or disclosures", () => {
+    const drawer = createStudioDrawer();
+    const styles = document.createElement("style");
+    const directory = dirname(fileURLToPath(import.meta.url));
+    styles.textContent = ["studio.css", "studio-focus.css"]
+      .map((name) => readFileSync(join(directory, "../styles", name), "utf8"))
+      .join("\n");
+    const body = "Exact synthetic <script>text</script> 🧪\n".repeat(2_000);
+    drawer.exactBody.textContent = body;
+    drawer.setLayoutClass("wide");
+    document.head.append(styles);
+    document.body.append(drawer.region);
+    try {
+      const exactStyle = getComputedStyle(drawer.exactBody);
+      expect(exactStyle.overflow).toBe("auto");
+      expect(exactStyle.flexGrow).toBe("1");
+      expect(exactStyle.flexShrink).toBe("1");
+      expect(exactStyle.flexBasis).toBe("auto");
+      expect(drawer.exactBody.textContent).toBe(body);
+      expect(drawer.exactBody.querySelector("script")).toBeNull();
+      drawer.setLayoutClass("compact");
+      expect(getComputedStyle(drawer.exactBody).overflow).toBe("auto");
+    } finally {
+      styles.remove();
+      drawer.region.remove();
+    }
+  });
+
   it("starts closed with one exact body, one collapsed disclosure, and a utility host", () => {
     const drawer = createStudioDrawer();
 

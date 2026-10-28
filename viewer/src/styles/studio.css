@@ -130,8 +130,19 @@
   min-height: 0;
 }
 
+.studio-focus-main:has(.continuation-dock[open]) {
+  display: flex;
+  flex-direction: column;
+}
+
+.studio-focus-main:has(.continuation-dock[open]) > [data-region="studio-transcript"] {
+  flex: 1 1 0;
+  min-height: min(12rem, 50%);
+}
+
 [data-region="studio-composer"] {
   display: block;
+  flex: 0 1 auto;
   padding: 0;
   overflow: hidden;
   background: var(--paper);
@@ -141,11 +152,21 @@
   box-shadow: var(--shadow-short);
 }
 
+[data-region="studio-composer"] .studio-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  line-height: 1.25;
+  text-align: center;
+}
+
 .continuation-dock > summary {
   display: flex;
   align-items: center;
   gap: 8px 16px;
   min-height: var(--target-min);
+  flex-shrink: 0;
   padding: 8px 12px;
   cursor: pointer;
 }
@@ -164,10 +185,21 @@
 .continuation-body {
   display: grid;
   gap: 8px;
-  max-height: min(20rem, 44vh);
+  min-height: 0;
   padding: 0 12px 12px;
   overflow: auto;
   border-top: 2px solid var(--line-soft);
+}
+
+.continuation-dock[open] {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.continuation-dock[open]::details-content {
+  display: contents;
 }
 
 .studio-focus-utility-panel {
@@ -276,6 +308,12 @@
 .studio-settings {
   display: grid;
   gap: 8px;
+}
+
+.studio-startup {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
 }
 
 .studio-settings .field {

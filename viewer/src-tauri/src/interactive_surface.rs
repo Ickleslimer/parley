@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::mem;
@@ -7,9 +8,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    GetLastError, SetLastError, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW,
@@ -33,6 +37,7 @@ pub const SURFACE_LABEL: &str = "widget-surface";
 const SURFACE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const GEOMETRY_TOLERANCE_PX: i32 = 1;
 const MAX_DESKTOP_BAND_WINDOWS: usize = 4_096;
+const MAX_DENIED_DESKTOP_ANCHORS: usize = 8;
 const PRESENTATION_DIAGNOSTICS_ENV: &str = "PARLEY_VIEWER_PRESENTATION_DIAGNOSTICS";
 const WM_REASSERT_DESKTOP_BAND: u32 = WM_APP + 0x32A;
 const WM_INSTALL_DESKTOP_BAND_HOOK: u32 = WM_APP + 0x32B;
@@ -64,6 +69,165 @@ static LAST_MOUSEACTIVATE_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 static BAND_HELPER_HWND: AtomicIsize = AtomicIsize::new(0);
 static SURFACE_CREATED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static PROCESS_STARTED: OnceLock<Instant> = OnceLock::new();
+
+thread_local! {
+    static PLACEMENT_FAILURE: RefCell<Option<PlacementFailureDiagnostic>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlacementWindowDiagnostic {
+    handle: String,
+    process_id: Option<u32>,
+    thread_id: Option<u32>,
+    class: Option<String>,
+    topmost: Option<bool>,
+    identity_available: bool,
+}
+
+impl PlacementWindowDiagnostic {
+    fn from_observation(
+        window: HWND,
+        process_id: u32,
+        thread_id: u32,
+        class: Option<String>,
+        topmost: Option<bool>,
+        valid: bool,
+    ) -> Self {
+        let available = valid && process_id != 0 && thread_id != 0;
+        Self {
+            handle: format_handle(window as isize),
+            process_id: available.then_some(process_id),
+            thread_id: available.then_some(thread_id),
+            class: if available {
+                class.map(|value| value.chars().take(128).collect())
+            } else {
+                None
+            },
+            topmost: if available { topmost } else { None },
+            identity_available: available,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlacementFailureDiagnostic {
+    schema_version: u8,
+    native_error_code: i32,
+    calling_thread_id: u32,
+    startup_attempt: Option<usize>,
+    observed_after_failure: bool,
+    helper: PlacementWindowDiagnostic,
+    anchor: PlacementWindowDiagnostic,
+    icon_host: PlacementWindowDiagnostic,
+}
+
+impl PlacementFailureDiagnostic {
+    pub(crate) fn with_startup_attempt(mut self, attempt: usize) -> Self {
+        self.startup_attempt = (1..=3).contains(&attempt).then_some(attempt);
+        self
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_fixture(class: &str) -> PlacementFailureDiagnostic {
+    PlacementFailureDiagnostic {
+        schema_version: 1,
+        native_error_code: 5,
+        calling_thread_id: 41,
+        startup_attempt: None,
+        observed_after_failure: true,
+        helper: PlacementWindowDiagnostic::from_observation(
+            11usize as HWND,
+            101,
+            201,
+            Some("ParleyHelper".into()),
+            Some(false),
+            true,
+        ),
+        anchor: PlacementWindowDiagnostic::from_observation(
+            12usize as HWND,
+            102,
+            202,
+            Some(class.into()),
+            Some(false),
+            true,
+        ),
+        icon_host: PlacementWindowDiagnostic::from_observation(
+            13usize as HWND,
+            103,
+            203,
+            Some("WorkerW".into()),
+            Some(false),
+            true,
+        ),
+    }
+}
+
+pub(crate) fn take_placement_failure_diagnostic() -> Option<PlacementFailureDiagnostic> {
+    PLACEMENT_FAILURE.with(|failure| failure.borrow_mut().take())
+}
+
+fn clear_placement_failure_diagnostic() {
+    let _ = take_placement_failure_diagnostic();
+}
+
+struct DiagnosticLastErrorGuard(u32);
+
+impl Drop for DiagnosticLastErrorGuard {
+    fn drop(&mut self) {
+        unsafe { SetLastError(self.0) };
+    }
+}
+
+fn placement_window_diagnostic(window: HWND) -> PlacementWindowDiagnostic {
+    let mut process_id = 0;
+    let thread_id = unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+    let class = window_class(window);
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let extended = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
+    let topmost = (unsafe { GetLastError() } == ERROR_SUCCESS)
+        .then_some(extended as u32 & WS_EX_TOPMOST != 0);
+    let mut final_process_id = 0;
+    let final_thread_id = unsafe { GetWindowThreadProcessId(window, &mut final_process_id) };
+    let valid = unsafe { IsWindow(window) } != 0
+        && process_id == final_process_id
+        && thread_id == final_thread_id;
+    PlacementWindowDiagnostic::from_observation(
+        window, process_id, thread_id, class, topmost, valid,
+    )
+}
+
+fn capture_placement_failure(
+    helper: HWND,
+    anchor: HWND,
+    icon_host: HWND,
+) -> PlacementFailureDiagnostic {
+    PlacementFailureDiagnostic {
+        schema_version: 1,
+        native_error_code: 5,
+        calling_thread_id: unsafe { GetCurrentThreadId() },
+        startup_attempt: None,
+        observed_after_failure: true,
+        helper: placement_window_diagnostic(helper),
+        anchor: placement_window_diagnostic(anchor),
+        icon_host: placement_window_diagnostic(icon_host),
+    }
+}
+
+fn helper_placement_error(
+    error: std::io::Error,
+    capture: impl FnOnce() -> PlacementFailureDiagnostic,
+) -> String {
+    let _last_error = DiagnosticLastErrorGuard(unsafe { GetLastError() });
+    clear_placement_failure_diagnostic();
+    if error.raw_os_error() == Some(5) {
+        let diagnostic = capture();
+        PLACEMENT_FAILURE.with(|failure| *failure.borrow_mut() = Some(diagnostic));
+    }
+    format!("failed to place desktop-band helper above Explorer: {error}")
+}
 
 struct ControlledSurfacePositionGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -528,38 +692,56 @@ fn position_desktop_pair_locked(
     rect: SurfaceRect,
     show: bool,
 ) -> Result<(), String> {
+    clear_placement_failure_diagnostic();
     let icon_host = desktop_icon_host()?;
-    let anchor = desktop_band_anchor(icon_host, helper, surface)?;
-    position_desktop_pair_after_locked(surface, helper, anchor, rect, show)
-}
-
-fn position_desktop_pair_after_locked(
-    surface: HWND,
-    helper: HWND,
-    anchor: HWND,
-    rect: SurfaceRect,
-    show: bool,
-) -> Result<(), String> {
+    let mut denied_anchors = Vec::new();
+    loop {
+        let anchor = desktop_band_anchor(icon_host, helper, surface, &denied_anchors)?;
+        if denied_anchors
+            .iter()
+            .any(|window| unsafe { IsWindowVisible(*window) } != 0)
+        {
+            return Err("a denied desktop-band anchor became visible".to_string());
+        }
+        let helper_positioned = unsafe {
+            SetWindowPos(
+                helper,
+                anchor,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+            )
+        };
+        if helper_positioned != 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        let skip = may_skip_denied_anchor(
+            error.raw_os_error(),
+            unsafe { IsWindow(anchor) } != 0,
+            unsafe { IsWindowVisible(anchor) } != 0,
+            denied_anchors.len(),
+        );
+        let message = helper_placement_error(error, || {
+            capture_placement_failure(helper, anchor, icon_host)
+        });
+        if !skip {
+            return Err(message);
+        }
+        denied_anchors.push(anchor);
+    }
+    if denied_anchors
+        .iter()
+        .any(|window| unsafe { IsWindowVisible(*window) } != 0)
+    {
+        return Err("a denied desktop-band anchor became visible".to_string());
+    }
+    clear_placement_failure_diagnostic();
     let mut flags = SWP_NOACTIVATE;
     if show {
         flags |= SWP_SHOWWINDOW;
-    }
-    let helper_positioned = unsafe {
-        SetWindowPos(
-            helper,
-            anchor,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-        )
-    };
-    if helper_positioned == 0 {
-        return Err(format!(
-            "failed to place desktop-band helper above Explorer: {}",
-            std::io::Error::last_os_error()
-        ));
     }
     let surface_positioned = unsafe {
         SetWindowPos(
@@ -581,7 +763,21 @@ fn position_desktop_pair_after_locked(
     Ok(())
 }
 
-fn desktop_band_anchor(icon_host: HWND, helper: HWND, surface: HWND) -> Result<HWND, String> {
+fn may_skip_denied_anchor(
+    native_error: Option<i32>,
+    valid: bool,
+    visible: bool,
+    skipped: usize,
+) -> bool {
+    native_error == Some(5) && valid && !visible && skipped < MAX_DENIED_DESKTOP_ANCHORS
+}
+
+fn desktop_band_anchor(
+    icon_host: HWND,
+    helper: HWND,
+    surface: HWND,
+    denied_anchors: &[HWND],
+) -> Result<HWND, String> {
     let shell_process_id = window_process_id(icon_host)?;
     let mut anchor = unsafe { GetWindow(icon_host, GW_HWNDPREV) };
     for _ in 0..MAX_DESKTOP_BAND_WINDOWS {
@@ -596,7 +792,14 @@ fn desktop_band_anchor(icon_host: HWND, helper: HWND, surface: HWND) -> Result<H
             shell_taskbar_window(anchor, shell_process_id),
         ) {
             AnchorCandidate::SkipOwned => {}
-            AnchorCandidate::UseWindow => return Ok(anchor),
+            AnchorCandidate::UseWindow => {
+                if !denied_anchors.contains(&anchor) {
+                    return Ok(anchor);
+                }
+                if unsafe { IsWindowVisible(anchor) } != 0 {
+                    return Err("a denied desktop-band anchor became visible".to_string());
+                }
+            }
             AnchorCandidate::RejectTopmost => {
                 return Err(
                     "Explorer icon host has no safe non-topmost preceding z-order anchor"
@@ -1858,6 +2061,165 @@ mod tests {
     }
 
     #[test]
+    fn placement_metadata_preserves_the_original_error_and_last_error() {
+        let error = std::io::Error::from_raw_os_error(5);
+        let expected = format!("failed to place desktop-band helper above Explorer: {error}");
+        unsafe { SetLastError(5) };
+        let message = helper_placement_error(error, || {
+            unsafe { SetLastError(87) };
+            diagnostic_fixture("style-owner-parent-geometry-viewport")
+        });
+        assert_eq!(unsafe { GetLastError() }, 5);
+        assert_eq!(message, expected);
+        assert!(!message.contains("style-owner-parent"));
+        let diagnostic = take_placement_failure_diagnostic().expect("captured metadata");
+        assert_eq!(diagnostic.native_error_code, 5);
+        assert_eq!(
+            diagnostic.anchor.class.as_deref(),
+            Some("style-owner-parent-geometry-viewport")
+        );
+        assert!(take_placement_failure_diagnostic().is_none());
+    }
+
+    #[test]
+    fn other_placement_errors_do_not_capture_or_reuse_metadata() {
+        helper_placement_error(std::io::Error::from_raw_os_error(5), || {
+            diagnostic_fixture("old")
+        });
+        let error = std::io::Error::from_raw_os_error(87);
+        let expected = format!("failed to place desktop-band helper above Explorer: {error}");
+        assert_eq!(
+            helper_placement_error(error, || panic!("capture must not run")),
+            expected
+        );
+        assert!(take_placement_failure_diagnostic().is_none());
+        helper_placement_error(std::io::Error::from_raw_os_error(5), || {
+            diagnostic_fixture("new")
+        });
+        clear_placement_failure_diagnostic();
+        assert!(take_placement_failure_diagnostic().is_none());
+    }
+
+    #[test]
+    fn placement_metadata_is_thread_local_and_consumed_once() {
+        clear_placement_failure_diagnostic();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            helper_placement_error(std::io::Error::from_raw_os_error(5), || {
+                diagnostic_fixture("peer")
+            });
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            assert_eq!(
+                take_placement_failure_diagnostic()
+                    .unwrap()
+                    .anchor
+                    .class
+                    .as_deref(),
+                Some("peer")
+            );
+            assert!(take_placement_failure_diagnostic().is_none());
+        });
+        ready_rx.recv().unwrap();
+        assert!(take_placement_failure_diagnostic().is_none());
+        helper_placement_error(std::io::Error::from_raw_os_error(5), || {
+            diagnostic_fixture("caller")
+        });
+        assert_eq!(
+            take_placement_failure_diagnostic()
+                .unwrap()
+                .anchor
+                .class
+                .as_deref(),
+            Some("caller")
+        );
+        release_tx.send(()).unwrap();
+        peer.join().unwrap();
+        assert!(take_placement_failure_diagnostic().is_none());
+    }
+
+    #[test]
+    fn disappeared_or_unidentified_windows_have_null_identity_fields() {
+        for (process_id, thread_id, valid) in [(101, 201, false), (0, 201, true), (101, 0, true)] {
+            let value = serde_json::to_value(PlacementWindowDiagnostic::from_observation(
+                12usize as HWND,
+                process_id,
+                thread_id,
+                Some("stale".into()),
+                Some(true),
+                valid,
+            ))
+            .unwrap();
+            assert_eq!(value["identityAvailable"], false);
+            assert!(value["processId"].is_null());
+            assert!(value["threadId"].is_null());
+            assert!(value["class"].is_null());
+            assert!(value["topmost"].is_null());
+            assert!(value["handle"].is_string());
+        }
+    }
+
+    #[test]
+    fn placement_metadata_is_bounded_escaped_and_observational() {
+        let class = format!("style\"owner\nparent🧪{}", "🧪".repeat(200));
+        let diagnostic = diagnostic_fixture(&class).with_startup_attempt(3);
+        let serialized = serde_json::to_string(&diagnostic).unwrap();
+        assert!(!serialized.contains('\n'));
+        assert!(serialized.len() < 2_048);
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["nativeErrorCode"], 5);
+        assert_eq!(value["callingThreadId"], 41);
+        assert_eq!(value["startupAttempt"], 3);
+        assert_eq!(value["observedAfterFailure"], true);
+        assert_eq!(
+            value["anchor"]["class"].as_str().unwrap().chars().count(),
+            128
+        );
+        assert_eq!(value["anchor"]["topmost"], false);
+        assert_eq!(value["anchor"]["identityAvailable"], true);
+        assert_eq!(value.as_object().unwrap().len(), 8);
+        assert_eq!(value["anchor"].as_object().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn placement_metadata_rejects_impossible_startup_attempt_numbers() {
+        for attempt in [0, 4, usize::MAX] {
+            assert!(diagnostic_fixture("anchor")
+                .with_startup_attempt(attempt)
+                .startup_attempt
+                .is_none());
+        }
+        for attempt in 1..=3 {
+            assert_eq!(
+                diagnostic_fixture("anchor")
+                    .with_startup_attempt(attempt)
+                    .startup_attempt,
+                Some(attempt)
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_class_and_style_are_not_inferred_from_window_identity() {
+        let value = serde_json::to_value(PlacementWindowDiagnostic::from_observation(
+            12usize as HWND,
+            102,
+            202,
+            None,
+            None,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(value["identityAvailable"], true);
+        assert_eq!(value["processId"], 102);
+        assert_eq!(value["threadId"], 202);
+        assert!(value["class"].is_null());
+        assert!(value["topmost"].is_null());
+    }
+
+    #[test]
     fn style_normalization_enforces_nonactivating_tool_window() {
         let (style, extended) = normalized_surface_styles(
             WS_CHILD | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
@@ -2008,6 +2370,62 @@ mod tests {
         assert_eq!(
             classify_anchor_candidate(topmost, helper, surface, true, true),
             AnchorCandidate::SkipOwned
+        );
+    }
+
+    #[test]
+    fn only_proven_access_denied_hidden_anchors_can_be_skipped() {
+        for (name, error, valid, visible, count, expected) in [
+            (
+                "hidden elevated or IME anchor",
+                Some(5),
+                true,
+                false,
+                0,
+                true,
+            ),
+            ("visible denied anchor", Some(5), true, true, 0, false),
+            (
+                "visible cloaked denied anchor",
+                Some(5),
+                true,
+                true,
+                0,
+                false,
+            ),
+            ("destroyed denied anchor", Some(5), false, false, 0, false),
+            (
+                "unrelated native failure",
+                Some(1400),
+                true,
+                false,
+                0,
+                false,
+            ),
+            ("no native error", None, true, false, 0, false),
+            ("last bounded skip", Some(5), true, false, 7, true),
+            ("skip ceiling", Some(5), true, false, 8, false),
+        ] {
+            assert_eq!(
+                may_skip_denied_anchor(error, valid, visible, count),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_eligibility_keeps_hidden_windows_without_a_proven_denial() {
+        let helper = 1usize as HWND;
+        let surface = 2usize as HWND;
+        let hidden_foreign = 3usize as HWND;
+        assert_eq!(
+            classify_anchor_candidate(hidden_foreign, helper, surface, false, false),
+            AnchorCandidate::UseWindow
+        );
+        assert_eq!(
+            classify_anchor_candidate(hidden_foreign, helper, surface, true, false),
+            AnchorCandidate::RejectTopmost
         );
     }
 

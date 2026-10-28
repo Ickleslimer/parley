@@ -5,14 +5,15 @@ use std::sync::{Mutex, MutexGuard};
 
 use super::keys::{decode_key, KeyContext, KeyKind};
 use super::parse::{parse_record, ParseOutcome};
+use super::search::SearchPattern;
 use super::source::{
     head_mismatch, ingest_from, open_shared_read, path_identity, FileCursor, FileIdentity,
 };
-use super::store::{page, Store};
+use super::store::{page, SearchSnapshot, Store};
 use super::types::{
     clamp_page_limit, ConversationPage, Diagnostics, EngineStatus, EventContent, ExchangePage,
-    IdMatch, SearchHit, SearchPage, SessionPage, SessionSummary, SourceState, SourceStatus,
-    WidgetFeedMessage, WidgetFeedPage, WIDGET_FEED_PAGE_SIZE,
+    IdMatch, SearchPage, SessionPage, SessionSummary, SourceState, SourceStatus, WidgetFeedMessage,
+    WidgetFeedPage, WIDGET_FEED_PAGE_SIZE,
 };
 
 #[derive(Debug)]
@@ -148,7 +149,60 @@ impl EventEngine {
     }
 
     pub fn search(&self, query: &str, cursor: Option<u64>, limit: usize) -> SearchPage {
-        self.lock().search(query, cursor, limit)
+        let query = query.trim();
+        if query.is_empty() {
+            return SearchPage {
+                items: Vec::new(),
+                next_cursor: None,
+                total: 0,
+            };
+        }
+        let pattern = SearchPattern::new(query);
+        self.with_search_snapshot(|snapshots| {
+            let mut ranked = Vec::new();
+            for (order, source) in snapshots {
+                ranked.extend(source.matches(&pattern).into_iter().map(|hit| (order, hit)));
+            }
+            ranked.sort_by(|left, right| {
+                right
+                    .1
+                    .timestamp_ms()
+                    .cmp(&left.1.timestamp_ms())
+                    .then_with(|| left.0.cmp(&right.0))
+                    .then_with(|| left.1.event_id().cmp(right.1.event_id()))
+            });
+            let total = ranked.len() as u64;
+            let start = usize::try_from(cursor.unwrap_or(0)).unwrap_or(ranked.len());
+            let end = start
+                .saturating_add(clamp_page_limit(limit))
+                .min(ranked.len());
+            let next_cursor = (end < ranked.len()).then_some(end as u64);
+            let items = ranked
+                .into_iter()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .map(|(_, matched)| matched.into_hit())
+                .collect();
+            SearchPage {
+                items,
+                next_cursor,
+                total,
+            }
+        })
+    }
+
+    pub(super) fn with_search_snapshot<Output>(
+        &self,
+        search: impl FnOnce(Vec<(usize, SearchSnapshot)>) -> Output,
+    ) -> Output {
+        let snapshots = {
+            let inner = self.lock();
+            inner
+                .unique_sources_enumerated()
+                .map(|(order, source)| (order, source.store.search_snapshot(source.keys())))
+                .collect()
+        };
+        search(snapshots)
     }
 
     pub fn event_content(&self, event_key: &str) -> Option<EventContent> {
@@ -578,40 +632,6 @@ impl Inner {
             anchor_exchange_key,
             reset_required: false,
         }
-    }
-
-    fn search(&self, query: &str, cursor: Option<u64>, limit: usize) -> SearchPage {
-        let query = query.trim();
-        if query.is_empty() {
-            return SearchPage {
-                items: Vec::new(),
-                next_cursor: None,
-                total: 0,
-            };
-        }
-        let mut ranked: Vec<(u64, usize, String, SearchHit)> = Vec::new();
-        for (order, source) in self.unique_sources_enumerated() {
-            for hit in source.store.all_search_hits(query, source.keys()) {
-                ranked.push((hit.timestamp_ms, order, hit.event_key.clone(), hit));
-            }
-        }
-        ranked.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.2.cmp(&right.2))
-        });
-        page(
-            ranked.into_iter().map(|item| item.3).collect(),
-            cursor,
-            limit,
-            |items, next, total| SearchPage {
-                items,
-                next_cursor: next,
-                total,
-            },
-        )
     }
 
     fn event_content(&self, event_key: &str) -> Option<EventContent> {

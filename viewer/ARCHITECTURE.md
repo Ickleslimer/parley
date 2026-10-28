@@ -11,6 +11,8 @@
 
 ## Multi-Source Event Engine
 
+Search IPC runs on a blocking worker rather than the UI thread. It captures reference-counted immutable events and source-qualified identities while briefly holding the engine lock, then releases that lock before matching, sorting, or projecting result excerpts. The matcher lowercases Unicode scalars once and uses a prefix table to scan in linear time, preserving original scalar offsets and refusing match starts inside a lowercase expansion. Only the requested page receives full search-hit metadata and excerpts. Replaced source generations remain unresolvable through their old event keys.
+
 The event engine below `src-tauri/src/event_engine/` exposes one thread-safe `EventEngine` over an ordered source list:
 
 - `set_sources`, `add_source`, and `remove_source` accept only absolute paths and never create a missing source.
@@ -37,6 +39,8 @@ All retrieval uses source- and generation-qualified opaque keys. Event, exchange
 
 Detail and legacy widget excerpts remain bounded to 420 Unicode scalar values and are never model-generated. The desktop chat uses a separate deterministic projection: framed requests expose only the exact matching current-request section, visibly mark omitted historical context, and fail closed when the exchange marker does not match. Within that section, or an otherwise unframed request, Rust may omit only a fully validated leading R3 envelope and fully validated terminal locked response and acknowledged-handoff contracts. Responses may omit only a fully validated acknowledged-handoff wrapper and terminal health footer. The retained colleague speech stays byte-for-byte exact, `DECISION` records remain visible, malformed or unknown blocks remain untouched, and errors remain exact. Automatic chat bodies are exact 4,000-scalar prefixes of that projection; full projected bodies are retrieved lazily by opaque event key. The detail inspector continues to expose the raw event without this display projection. Context source, mode, offsets, counts, truncation, and recovery remain detail diagnostics. The interactive surface is the sole desktop transcript renderer.
 
+Conversation and session response previews reuse that validated response projection before their 420-scalar limit, so handoff wrappers and health footers do not consume preview space. Request previews retain their existing task extraction, errors remain exact, and search still matches raw evidence with raw scalar offsets. Selected-event retrieval and content lengths remain raw.
+
 ## Runtime and Settings
 
 - `--event-log <absolute-path>` is repeatable. Source precedence is repeated CLI paths, one `PARLEY_EVENT_LOG`, saved `selectedLogs`, then no source.
@@ -45,10 +49,12 @@ Detail and legacy widget excerpts remain bounded to 420 Unicode scalar values an
 - `--show` and ordinary Start Menu launches show detail. `--autostart` opens only tray and widget.
 - Tray creation precedes underlay attachment. Tray failure keeps the widget detached and opens detail with a visible Exit action.
 - Underlay failure keeps the widget hidden, reports degraded state, and enters bounded reattachment cycles. No always-on-top, click-through, or ordinary-window fallback is allowed.
+- A startup helper-placement access denial adds optional `placementContext` metadata to the private `interactive-runtime.jsonl` diagnostic: the saved native error, calling thread, startup attempt, and bounded HWND/PID/thread/class/topmost observations for the helper, chosen anchor, and Explorer icon host. These are observations after failure, not proof that a transient window retained its identity. Disappeared or unidentified windows have null identity fields. Metadata is consumed once on the failing thread and never enters the error string, placement decisions, IPC, transcript, or persisted settings. Existing retry and fallback rules remain unchanged; diagnosis of the login failure still requires a natural-login record.
 - Closing detail hides it to tray. Only the Exit action or tray Exit terminates the process.
 - Viewer settings (`%APPDATA%\com.ickleslimer.parley-viewer\settings.json`), `%LOCALAPPDATA%\Parley\health`, and `%LOCALAPPDATA%\Parley\context` all survive uninstall and upgrade.
 - `%LOCALAPPDATA%\Parley\jobs`, `%LOCALAPPDATA%\Parley\lanes`, and `%LOCALAPPDATA%\Parley\handoffs` also survive uninstall and upgrade as task evidence.
 - Once `autostartInitialized` is true, saved `launchAtLogin` stays authoritative: startup restores or clears the viewer Run entry to match it, including after uninstall removed the registration. First interactive detail launch still enables autostart when `autostartInitialized` is false.
+- Settings begins with one shared `Launch Parley at sign-in` control. It changes the existing login registration and persisted preference, not current widget visibility or placement. Login launches the shared viewer process with its widget and tray; the full conversation window remains closed until explicitly opened.
 
 ### Interactive desktop composition
 
@@ -77,7 +83,7 @@ Detail and legacy widget excerpts remain bounded to 420 Unicode scalar values an
 
 - `getStatus` drives underlay lifecycle and geometry refresh. The underlay never requests transcript data.
 - `getWidgetFeed` returns fixed 20-exchange pages and an opaque history token; `getWidgetMessage` returns one complete projected body by opaque event key; `openWidgetEvent` opens that exact raw event in detail. The surface owns Live latching, viewport retention, and its bounded 200-exchange cache. A genuine user scroll within one layout pixel of the bottom resumes Live and clears ordinary unread keys without pinning; tagged programmatic scrolls and fail-closed history replacement cannot resume it.
-- `getConversationPage` returns exact 420-scalar detail excerpts in global newest-to-oldest exchange order. It supports opaque `before` history anchors for appending older exchanges and an opaque `around` anchor that places its target first with older context beneath it; stale, missing, mixed, or wrong-kind anchors fail closed with `resetRequired`.
+- `getConversationPage` returns 420-scalar previews in global newest-to-oldest exchange order, using validated speech prefixes for responses and existing exact/task-extracted prefixes for requests and errors. It supports opaque `before` history anchors for appending older exchanges and an opaque `around` anchor that places its target first with older context beneath it; stale, missing, mixed, or wrong-kind anchors fail closed with `resetRequired`.
 - `reportWidgetSurfaceBounds` accepts only validated underlay geometry; `widgetSurfaceReady` accepts readiness only from the surface; `widgetSurfacePointerDown` lets only the surface synchronously restore and verify its desktop-band position before a mouse action; `retryInteractiveMode` explicitly clears only the runtime fallback latch.
 - `listSessions` and `listExchanges` remain compatibility commands, while the detail window uses `getConversationPage`; `search` and `getEventContent` retain global search and exact raw retrieval.
 - `getSettings`, `saveSettings`, and `listMonitors` drive source ordering and geometry settings.
@@ -94,6 +100,10 @@ The interactive detail window polls the handoff-schema-v1 store read-only. It sh
 The desktop-underlay widget continues to consume only completed event-log exchanges. Pending handoffs and peer activity never enter its snapshot or rendering path. Health schema v3 projects only `quota_exhausted` and `mcp_stdout_undelivered` into incident lists, unread counts, and tray badges. Capacity throttles, turn errors, and watchdog terminations remain diagnostics. A Grok-triggered `handoff_unacknowledged` record is a separate explicit handoff alert shown with pending handoff evidence, not an incident. Viewing a report, expanding it, or acknowledging a health incident cannot record the Codex receipt required by Parley; only the locked MCP `ack_agent_handoff` command can do that, and receipt means delivery rather than acceptance.
 
 ## Direct Grok Continuation
+
+The expanded composer sizes to its content instead of a fixed rem or viewport-height ceiling. It yields space to a readable transcript when the window is short, with its own scrollbar only when the complete form or expanded evidence exceeds the space available. The default four-row input remains manually resizable. Closing the dock restores the original transcript-first layout.
+
+The composer accepts an in-memory draft even when a task is absent, expired, closed, ambiguous, running, or unavailable. Drafting conveys no submission or file authority. Send requires a successful status read reporting `armed` or `completed`, and a failed status poll disables submission until a subsequent successful read. Submission invalidates earlier status reads, and eligibility stays unknown until a successful read that started after submission settled. The textarea remains editable during submission; success clears only an unchanged submitted draft. Polling preserves the draft, focus, and caret; drafts are not persisted across window closure.
 
 The studio contains an emergency-only direct composer backed by the fixed `parley-continuation-broker.exe` installer resource. Codex publishes the immutable manifest through the locked MCP profile; the viewer can only read its bounded status, submit text, cancel the exact running turn, and record display receipt for one exact terminal event. The broker owns state, policy, non-executing Git observation, recursive ignored-file change watching, grant, canary, session, runtime-lock recovery, and evidence integrity. It never executes repository code after Grok writes; tests wait for Codex review. Rust launches it without a console and bounds stdout and stderr; TypeScript never opens files or starts processes.
 

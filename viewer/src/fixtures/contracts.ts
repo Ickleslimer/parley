@@ -17,7 +17,8 @@ export type FixtureScenario =
   | "paused-unread"
   | "collapsed"
   | "expanded"
-  | "completion";
+  | "completion"
+  | "handoff-preview";
 
 export type FixtureInspectorTab = "event" | "activity" | "sources" | "settings";
 
@@ -54,7 +55,12 @@ export const REQUIRED_FIXTURES: readonly FixtureRequest[] = [
   { surface: "detail", scenario: "short-exchange", width: 840, height: 560, textScale: 1, reducedMotion: false, inspectorTab: "activity" },
   { surface: "detail", scenario: "search-results", width: 1120, height: 760, textScale: 1, reducedMotion: false, inspectorTab: "sources" },
   { surface: "detail", scenario: "empty", width: 1120, height: 760, textScale: 1, reducedMotion: false, inspectorTab: "settings" },
+  { surface: "detail", scenario: "empty", width: 840, height: 560, textScale: 1, reducedMotion: false, inspectorTab: "settings" },
+  { surface: "detail", scenario: "empty", width: 840, height: 560, textScale: 2, reducedMotion: false, inspectorTab: "settings" },
+  { surface: "detail", scenario: "empty", width: 1120, height: 760, textScale: 2, reducedMotion: true, inspectorTab: "settings" },
   { surface: "detail", scenario: "source-error", width: 840, height: 560, textScale: 1, reducedMotion: false, inspectorTab: "event" },
   { surface: "detail", scenario: "maximum-exchange", width: 1120, height: 760, textScale: 1, reducedMotion: true, inspectorTab: "event" },
   { surface: "detail", scenario: "maximum-exchange", width: 1120, height: 760, textScale: 2, reducedMotion: false, inspectorTab: "event" },
+  { surface: "detail", scenario: "handoff-preview", width: 1120, height: 760, textScale: 1, reducedMotion: false, inspectorTab: "event" },
+  { surface: "detail", scenario: "handoff-preview", width: 840, height: 560, textScale: 1, reducedMotion: false },
 ] as const;

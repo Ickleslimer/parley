@@ -318,7 +318,9 @@ export function buildInspector(): InspectorNodes {
   const width = numberInput("width", "Width");
   const height = numberInput("height", "Height");
   const widgetVisible = el("input", { attrs: { type: "checkbox", id: "widget-visible" } });
-  const launchAtLogin = el("input", { attrs: { type: "checkbox", id: "launch-at-login" } });
+  const launchAtLogin = el("input", {
+    attrs: { type: "checkbox", id: "launch-at-login", "aria-describedby": "launch-at-login-help" },
+  });
   const saveSettings = el("button", {
     className: "studio-action",
     text: "Save placement",
@@ -338,12 +340,27 @@ export function buildInspector(): InspectorNodes {
     ],
   });
   panels.settings.append(
+    el("section", {
+      className: "studio-startup",
+      attrs: { "aria-labelledby": "startup-heading" },
+      children: [
+        el("h3", { id: "startup-heading", className: "studio-panel-title", text: "Startup" }),
+        el("div", {
+          className: "studio-settings-runtime",
+          children: [labelledControl("Launch Parley at sign-in", launchAtLogin, "field field-check")],
+        }),
+        el("p", {
+          id: "launch-at-login-help",
+          className: "studio-diagnostics",
+          text: "Starts the desktop widget and keeps the conversation viewer in the tray. The full window stays closed until you open it. Changes apply at your next sign-in.",
+        }),
+      ],
+    }),
     settingsForm,
     el("div", {
       className: "studio-settings-runtime",
       children: [
         labelledControl("Widget visible", widgetVisible, "field field-check"),
-        labelledControl("Launch at login", launchAtLogin, "field field-check"),
       ],
     }),
   );

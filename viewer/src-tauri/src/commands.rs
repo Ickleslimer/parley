@@ -117,13 +117,16 @@ pub fn get_conversation_page(
 }
 
 #[tauri::command]
-pub fn search_events(
+pub async fn search_events(
     state: State<'_, AppState>,
     query: String,
     cursor: Option<u64>,
     limit: usize,
-) -> SearchPage {
-    state.engine.search(&query, cursor, limit)
+) -> Result<SearchPage, String> {
+    let engine = std::sync::Arc::clone(&state.engine);
+    tauri::async_runtime::spawn_blocking(move || engine.search(&query, cursor, limit))
+        .await
+        .map_err(|_| "Search could not be completed".to_string())
 }
 
 #[tauri::command]

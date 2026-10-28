@@ -40,6 +40,7 @@ import {
   type ViewerStatus,
 } from "../contracts";
 import type { ViewerApi } from "../ipc";
+import { createSyntheticFixture } from "../fixtures/synthetic-api";
 
 import { mountDetail } from "./detail";
 import { OPEN_LATEST_HANDOFF_LABEL } from "./peer-health";
@@ -532,6 +533,27 @@ describe("conversation studio detail", () => {
     vi.useRealTimers();
   });
 
+  it("shows speech-only response previews while the evidence drawer retains exact handoff records", async () => {
+    vi.useFakeTimers();
+    const fixture = createSyntheticFixture("handoff-preview");
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, fixture.api).stop;
+    await settle();
+    const row = root.querySelector<HTMLButtonElement>('[data-event-key="event:completion"]');
+    const preview = row?.querySelector(".studio-focus-excerpt");
+    expect(preview?.textContent).toBe(fixture.exchanges[0]?.completion?.excerpt);
+    expect(preview?.textContent).toMatch(/^We agree on the narrow preview change/);
+    expect(preview?.textContent).not.toMatch(/HANDOFF_READY|TWO_CHAIRS_HANDOFF|job=|handoff=/);
+    expect(preview?.textContent).toContain("DECISION\nchosen: preserve colleague speech");
+    row?.click();
+    await settle();
+    const exact = root.querySelector(".studio-focus-exact");
+    expect(exact?.textContent).toBe(fixture.events.get("event:completion")?.content);
+    expect(exact?.textContent).toContain("TWO_CHAIRS_HANDOFF_READY_V1");
+    expect(exact?.textContent).toContain("END_TWO_CHAIRS_HANDOFF_READY_V1");
+  });
+
   it("opens the exact widget event in the closed-by-default evidence drawer", async () => {
     vi.useFakeTimers();
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
@@ -784,6 +806,75 @@ describe("conversation studio detail", () => {
     await settle();
     expect(harness.calls.widgetVisible).toEqual([false]);
     expect(harness.calls.launchAtLogin).toEqual([true]);
+  });
+
+  it("puts the shared startup switch before placement and explains its scope", async () => {
+    vi.useFakeTimers();
+    const harness = createApi();
+    harness.api.getSettings = async () => ({ ...DEFAULT_SETTINGS, launchAtLogin: true });
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, harness.api).stop;
+    await settle();
+    chooseUtility(root, "settings");
+    await settle();
+    const startup = root.querySelector(".studio-startup");
+    const control = root.querySelector<HTMLInputElement>("#launch-at-login")!;
+    expect(root.querySelectorAll("#launch-at-login")).toHaveLength(1);
+    expect(control.labels?.[0]?.textContent).toBe("Launch Parley at sign-in");
+    expect(control.checked).toBe(true);
+    expect(control.closest("[hidden]")).toBeNull();
+    expect(control.getAttribute("aria-describedby")).toBe("launch-at-login-help");
+    expect(root.querySelector("#launch-at-login-help")?.textContent).toContain("desktop widget");
+    expect(root.querySelector("#launch-at-login-help")?.textContent).toContain("conversation viewer in the tray");
+    expect(root.querySelector("#launch-at-login-help")?.textContent).toContain("full window stays closed");
+    expect(startup?.nextElementSibling).toBe(root.querySelector(".studio-settings"));
+    control.focus();
+    expect(document.activeElement).toBe(control);
+    expect(harness.calls.launchAtLogin).toEqual([]);
+  });
+
+  it("turns shared startup off and on without changing widget visibility or placement", async () => {
+    vi.useFakeTimers();
+    const harness = createApi();
+    harness.api.getSettings = async () => ({ ...DEFAULT_SETTINGS, launchAtLogin: true });
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, harness.api).stop;
+    await settle();
+    chooseUtility(root, "settings");
+    await settle();
+    const control = root.querySelector<HTMLInputElement>("#launch-at-login")!;
+    control.click();
+    await settle();
+    expect(control.checked).toBe(false);
+    control.click();
+    await settle();
+    expect(control.checked).toBe(true);
+    expect(harness.calls.launchAtLogin).toEqual([false, true]);
+    expect(harness.calls.widgetVisible).toEqual([]);
+    expect(harness.calls.savedSettings).toEqual([]);
+  });
+
+  it("restores the saved startup choice and reports registration failure", async () => {
+    vi.useFakeTimers();
+    const harness = createApi();
+    harness.api.getSettings = async () => ({ ...DEFAULT_SETTINGS, launchAtLogin: true });
+    harness.api.setLaunchAtLogin = async () => {
+      throw new Error("synthetic registration failure");
+    };
+    const root = document.createElement("div");
+    document.body.append(root);
+    stop = mountDetail(root, harness.api).stop;
+    await settle();
+    chooseUtility(root, "settings");
+    await settle();
+    const control = root.querySelector<HTMLInputElement>("#launch-at-login")!;
+    control.click();
+    await settle();
+    expect(control.checked).toBe(true);
+    expect(root.querySelector(".studio-load-error")?.textContent).toContain("update launch at login");
+    expect(root.querySelector(".studio-load-error")?.hasAttribute("hidden")).toBe(false);
   });
 
   it("records one receipt only after the matching terminal row is visibly presented", async () => {

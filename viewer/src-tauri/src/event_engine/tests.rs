@@ -588,6 +588,122 @@ fn widget_feed_projects_speech_while_detail_keeps_raw_protocol_records() {
 }
 
 #[test]
+fn response_previews_omit_valid_handoffs_before_bounding_but_preserve_raw_evidence() {
+    let job_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let handoff_id = "11111111-2222-4333-8444-555555555555";
+    let speech = "We agree on the narrow change.\n\nDECISION\nchosen: retain exact speech 🧪";
+    for line_break in ["\n", "\r\n"] {
+        let log = TempLog::new("response-preview-speech");
+        let report = speech.replace('\n', line_break);
+        let raw = format!(
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job={job_id} handoff={handoff_id} ==={line_break}{report}{line_break}{line_break}TWO_CHAIRS_HANDOFF{line_break}peer: codex{line_break}evidence_class: usage_sample{line_break}incident_id: none{line_break}as_of_ms: 42{line_break}continuity: not_authorized{line_break}=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={handoff_id} ==="
+        );
+        write_lines(
+            &log,
+            &[event_line(
+                "response",
+                "preview-response",
+                "preview-exchange",
+                Some("preview-session"),
+                Some(&raw),
+                1,
+            )],
+        );
+        let engine = watching_engine(&log);
+        let conversation = engine.conversation_page(None, None, 20);
+        let preview = conversation.items[0].completion.as_ref().unwrap();
+        assert_eq!(preview.excerpt, report);
+        assert!(!preview.excerpt_extracted);
+        assert_eq!(preview.content_length, raw.chars().count() as u64);
+        let session = &engine.session_page(None, 20).items[0];
+        assert_eq!(session.latest_excerpt, report);
+        let exchanges = engine.exchange_page(&session.session_key, None, 20);
+        assert_eq!(
+            exchanges.items[0].completion.as_ref().unwrap().excerpt,
+            report
+        );
+        assert_eq!(unique_event(&engine, "preview-response").content, raw);
+        let search = engine.search(job_id, None, 20);
+        assert_eq!(search.total, 1);
+        assert!(search.items[0].excerpt.contains(job_id));
+        let offset = raw[..raw.find(job_id).unwrap()].chars().count() as u64;
+        assert_eq!(search.items[0].match_offset, offset);
+        let marker_search = engine.search("=== TWO_CHAIRS_HANDOFF_READY_V1", None, 20);
+        assert_eq!(marker_search.total, 1);
+        assert!(marker_search.items[0]
+            .excerpt
+            .starts_with("=== TWO_CHAIRS_HANDOFF_READY_V1"));
+        assert_eq!(marker_search.items[0].match_offset, 0);
+    }
+}
+
+#[test]
+fn response_previews_bound_projected_unicode_and_keep_protocol_lookalikes_and_errors_exact() {
+    let job_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let handoff_id = "11111111-2222-4333-8444-555555555555";
+    let prefix = format!("=== TWO_CHAIRS_HANDOFF_READY_V1 job={job_id} handoff={handoff_id} ===");
+    let suffix = format!("=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff={handoff_id} ===");
+    let speech = "🧪界é".repeat(200);
+    let raw = format!("{prefix}\n{speech}\n{suffix}");
+    let bounded: String = speech.chars().take(420).collect();
+    let mismatched = raw.replace(
+        &suffix,
+        "=== END_TWO_CHAIRS_HANDOFF_READY_V1 handoff=22222222-2222-4333-8444-555555555555 ===",
+    );
+    let nested = format!("{prefix}\n{prefix}\nReport\n{suffix}");
+    let cases = [
+        ("response", raw.clone(), bounded),
+        ("error", raw.clone(), raw.chars().take(420).collect()),
+        ("request", raw.clone(), raw.chars().take(420).collect()),
+        ("response", prefix.clone(), prefix.clone()),
+        (
+            "response",
+            mismatched.clone(),
+            mismatched.chars().take(420).collect(),
+        ),
+        ("response", nested.clone(), nested.clone()),
+        (
+            "response",
+            format!("Discuss this marker: {prefix}"),
+            format!("Discuss this marker: {prefix}"),
+        ),
+        (
+            "response",
+            format!("{prefix}\nReport\n{suffix}\nMore prose"),
+            format!("{prefix}\nReport\n{suffix}\nMore prose"),
+        ),
+        (
+            "response",
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job=invalid handoff=invalid ===\nReport".to_string(),
+            "=== TWO_CHAIRS_HANDOFF_READY_V1 job=invalid handoff=invalid ===\nReport".to_string(),
+        ),
+    ];
+    for (event_type, content, expected) in cases {
+        let log = TempLog::new("response-preview-boundaries");
+        write_lines(
+            &log,
+            &[event_line(
+                event_type,
+                "boundary-event",
+                "boundary-exchange",
+                Some("boundary-session"),
+                Some(&content),
+                1,
+            )],
+        );
+        let engine = watching_engine(&log);
+        let page = engine.conversation_page(None, None, 20);
+        let preview = page.items[0]
+            .completion
+            .as_ref()
+            .or(page.items[0].request.as_ref())
+            .unwrap();
+        assert_eq!(preview.excerpt, expected, "{event_type}: {content}");
+        assert_eq!(unique_event(&engine, "boundary-event").content, content);
+    }
+}
+
+#[test]
 fn direct_user_continuations_stay_in_detail_but_not_the_desktop_widget() {
     let log = TempLog::new("direct-user-continuation");
     let raw_request = "=== PARLEY_USER_CONTINUATION_REQUEST_V1 ===\nPlease finish the bounded parser.\n=== PARLEY_CONTINUATION_CONTRACT_V1 ===\nDiagnostic policy text";
@@ -1313,6 +1429,153 @@ fn retrieves_exact_content_above_sixty_thousand_characters() {
     assert_eq!(feed_message.full_character_length, 70_012);
     assert_eq!(feed_message.body.chars().count(), 4_000);
     assert!(content.starts_with(&feed_message.body));
+}
+
+#[test]
+fn searches_large_unicode_records_with_the_reported_query_and_exact_offsets() {
+    let log = TempLog::new("unicode-search");
+    let mut content = format!("🧬{}", "x".repeat(1_000_000));
+    content.push_str("ME target at the end.");
+    write_lines(
+        &log,
+        &[
+            event_line(
+                "request",
+                "request-me",
+                "exchange-me",
+                Some("session-me"),
+                Some(&content),
+                1,
+            ),
+            event_line(
+                "response",
+                "response-me",
+                "exchange-me",
+                Some("session-me"),
+                Some("No match here."),
+                2,
+            ),
+        ],
+    );
+    let engine = watching_engine(&log);
+    let page = engine.search("me", None, 1);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].event_id, "request-me");
+    assert_eq!(page.items[0].match_offset, 1_000_001);
+    assert!(page.items[0].excerpt.starts_with("ME target"));
+    assert!(engine.search("not-in-any-record", None, 1).items.is_empty());
+    assert!(engine.search("me", Some(u64::MAX), 1).items.is_empty());
+}
+
+#[test]
+fn search_snapshot_does_not_block_status_or_widget_reads() {
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
+
+    let log = TempLog::new("search-lock");
+    write_lines(
+        &log,
+        &[event_line(
+            "response",
+            "search-result",
+            "search-exchange",
+            None,
+            Some("message 🧬"),
+            1,
+        )],
+    );
+    let engine = Arc::new(watching_engine(&log));
+    let (scan_ready, ready) = mpsc::channel();
+    let (finish_scan, finish) = mpsc::channel();
+    let search_engine = Arc::clone(&engine);
+    let worker = thread::spawn(move || {
+        search_engine.with_search_snapshot(|snapshots| {
+            scan_ready.send(()).unwrap();
+            finish.recv().unwrap();
+            let pattern = super::search::SearchPattern::new("me");
+            snapshots
+                .into_iter()
+                .map(|(_, snapshot)| snapshot.matches(&pattern).len())
+                .sum::<usize>()
+        })
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (responded, response) = mpsc::channel();
+    let status_engine = Arc::clone(&engine);
+    let status_worker = thread::spawn(move || {
+        let status = status_engine.status();
+        let feed = status_engine.widget_feed(None);
+        responded
+            .send((status.exchange_count, feed.items.len()))
+            .unwrap();
+    });
+    let read_result = response.recv_timeout(Duration::from_secs(2));
+    finish_scan.send(()).unwrap();
+    assert_eq!(worker.join().unwrap(), 1);
+    status_worker.join().unwrap();
+    assert_eq!(read_result.unwrap(), (1, 1));
+}
+
+#[test]
+fn search_snapshot_keeps_exact_evidence_when_sources_are_removed() {
+    let log = TempLog::new("search-generation");
+    write_lines(
+        &log,
+        &[event_line(
+            "response",
+            "original-me",
+            "original-exchange",
+            None,
+            Some("message 🧬"),
+            1,
+        )],
+    );
+    let engine = watching_engine(&log);
+    engine.with_search_snapshot(|snapshots| {
+        engine.set_source(None).unwrap();
+        let pattern = super::search::SearchPattern::new("me");
+        let result = snapshots
+            .into_iter()
+            .flat_map(|(_, snapshot)| snapshot.matches(&pattern))
+            .next()
+            .unwrap()
+            .into_hit();
+        assert_eq!(result.event_id, "original-me");
+        assert_eq!(result.excerpt, "message 🧬");
+        assert!(engine.event_content(&result.event_key).is_none());
+    });
+}
+
+#[test]
+#[ignore = "requires explicit local read-only acceptance logs"]
+fn acceptance_search_real_logs_without_gui() {
+    use std::time::Instant;
+
+    let paths = std::env::var_os("PARLEY_VIEWER_SEARCH_ACCEPTANCE_LOGS")
+        .expect("explicit read-only acceptance paths are required");
+    let engine = EventEngine::new();
+    engine
+        .set_sources(std::env::split_paths(&paths).collect())
+        .unwrap();
+    engine.poll();
+    for query in ["me", "parley-search-absence-canary-2e1a36bb"] {
+        let started = Instant::now();
+        let result = engine.search(query, None, 50);
+        eprintln!(
+            "search acceptance: query={query}, matches={}, page_size={}, elapsed_ms={}",
+            result.total,
+            result.items.len(),
+            started.elapsed().as_millis()
+        );
+        assert!(result.items.len() <= 50);
+        for hit in &result.items {
+            let event = engine
+                .event_content(&hit.event_key)
+                .expect("unchanged source event should resolve");
+            assert_eq!(event.event_id, hit.event_id);
+        }
+    }
 }
 
 #[test]

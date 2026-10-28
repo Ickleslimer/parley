@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::excerpt::{excerpt, parse_context_diagnostics, widget_projection, window_from};
 use super::keys::KeyContext;
 use super::parse::ParsedEvent;
+use super::search::SearchPattern;
 use super::types::{
     clamp_page_limit, speakers, EventContent, EventType, ExchangeSummary, MessagePreview,
     SearchHit, SessionSummary, WidgetFeedExchange, WidgetFeedMessage, PENDING_LABEL,
@@ -46,7 +48,7 @@ struct SessionAcc {
 
 #[derive(Debug, Default)]
 pub(crate) struct Store {
-    events: Vec<StoredEvent>,
+    events: Vec<Arc<StoredEvent>>,
     by_event_id: HashMap<String, usize>,
     exchanges: HashMap<String, ExchangeAcc>,
     sessions: HashMap<String, SessionAcc>,
@@ -125,7 +127,7 @@ impl Store {
         self.by_event_id.insert(stored.event_id.clone(), idx);
         self.upsert_exchange(&stored, idx);
         self.upsert_session(&stored);
-        self.events.push(stored);
+        self.events.push(Arc::new(stored));
         true
     }
 
@@ -275,31 +277,15 @@ impl Store {
         Some(self.widget_feed_message_at(idx, keys, false))
     }
 
-    pub(crate) fn all_search_hits(&self, query: &str, keys: KeyContext<'_>) -> Vec<SearchHit> {
-        let query = query.trim();
-        if query.is_empty() {
-            return Vec::new();
+    pub(crate) fn search_snapshot(&self, keys: KeyContext<'_>) -> SearchSnapshot {
+        SearchSnapshot {
+            events: self.events.clone(),
+            keys: Arc::new(SearchKeys {
+                source_id: keys.source_id.to_string(),
+                generation: keys.generation,
+                path: keys.path.to_string(),
+            }),
         }
-        self.events
-            .iter()
-            .filter_map(|event| {
-                let text = preview_text(event);
-                let match_offset = find_ignore_case(text, query)?;
-                Some(SearchHit {
-                    event_key: keys.event_key(&event.event_id),
-                    exchange_key: keys.exchange_key(&event.exchange_id),
-                    session_key: keys.session_key(&event.session_id),
-                    event_id: event.event_id.clone(),
-                    exchange_id: event.exchange_id.clone(),
-                    session_id: event.session_id.clone(),
-                    source_path: keys.path.to_string(),
-                    event_type: event.event_type,
-                    timestamp_ms: event.timestamp_ms,
-                    excerpt: window_from(text, match_offset),
-                    match_offset: match_offset as u64,
-                })
-            })
-            .collect()
     }
 
     pub(crate) fn event_content(
@@ -444,8 +430,13 @@ impl Store {
     fn preview(&self, event: &StoredEvent, keys: KeyContext<'_>) -> MessagePreview {
         let (speaker, recipient) = speakers(event.event_type, &event.source, &event.target);
         let text = preview_text(event);
+        let visible_text = if event.event_type == EventType::Response {
+            widget_projection(text, event.event_type, &event.exchange_id).text
+        } else {
+            text
+        };
         let (excerpt, excerpt_extracted) = excerpt(
-            text,
+            visible_text,
             event.event_type == EventType::Request,
             &event.exchange_id,
         );
@@ -544,31 +535,74 @@ pub(crate) fn page<T: Clone, R>(
     finish(items[start..end].to_vec(), next, total)
 }
 
-pub(crate) fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    if haystack.is_ascii() && needle.is_ascii() {
-        let hay = haystack.as_bytes();
-        let ned = needle.as_bytes();
-        if ned.len() > hay.len() {
-            return None;
-        }
-        for start in 0..=hay.len() - ned.len() {
-            if hay[start..start + ned.len()].eq_ignore_ascii_case(ned) {
-                return Some(start);
-            }
-        }
-        return None;
-    }
-    let needle_lower = needle.to_lowercase();
-    for (char_index, (byte_index, _)) in haystack.char_indices().enumerate() {
-        if haystack[byte_index..]
-            .to_lowercase()
-            .starts_with(&needle_lower)
-        {
-            return Some(char_index);
+#[derive(Debug)]
+struct SearchKeys {
+    source_id: String,
+    generation: u64,
+    path: String,
+}
+
+impl SearchKeys {
+    fn context(&self) -> KeyContext<'_> {
+        KeyContext {
+            source_id: &self.source_id,
+            generation: self.generation,
+            path: &self.path,
         }
     }
-    None
+}
+
+pub(crate) struct SearchSnapshot {
+    events: Vec<Arc<StoredEvent>>,
+    keys: Arc<SearchKeys>,
+}
+
+pub(crate) struct SearchMatch {
+    event: Arc<StoredEvent>,
+    keys: Arc<SearchKeys>,
+    offset: usize,
+}
+
+impl SearchSnapshot {
+    pub(crate) fn matches(&self, pattern: &SearchPattern) -> Vec<SearchMatch> {
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let offset = pattern.find(preview_text(event))?;
+                Some(SearchMatch {
+                    event: Arc::clone(event),
+                    keys: Arc::clone(&self.keys),
+                    offset,
+                })
+            })
+            .collect()
+    }
+}
+
+impl SearchMatch {
+    pub(crate) fn timestamp_ms(&self) -> u64 {
+        self.event.timestamp_ms
+    }
+
+    pub(crate) fn event_id(&self) -> &str {
+        &self.event.event_id
+    }
+
+    pub(crate) fn into_hit(self) -> SearchHit {
+        let event = self.event;
+        let keys = self.keys.context();
+        SearchHit {
+            event_key: keys.event_key(&event.event_id),
+            exchange_key: keys.exchange_key(&event.exchange_id),
+            session_key: keys.session_key(&event.session_id),
+            event_id: event.event_id.clone(),
+            exchange_id: event.exchange_id.clone(),
+            session_id: event.session_id.clone(),
+            source_path: keys.path.to_string(),
+            event_type: event.event_type,
+            timestamp_ms: event.timestamp_ms,
+            excerpt: window_from(preview_text(&event), self.offset),
+            match_offset: self.offset as u64,
+        }
+    }
 }

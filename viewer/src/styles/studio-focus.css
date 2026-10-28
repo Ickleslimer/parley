@@ -52,6 +52,21 @@
   position: relative;
 }
 
+[data-region="studio-header"] button:not([role="menuitem"]),
+[data-region="studio-search"] button,
+[data-region="studio-transcript"] .studio-focus-jump,
+[data-region="studio-transcript"] .studio-focus-earlier,
+[data-region="studio-drawer"] .studio-focus-close,
+[data-region="studio-drawer"] .studio-action,
+[data-region="studio-drawer"] .studio-source-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  line-height: 1.25;
+  text-align: center;
+}
+
 [data-region="studio-header"] button,
 [data-region="studio-transcript"] button,
 [data-region="studio-drawer"] button,
@@ -80,7 +95,8 @@
   display: flex;
   flex-direction: column;
   min-width: 12rem;
-  padding: 4px;
+  padding: 0;
+  border: 2px solid var(--line);
   background: var(--paper-raised);
   color: var(--ink);
   border-radius: var(--radius-paper);
@@ -95,15 +111,36 @@
   width: 100%;
   padding: 8px 12px;
   border: 0;
-  border-radius: var(--radius-paper);
+  border-radius: 0;
   background: transparent;
   color: var(--ink);
   text-align: left;
 }
 
+[data-region="studio-header"] [role="menuitem"] + [role="menuitem"] {
+  border-top: 1px solid var(--line);
+}
+
+[data-region="studio-header"] [role="menuitem"]:first-child {
+  border-radius: calc(var(--radius-paper) - 2px) calc(var(--radius-paper) - 2px) 0 0;
+}
+
+[data-region="studio-header"] [role="menuitem"]:last-child {
+  border-radius: 0 0 calc(var(--radius-paper) - 2px) calc(var(--radius-paper) - 2px);
+}
+
+[data-region="studio-header"] .studio-focus-utility-count:empty {
+  display: none;
+}
+
 [data-region="studio-header"] .studio-focus-utility-count {
   margin-left: 6px;
   color: var(--ink-muted);
+}
+
+[data-region="studio-header"] [data-region="studio-utilities"]:hover:not(:disabled) {
+  background: var(--paper-dim);
+  border-color: var(--codex-mark);
 }
 
 [data-region="studio-header"] [data-region="studio-exit"] {
@@ -264,6 +301,9 @@
 }
 
 [data-region="studio-drawer"] .studio-focus-exact {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-family: var(--exact-font);

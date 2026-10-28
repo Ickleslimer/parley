@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -202,7 +202,7 @@ pub enum SurfaceCorrectionDecision {
 
 #[derive(Debug)]
 pub struct AppState {
-    pub engine: EventEngine,
+    pub engine: Arc<EventEngine>,
     settings: Mutex<SettingsFile>,
     settings_path: PathBuf,
     runtime: Mutex<RuntimeFlags>,
@@ -213,7 +213,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(settings_path: PathBuf, settings: SettingsFile) -> Self {
         Self {
-            engine: EventEngine::new(),
+            engine: Arc::new(EventEngine::new()),
             settings: Mutex::new(settings),
             settings_path,
             runtime: Mutex::new(RuntimeFlags::default()),
@@ -495,6 +495,10 @@ impl AppState {
 
     pub fn defer_surface_startup(&self) {
         self.lock_runtime().surface_startup_deferred = true;
+    }
+
+    pub fn surface_startup_attempt_count(&self) -> usize {
+        self.lock_runtime().surface_startup_attempts
     }
 
     pub fn mark_surface_primed(&self) {
@@ -912,6 +916,30 @@ mod tests {
             state.surface_startup_attempt_decision(2),
             SurfaceCorrectionDecision::Attempt
         );
+    }
+
+    #[test]
+    fn reading_startup_attempt_count_does_not_change_retry_decisions() {
+        let state = AppState::new(PathBuf::from("settings.json"), SettingsFile::default());
+        state.initialize_desktop_mode(DesktopMode::Interactive);
+        assert_eq!(state.surface_startup_attempt_count(), 0);
+        for attempt in 1..=3 {
+            assert_eq!(
+                state.surface_startup_attempt_decision(
+                    (attempt - 1) as u64 * SURFACE_CORRECTION_RETRY_MS
+                ),
+                SurfaceCorrectionDecision::Attempt
+            );
+            assert_eq!(state.surface_startup_attempt_count(), attempt);
+            assert_eq!(state.surface_startup_attempt_count(), attempt);
+        }
+        assert_eq!(
+            state.surface_startup_attempt_decision(3 * SURFACE_CORRECTION_RETRY_MS),
+            SurfaceCorrectionDecision::Exhausted
+        );
+        assert_eq!(state.surface_startup_attempt_count(), 3);
+        state.mark_surface_primed();
+        assert_eq!(state.surface_startup_attempt_count(), 0);
     }
 
     #[test]

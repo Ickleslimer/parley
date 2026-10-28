@@ -43,6 +43,9 @@ export function buildContinuationSection(
   options: ContinuationSectionOptions = {},
 ): ContinuationController {
   let status: ContinuationStatus | null = null;
+  let statusAvailable = false;
+  let statusGeneration = 0;
+  let statusReadSequence = 0;
   let error: string | null = null;
   let submitPending = false;
   let controlPending = false;
@@ -91,10 +94,16 @@ export function buildContinuationSection(
     className: "continuation-input",
     attrs: {
       id: "continuation-message",
-      rows: "6",
+      rows: "4",
       maxlength: String(MAX_MESSAGE_CHARS),
-      placeholder: "Tell Grok what to finish within the published task…",
+      placeholder: "Write a message to Grok…",
+      "aria-describedby": "continuation-draft-help",
     },
+  });
+  const draftHelp = el("p", {
+    className: "continuation-meta",
+    attrs: { id: "continuation-draft-help" },
+    text: "You can draft here while sending is unavailable. Send requires an active published task. Drafts stay in this window until it closes.",
   });
   const characterCount = el("span", {
     className: "continuation-count",
@@ -114,6 +123,7 @@ export function buildContinuationSection(
     className: "continuation-form",
     children: [
       labelledControl("Message", textarea, "continuation-field"),
+      draftHelp,
       el("div", {
         className: "continuation-form-footer",
         children: [characterCount, send, cancel],
@@ -155,6 +165,9 @@ export function buildContinuationSection(
     children: [composer],
   });
 
+  const canSubmit = (): boolean =>
+    statusAvailable && (status?.state === "armed" || status?.state === "completed");
+
   const paint = (): void => {
     const state = status?.state ?? "loading";
     setText(availability, availabilityLabel(status, error));
@@ -168,9 +181,7 @@ export function buildContinuationSection(
     actionError.hidden = error == null;
     setText(actionError, error ?? "");
 
-    const canSubmit = state === "armed" || state === "completed";
-    textarea.disabled = !canSubmit || submitPending;
-    send.disabled = !canSubmit || submitPending || textarea.value.trim().length === 0;
+    send.disabled = !canSubmit() || submitPending || textarea.value.trim().length === 0;
     cancel.hidden = state !== "running";
     cancel.disabled = state !== "running" || controlPending || !status?.runningContinuationId;
 
@@ -262,17 +273,21 @@ export function buildContinuationSection(
   };
 
   const refresh = async (): Promise<void> => {
+    const generation = statusGeneration;
+    const sequence = ++statusReadSequence;
     try {
       const next = await api.getContinuationStatus();
-      if (stopped) {
+      if (stopped || generation !== statusGeneration || sequence !== statusReadSequence) {
         return;
       }
       status = next;
+      statusAvailable = true;
       error = null;
     } catch {
-      if (stopped) {
+      if (stopped || generation !== statusGeneration || sequence !== statusReadSequence) {
         return;
       }
+      statusAvailable = false;
       error = "Direct continuation status is unavailable.";
     }
     paint();
@@ -285,22 +300,25 @@ export function buildContinuationSection(
   });
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    if (submitPending || textarea.disabled || textarea.value.trim().length === 0) {
+    if (!canSubmit() || submitPending || textarea.value.trim().length === 0) {
       return;
     }
     const text = textarea.value;
+    statusGeneration += 1;
+    statusAvailable = false;
     submitPending = true;
     error = null;
     paint();
     void api
       .submitContinuation(text)
-      .then(async () => {
+      .then(() => {
         if (stopped) {
           return;
         }
-        textarea.value = "";
-        setText(characterCount, `0 / ${MAX_MESSAGE_CHARS}`);
-        await refresh();
+        if (textarea.value === text) {
+          textarea.value = "";
+          setText(characterCount, `0 / ${MAX_MESSAGE_CHARS}`);
+        }
       })
       .catch(() => {
         if (!stopped) {
@@ -309,6 +327,8 @@ export function buildContinuationSection(
       })
       .finally(() => {
         if (!stopped) {
+          statusGeneration += 1;
+          statusAvailable = false;
           submitPending = false;
           paint();
         }
