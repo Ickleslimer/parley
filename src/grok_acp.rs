@@ -736,6 +736,7 @@ fn acp_invocation(request: &AcpRequest<'_>, profile_path: &str) -> Invocation {
             "stdio".to_string(),
         ],
     )
+    .isolate_handoff_environment()
     .with_env("GROK_ACTIVE_AGENT_MESSAGES", "0")
     .with_env("GROK_WORKFLOWS", "0")
     .with_env("GROK_MEMORY", "0")

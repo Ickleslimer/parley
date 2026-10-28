@@ -755,6 +755,22 @@ pub(crate) fn run_prepared_with_execution_lease(
     _execution_lease: &ExecutionLease,
 ) -> Result<AskOutcome, AskFailure> {
     let exchange_id = ExchangeLog::allocate_exchange_id();
+    if !req.images.is_empty() {
+        let target = req
+            .resume_id
+            .as_deref()
+            .ok_or_else(|| "image_session_required".to_string())
+            .and_then(|id| session::validate_grok_image_session(id, &req.cwd));
+        if let Err(error) = target {
+            return Err(preflight_failure(
+                req,
+                &req.prompt,
+                exchange_id,
+                "image_preflight_error",
+                &format!("image session validation failed; agent was not started: {error}"),
+            ));
+        }
+    }
     let resolved = match resolve_prompt(req, &exchange_id, false) {
         Ok(resolved) => resolved,
         Err(error) => {

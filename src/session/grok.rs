@@ -90,6 +90,76 @@ impl SessionStore for GrokSessions {
 }
 
 impl GrokSessions {
+    pub(crate) fn validate_image_session(&self, id: &str, cwd: &Path) -> Result<(), String> {
+        if id.len() != 36
+            || !id.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+        {
+            return Err("image_session_id_invalid".to_string());
+        }
+        let requested =
+            fs::canonicalize(cwd).map_err(|_| "image_session_cwd_unavailable".to_string())?;
+        let root = self.root().ok_or("image_session_store_unavailable")?;
+        let root =
+            fs::canonicalize(root).map_err(|_| "image_session_store_unavailable".to_string())?;
+        let entries =
+            fs::read_dir(&root).map_err(|_| "image_session_store_unavailable".to_string())?;
+        let mut summaries = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| "image_session_store_unavailable".to_string())?;
+            if !entry
+                .file_type()
+                .map_err(|_| "image_session_store_unavailable".to_string())?
+                .is_dir()
+            {
+                continue;
+            }
+            let directory = entry.path().join(id);
+            if directory
+                .try_exists()
+                .map_err(|_| "image_session_summary_unavailable".to_string())?
+            {
+                crate::context::refuse_reparse_chain(&directory)
+                    .map_err(|_| "image_session_summary_unsafe".to_string())?;
+                summaries.push(directory.join("summary.json"));
+            }
+        }
+        let summary = match summaries.as_slice() {
+            [] => return Err("image_session_not_found".to_string()),
+            [summary] => summary,
+            _ => return Err("image_session_ambiguous".to_string()),
+        };
+        crate::context::refuse_reparse_chain(summary)
+            .map_err(|_| "image_session_summary_unsafe".to_string())?;
+        let metadata =
+            fs::metadata(summary).map_err(|_| "image_session_summary_unavailable".to_string())?;
+        if !metadata.is_file() || metadata.len() > 256 * 1024 {
+            return Err("image_session_summary_invalid".to_string());
+        }
+        let raw = fs::read_to_string(summary)
+            .map_err(|_| "image_session_summary_unavailable".to_string())?;
+        let record = Json::parse(&raw).map_err(|_| "image_session_summary_invalid".to_string())?;
+        if summary_id(&record) != Some(id) {
+            return Err("image_session_summary_identity_mismatch".to_string());
+        }
+        let stored = record
+            .get("info")
+            .and_then(|info| info.get("cwd"))
+            .and_then(Json::as_str)
+            .ok_or("image_session_summary_invalid")?;
+        let stored = fs::canonicalize(stored)
+            .map_err(|_| "image_session_stored_cwd_unavailable".to_string())?;
+        if !paths_match(&stored, &requested) {
+            return Err("image_session_cwd_mismatch".to_string());
+        }
+        Ok(())
+    }
+
     fn root(&self) -> Option<PathBuf> {
         self.root_override.clone().or_else(|| {
             let home = env::var_os("GROK_HOME").map(PathBuf::from).or_else(|| {
@@ -284,6 +354,68 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].text, "hello");
         assert_eq!(turns[1].text, "world");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_target_validates_id_canonical_cwd_and_distinct_failure_classes() {
+        let (root, cwd, id) = fixture();
+        let store = GrokSessions::at(root.join("sessions"));
+        assert!(store.validate_image_session(&id, &cwd.join(".")).is_ok());
+        let other = root.join("other");
+        fs::create_dir(&other).unwrap();
+        assert_eq!(
+            store.validate_image_session(&id, &other).unwrap_err(),
+            "image_session_cwd_mismatch"
+        );
+        assert_eq!(
+            store
+                .validate_image_session(&id, &root.join("missing"))
+                .unwrap_err(),
+            "image_session_cwd_unavailable"
+        );
+        assert_eq!(
+            store
+                .validate_image_session("../outside", &cwd)
+                .unwrap_err(),
+            "image_session_id_invalid"
+        );
+        assert_eq!(
+            store
+                .validate_image_session("00000000-0000-0000-0000-000000000000", &cwd)
+                .unwrap_err(),
+            "image_session_not_found"
+        );
+        let summary = root.join("sessions/encoded").join(&id).join("summary.json");
+        fs::write(&summary, "{").unwrap();
+        assert_eq!(
+            store.validate_image_session(&id, &cwd).unwrap_err(),
+            "image_session_summary_invalid"
+        );
+        fs::remove_file(&summary).unwrap();
+        assert_eq!(
+            store.validate_image_session(&id, &cwd).unwrap_err(),
+            "image_session_summary_unavailable"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_native_image_session_identity_is_ambiguous() {
+        let (root, cwd, id) = fixture();
+        let duplicate = root.join("sessions/second").join(&id);
+        fs::create_dir_all(&duplicate).unwrap();
+        fs::copy(
+            root.join("sessions/encoded").join(&id).join("summary.json"),
+            duplicate.join("summary.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            GrokSessions::at(root.join("sessions"))
+                .validate_image_session(&id, &cwd)
+                .unwrap_err(),
+            "image_session_ambiguous"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
