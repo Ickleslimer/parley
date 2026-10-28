@@ -23,6 +23,16 @@ pub(crate) struct SafeActivity {
     pub visible_text: Option<String>,
 }
 
+pub(crate) trait ManagedActivityObserver: Send + Sync {
+    fn configure_image_invocation(
+        &self,
+        invocation: &mut crate::harness::Invocation,
+    ) -> Result<(), String>;
+    fn activity(&self, activity: SafeActivity) -> Result<(), String>;
+    fn pause_execution_clock(&self) -> bool;
+    fn timeout_reason(&self) -> Option<String>;
+}
+
 pub(crate) fn decode_stream_line(
     line: &str,
     timestamp_ms: u128,

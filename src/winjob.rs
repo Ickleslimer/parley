@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{c_void, OsStr, OsString};
 use std::fs::File;
@@ -284,7 +284,7 @@ where
     })?;
     let mut application = wide_null(executable.as_os_str());
     let mut command_line = build_command_line(&executable, &invocation.args);
-    let mut environment = build_environment(&invocation.env);
+    let mut environment = build_environment(&invocation.env, &invocation.remove_inherited_env);
     let cwd = cwd
         .map(PathBuf::from)
         .or_else(|| env::current_dir().ok())
@@ -595,8 +595,20 @@ fn quote_windows_arg(value: &str) -> String {
     quoted
 }
 
-fn build_environment(overrides: &BTreeMap<String, String>) -> Vec<u16> {
-    let mut values = env::vars_os().collect::<Vec<(OsString, OsString)>>();
+fn build_environment(overrides: &BTreeMap<String, String>, removed: &BTreeSet<String>) -> Vec<u16> {
+    build_environment_from(env::vars_os().collect(), overrides, removed)
+}
+
+fn build_environment_from(
+    mut values: Vec<(OsString, OsString)>,
+    overrides: &BTreeMap<String, String>,
+    removed: &BTreeSet<String>,
+) -> Vec<u16> {
+    values.retain(|(existing, _)| {
+        !removed
+            .iter()
+            .any(|name| existing.to_string_lossy().eq_ignore_ascii_case(name))
+    });
     for (key, value) in overrides {
         values.retain(|(existing, _)| !existing.to_string_lossy().eq_ignore_ascii_case(key));
         values.push((OsString::from(key), OsString::from(value)));
@@ -637,6 +649,64 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn native_environment_removes_case_variants_and_restores_only_current_binding() {
+        let isolated = Invocation::new("grok", Vec::new()).isolate_handoff_environment();
+        let inherited = isolated
+            .remove_inherited_env
+            .iter()
+            .map(|name| {
+                (
+                    OsString::from(name.to_lowercase()),
+                    OsString::from("stale-A"),
+                )
+            })
+            .chain([(OsString::from("KEEP"), OsString::from("unchanged"))])
+            .collect::<Vec<_>>();
+        let decode = |block: Vec<u16>| {
+            String::from_utf16(&block)
+                .unwrap()
+                .split('\0')
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let clean = decode(build_environment_from(
+            inherited.clone(),
+            &isolated.env,
+            &isolated.remove_inherited_env,
+        ));
+        assert_eq!(clean, vec!["KEEP=unchanged"]);
+        let mut overrides = BTreeMap::new();
+        for name in &isolated.remove_inherited_env {
+            overrides.insert(name.clone(), "current-B".to_string());
+        }
+        overrides.insert(
+            "PARLEY_HANDOFF_SOURCE_SESSION_ID".to_string(),
+            "unavailable".to_string(),
+        );
+        overrides.insert(
+            "PARLEY_HANDOFF_TARGET_SESSION_ID".to_string(),
+            "unavailable".to_string(),
+        );
+        let bound = decode(build_environment_from(
+            inherited.clone(),
+            &overrides,
+            &isolated.remove_inherited_env,
+        ));
+        assert_eq!(bound.len(), 8);
+        assert!(!bound.iter().any(|entry| entry.contains("stale-A")));
+        assert!(bound.contains(&"PARLEY_HANDOFF_TARGET_SESSION_ID=unavailable".to_string()));
+        let other = decode(build_environment_from(
+            inherited,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        ));
+        assert!(other
+            .iter()
+            .any(|entry| entry == "parley_handoff_state_dir=stale-A"));
+    }
 
     #[link(name = "kernel32")]
     extern "system" {

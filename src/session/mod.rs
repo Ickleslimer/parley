@@ -325,6 +325,10 @@ pub(crate) fn list_sessions_json(cwd: &Path, harness_filter: Option<&str>) -> Js
     sessions_to_json(&sessions, cwd)
 }
 
+pub(crate) fn validate_grok_image_session(id: &str, cwd: &Path) -> Result<(), String> {
+    grok::GrokSessions::default().validate_image_session(id, cwd)
+}
+
 pub(crate) fn last_session_json(cwd: &Path, harness_filter: Option<&str>) -> Option<Json> {
     let sessions = list_all(cwd, harness_filter);
     sessions.first().map(|s| session_to_json(s, cwd))

@@ -22,15 +22,28 @@ const CONSUMED_FILE: &str = ".consumed";
 const DELIVERED_FILE: &str = ".delivered";
 const HEALTH_CONSUMED_FILE: &str = ".health-consumed";
 const HEALTH_DELIVERED_FILE: &str = ".health-delivered";
+const HANDOFF_RECEIVED_FILE: &str = ".handoff-received";
 const BROKER_TOOL: &str = "get_attached_images";
 const HEALTH_TOOL: &str = "get_peer_health";
+const WAIT_TOOL: &str = "wait_for_codex_receipt";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 static NEXT_BUNDLE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ImageAttachment {
     source: PathBuf,
+    expected_digest: Option<String>,
     inspected: Option<Arc<InspectedImage>>,
+}
+
+impl std::fmt::Debug for ImageAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImageAttachment")
+            .field("expected_digest", &self.expected_digest)
+            .field("inspected", &self.inspected.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -45,6 +58,7 @@ struct InspectedImage {
 
 pub(crate) struct ImageBundle {
     root: PathBuf,
+    state_root: PathBuf,
     cleaned: bool,
 }
 
@@ -52,8 +66,35 @@ impl ImageAttachment {
     pub(crate) fn source(path: impl Into<PathBuf>) -> Self {
         Self {
             source: path.into(),
+            expected_digest: None,
             inspected: None,
         }
+    }
+
+    pub(crate) fn asynchronous_source(path: PathBuf, digest: String) -> Result<Self, String> {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|value| matches!(value, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(
+                "async image sha256 must be 64 lowercase hexadecimal characters".to_string(),
+            );
+        }
+        if !path.is_absolute() {
+            return Err("async image path must be absolute".to_string());
+        }
+        Ok(Self {
+            source: path,
+            expected_digest: Some(digest),
+            inspected: None,
+        })
+    }
+
+    pub(crate) fn expected_digest(&self) -> Result<&str, String> {
+        self.expected_digest
+            .as_deref()
+            .ok_or_else(|| "async image requires an expected SHA-256 digest".to_string())
     }
 
     fn inspected(&self) -> Result<&InspectedImage, String> {
@@ -65,15 +106,22 @@ impl ImageAttachment {
 
 impl ImageBundle {
     pub(crate) fn stage(images: &[ImageAttachment], max_age: Duration) -> Result<Self, String> {
+        Self::stage_in(images, &state_root()?, max_age)
+    }
+
+    pub(crate) fn stage_in(
+        images: &[ImageAttachment],
+        state_root: &Path,
+        max_age: Duration,
+    ) -> Result<Self, String> {
         if images.is_empty() || images.len() > MAX_IMAGES {
             return Err(format!(
                 "image attachment count must be between 1 and {MAX_IMAGES}"
             ));
         }
-        let state_root = state_root()?;
-        ensure_state_root(&state_root)?;
-        cleanup_stale_bundles(&state_root, max_age)?;
-        let root = create_bundle_dir(&state_root)?;
+        ensure_state_root(state_root)?;
+        cleanup_stale_bundles(state_root, max_age)?;
+        let root = create_bundle_dir(state_root)?;
         let result = (|| {
             for (index, image) in images.iter().enumerate() {
                 let inspected = image.inspected()?;
@@ -95,11 +143,12 @@ impl ImageBundle {
             Ok(())
         })();
         if let Err(error) = result {
-            let _ = remove_bundle_dir(&state_root, &root);
+            let _ = remove_bundle_dir(state_root, &root);
             return Err(error);
         }
         Ok(Self {
             root,
+            state_root: state_root.to_path_buf(),
             cleaned: false,
         })
     }
@@ -120,11 +169,50 @@ impl ImageBundle {
         if self.cleaned {
             return Ok(());
         }
-        let state_root = state_root()?;
-        remove_bundle_dir(&state_root, &self.root)?;
+        remove_bundle_dir(&self.state_root, &self.root)?;
         self.cleaned = true;
         Ok(())
     }
+
+    pub(crate) fn validate_handoff_consumption(&self) -> Result<(), String> {
+        validate_delivery_marker(&self.root, HANDOFF_RECEIVED_FILE, "handoff receipt")
+    }
+}
+
+pub(crate) fn cleanup_job_stage(root: &Path) -> Result<(), String> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let id = name.strip_prefix("job-").unwrap_or("");
+    if id.len() != 36
+        || !id.bytes().enumerate().all(|(index, value)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                value == b'-'
+            } else {
+                matches!(value, b'0'..=b'9' | b'a'..=b'f')
+            }
+        })
+    {
+        return Err("refusing unknown image job stage identity".to_string());
+    }
+    refuse_reparse_chain(root).map_err(|_| "image job stage is unsafe".to_string())?;
+    for entry in fs::read_dir(root).map_err(|_| "read image job stage failed".to_string())? {
+        let entry = entry.map_err(|_| "read image job stage failed".to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|_| "inspect image job stage failed".to_string())?
+            .is_dir()
+            || !is_owned_bundle_name(&entry.file_name().to_string_lossy())
+        {
+            return Err("refusing unknown image job stage entry".to_string());
+        }
+        remove_bundle_dir(root, &entry.path())?;
+    }
+    fs::remove_dir(root).map_err(|_| "remove empty image job stage failed".to_string())
 }
 
 impl Drop for ImageBundle {
@@ -182,8 +270,16 @@ pub(crate) fn inspect_all(
             ));
         }
         let format = inspect_bytes(&bytes).map_err(|error| format!("image {ordinal}: {error}"))?;
+        let digest = hex_encode(&sha256(&bytes));
+        if image
+            .expected_digest
+            .as_ref()
+            .is_some_and(|expected| expected != &digest)
+        {
+            return Err(format!("image {ordinal}: content hash mismatch"));
+        }
         image.inspected = Some(Arc::new(InspectedImage {
-            digest: hex_encode(&sha256(&bytes)),
+            digest,
             bytes: Arc::from(bytes),
             mime_type: format.mime_type,
             extension: format.extension,
@@ -264,7 +360,10 @@ pub(crate) fn run_private_mcp_from_env() -> Result<(), String> {
             ),
             "tools/list" => rpc_result(
                 id,
-                tools_list(env::var_os("PARLEY_IMAGE_HEALTH_QUERY_EXE").is_some()),
+                tools_list(
+                    env::var_os("PARLEY_IMAGE_HEALTH_QUERY_EXE").is_some(),
+                    env::var_os("PARLEY_IMAGE_HANDOFF_WAIT_EXE").is_some(),
+                ),
             ),
             "tools/call" => match call_private_tool(&root, &request) {
                 Ok(result) => rpc_result(id, result),
@@ -299,16 +398,17 @@ fn call_private_tool(root: &Path, request: &Json) -> Result<Json, String> {
         .get("params")
         .ok_or_else(|| "invalid image-tool request".to_string())?;
     let name = params.get("name").and_then(Json::as_str).unwrap_or("");
-    if params
-        .get("arguments")
-        .and_then(Json::as_object)
-        .is_some_and(|arguments| !arguments.is_empty())
-    {
+    if params.get("arguments").is_some_and(|arguments| {
+        arguments
+            .as_object()
+            .is_none_or(|arguments| !arguments.is_empty())
+    }) {
         return Err("image tool accepts no arguments".to_string());
     }
     match name {
         BROKER_TOOL => call_image_tool(root),
         HEALTH_TOOL => call_health_tool(root),
+        WAIT_TOOL => call_wait_tool(root),
         _ => Err("unknown private tool".to_string()),
     }
 }
@@ -341,6 +441,118 @@ fn call_image_tool(root: &Path) -> Result<Json, String> {
         ("content", Json::Array(content)),
         ("isError", Json::Bool(false)),
     ]))
+}
+
+fn call_wait_tool(root: &Path) -> Result<Json, String> {
+    let executable = env::var_os("PARLEY_IMAGE_HANDOFF_WAIT_EXE")
+        .map(PathBuf::from)
+        .ok_or_else(|| "private handoff wait is unavailable".to_string())?;
+    if !executable.is_absolute() || !executable.is_file() {
+        return Err("private handoff wait helper is unavailable".to_string());
+    }
+    refuse_reparse_chain(&executable)
+        .map_err(|_| "private handoff wait helper is unsafe".to_string())?;
+    validate_delivery_marker(root, DELIVERED_FILE, "attached images")?;
+    if env::var_os("PARLEY_IMAGE_HEALTH_QUERY_EXE").is_some() {
+        validate_delivery_marker(root, HEALTH_DELIVERED_FILE, "peer health")?;
+    }
+    let slice = env::var("PARLEY_HANDOFF_WAIT_SLICE_SEC")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=300).contains(value))
+        .ok_or_else(|| "private handoff wait binding is invalid".to_string())?;
+    let mut command = Command::new(executable);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| "private handoff wait did not start".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "private handoff wait has no output".to_string())?;
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(65_537).read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(slice.saturating_add(5)) => {
+                thread::sleep(Duration::from_millis(50))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("private handoff wait failed or timed out".to_string());
+            }
+        }
+    };
+    let bytes = reader
+        .join()
+        .map_err(|_| "private handoff wait reader failed".to_string())?
+        .map_err(|_| "private handoff wait output failed".to_string())?;
+    if !status.success() || bytes.len() > 65_536 {
+        return Err("private handoff wait was refused".to_string());
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "private handoff wait returned invalid text".to_string())?;
+    let result = Json::parse_exact(text.trim())
+        .map_err(|_| "private handoff wait returned invalid JSON".to_string())?;
+    let receipt_state = wait_receipt_state(&result)?;
+    match receipt_state {
+        "received" => create_marker(
+            root,
+            HANDOFF_RECEIVED_FILE,
+            "private receipt was already delivered",
+            "private receipt delivery could not be recorded",
+        )?,
+        "pending" => {}
+        _ => unreachable!(),
+    }
+    let projection = wait_projection(receipt_state);
+    Ok(object(vec![
+        (
+            "content",
+            Json::Array(vec![object(vec![
+                ("type", Json::Str("text".to_string())),
+                ("text", Json::Str(projection.to_compact_string())),
+            ])]),
+        ),
+        ("isError", Json::Bool(false)),
+    ]))
+}
+
+fn wait_receipt_state(result: &Json) -> Result<&str, String> {
+    if result.get("schema_version").and_then(Json::as_number) != Some(1.0)
+        || result.get("deadline_state").and_then(Json::as_str) != Some("pending")
+    {
+        return Err("private handoff wait returned invalid binding evidence".to_string());
+    }
+    match (
+        result.get("receipt_state").and_then(Json::as_str),
+        result.get("state").and_then(Json::as_str),
+    ) {
+        (Some("received"), Some("acknowledged")) => Ok("received"),
+        (Some("pending"), Some("ready" | "awaiting_ack")) => Ok("pending"),
+        _ => Err("private handoff wait returned invalid receipt state".to_string()),
+    }
+}
+
+fn wait_projection(receipt_state: &str) -> Json {
+    object(vec![
+        ("schema_version", Json::Number(1.0)),
+        ("receipt_state", Json::Str(receipt_state.to_string())),
+    ])
 }
 
 fn call_health_tool(root: &Path) -> Result<Json, String> {
@@ -456,7 +668,7 @@ fn validate_delivery_marker(root: &Path, name: &str, label: &str) -> Result<(), 
     Ok(())
 }
 
-fn tools_list(include_health: bool) -> Json {
+fn tools_list(include_health: bool, include_wait: bool) -> Json {
     let image_tool = object(vec![
         ("name", Json::Str(BROKER_TOOL.to_string())),
         (
@@ -511,6 +723,23 @@ fn tools_list(include_health: bool) -> Json {
             ),
         ]));
     }
+    if include_wait {
+        tools.push(object(vec![
+            ("name", Json::Str(WAIT_TOOL.to_string())),
+            ("description", Json::Str("Wait one bounded slice for this exact image job's Codex receipt. Takes no ids, paths, commands or arguments; repeat only while pending.".to_string())),
+            ("inputSchema", object(vec![
+                ("type", Json::Str("object".to_string())),
+                ("properties", object(vec![])),
+                ("additionalProperties", Json::Bool(false)),
+            ])),
+            ("annotations", object(vec![
+                ("readOnlyHint", Json::Bool(false)),
+                ("destructiveHint", Json::Bool(false)),
+                ("idempotentHint", Json::Bool(false)),
+                ("openWorldHint", Json::Bool(false)),
+            ])),
+        ]));
+    }
     object(vec![("tools", Json::Array(tools))])
 }
 
@@ -527,7 +756,11 @@ fn load_staged_images(root: &Path) -> Result<Vec<LoadedImage>, String> {
         let name = entry.file_name().to_string_lossy().into_owned();
         if matches!(
             name.as_str(),
-            CONSUMED_FILE | DELIVERED_FILE | HEALTH_CONSUMED_FILE | HEALTH_DELIVERED_FILE
+            CONSUMED_FILE
+                | DELIVERED_FILE
+                | HEALTH_CONSUMED_FILE
+                | HEALTH_DELIVERED_FILE
+                | HANDOFF_RECEIVED_FILE
         ) {
             continue;
         }
@@ -1091,6 +1324,58 @@ mod tests {
     }
 
     #[test]
+    fn async_descriptors_require_absolute_paths_and_exact_sha256() {
+        let path = env::temp_dir().join("private-source-name.png");
+        for digest in ["a".repeat(63), "G".repeat(64), "A".repeat(64)] {
+            assert!(ImageAttachment::asynchronous_source(path.clone(), digest).is_err());
+        }
+        assert!(ImageAttachment::asynchronous_source(
+            PathBuf::from("relative.png"),
+            "a".repeat(64)
+        )
+        .is_err());
+        let image = ImageAttachment::asynchronous_source(path.clone(), "a".repeat(64)).unwrap();
+        let debug = format!("{image:?}");
+        assert!(!debug.contains("private-source-name"));
+        assert!(!debug.contains(path.to_string_lossy().as_ref()));
+        assert_eq!(image.expected_digest().unwrap(), "a".repeat(64));
+        assert!(ImageAttachment::source(path).expected_digest().is_err());
+    }
+
+    #[test]
+    fn async_hash_mismatch_is_redacted_and_keeps_no_snapshot() {
+        let (root, _) = temp_bundle("hash-mismatch");
+        let source = root.join("private-source-name.png");
+        fs::write(&source, png(10, 20, false)).unwrap();
+        let mut images =
+            vec![ImageAttachment::asynchronous_source(source, "0".repeat(64)).unwrap()];
+        let error = inspect_all(&mut images, &root, true).unwrap_err();
+        assert_eq!(error, "image 1: content hash mismatch");
+        assert!(images[0].inspected.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn async_verified_snapshot_does_not_reopen_changed_or_missing_source() {
+        let (root, _) = temp_bundle("immutable-snapshot");
+        let source = root.join("private-source-name.png");
+        let bytes = png(10, 20, false);
+        fs::write(&source, &bytes).unwrap();
+        let expected = hex_encode(&sha256(&bytes));
+        let mut images =
+            vec![ImageAttachment::asynchronous_source(source.clone(), expected.clone()).unwrap()];
+        inspect_all(&mut images, &root, true).unwrap();
+        fs::remove_file(source).unwrap();
+        inspect_all(&mut images, &root, true).unwrap();
+        assert_eq!(
+            images[0].inspected().unwrap().bytes.as_ref(),
+            bytes.as_slice()
+        );
+        assert_eq!(images[0].inspected().unwrap().digest, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_oversized_dimensions_and_unknown_formats() {
         assert!(inspect_bytes(&png(MAX_DIMENSION + 1, 1, false)).is_err());
         assert!(inspect_bytes(b"not an image").is_err());
@@ -1186,6 +1471,7 @@ mod tests {
             .contains("already consumed"));
         let staged = ImageBundle {
             root: bundle.clone(),
+            state_root: root.clone(),
             cleaned: true,
         };
         staged.validate_consumption(false).unwrap();
@@ -1233,7 +1519,7 @@ mod tests {
 
     #[test]
     fn private_tool_catalog_exposes_health_only_when_configured() {
-        let without_health = tools_list(false);
+        let without_health = tools_list(false, false);
         let without = without_health
             .get("tools")
             .and_then(Json::as_array)
@@ -1244,12 +1530,119 @@ mod tests {
             Some(BROKER_TOOL)
         );
 
-        let with_health = tools_list(true);
+        let with_health = tools_list(true, false);
         let with = with_health.get("tools").and_then(Json::as_array).unwrap();
         assert_eq!(with.len(), 2);
         assert_eq!(
             with[1].get("name").and_then(Json::as_str),
             Some(HEALTH_TOOL)
         );
+    }
+
+    #[test]
+    fn managed_wait_catalog_has_only_a_closed_zero_argument_operation() {
+        for health in [false, true] {
+            let catalog = tools_list(health, true);
+            let tools = catalog.get("tools").and_then(Json::as_array).unwrap();
+            assert_eq!(tools.len(), if health { 3 } else { 2 });
+            let wait = tools.last().unwrap();
+            assert_eq!(
+                tools[0].get("name").and_then(Json::as_str),
+                Some(BROKER_TOOL)
+            );
+            if health {
+                assert_eq!(
+                    tools[1].get("name").and_then(Json::as_str),
+                    Some(HEALTH_TOOL)
+                );
+            }
+            assert_eq!(wait.get("name").and_then(Json::as_str), Some(WAIT_TOOL));
+            assert_eq!(
+                wait.get("annotations")
+                    .unwrap()
+                    .get("readOnlyHint")
+                    .and_then(Json::as_bool),
+                Some(false)
+            );
+            let schema = wait.get("inputSchema").unwrap();
+            assert!(schema
+                .get("properties")
+                .and_then(Json::as_object)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                schema.get("additionalProperties").and_then(Json::as_bool),
+                Some(false)
+            );
+            assert!(!tools_list(health, false)
+                .to_compact_string()
+                .contains(WAIT_TOOL));
+        }
+        for arguments in ["null", "[]", "\"command\"", "{\"job_id\":\"other\"}"] {
+            let request = Json::parse_exact(&format!(
+                "{{\"params\":{{\"name\":\"{WAIT_TOOL}\",\"arguments\":{arguments}}}}}"
+            ))
+            .unwrap();
+            assert!(call_private_tool(Path::new("unused"), &request)
+                .unwrap_err()
+                .contains("no arguments"));
+        }
+    }
+
+    #[test]
+    fn managed_wait_requires_real_acknowledgement_state() {
+        for (receipt, state, accepted) in [
+            ("pending", "awaiting_ack", true),
+            ("pending", "ready", true),
+            ("received", "acknowledged", true),
+            ("received", "awaiting_ack", false),
+            ("received", "detached_received", false),
+            ("pending", "acknowledged", false),
+        ] {
+            let value = Json::parse_exact(&format!("{{\"schema_version\":1,\"deadline_state\":\"pending\",\"receipt_state\":\"{receipt}\",\"state\":\"{state}\"}}")).unwrap();
+            assert_eq!(wait_receipt_state(&value).is_ok(), accepted);
+            if accepted {
+                assert_eq!(wait_receipt_state(&value).unwrap(), receipt);
+            }
+        }
+        for invalid in [
+            "{}",
+            "{\"schema_version\":2,\"receipt_state\":\"received\"}",
+            "{\"receipt_state\":\"received\"}",
+        ] {
+            assert!(wait_receipt_state(&Json::parse_exact(invalid).unwrap()).is_err());
+        }
+        let expired = Json::parse_exact(r#"{"schema_version":1,"deadline_state":"expired","receipt_state":"received","state":"acknowledged"}"#).unwrap();
+        assert!(wait_receipt_state(&expired).is_err());
+        let projection = wait_projection("pending").to_compact_string();
+        assert_eq!(
+            projection,
+            r#"{"receipt_state":"pending","schema_version":1}"#
+        );
+        assert!(!projection.contains("activity"));
+    }
+
+    #[test]
+    fn job_staging_cleanup_preserves_sources_and_unknown_entries() {
+        let (root, _) = temp_bundle("job-cleanup");
+        let source = root.join("source.png");
+        fs::write(&source, png(2, 2, false)).unwrap();
+        let mut images = vec![ImageAttachment::source(&source)];
+        inspect_all(&mut images, &root, true).unwrap();
+        let stage = root.join("job-11111111-2222-4333-8444-555555555555");
+        let mut bundle = ImageBundle::stage_in(&images, &stage, Duration::from_secs(600)).unwrap();
+        fs::write(bundle.root().join(HANDOFF_RECEIVED_FILE), b"1").unwrap();
+        assert_eq!(load_staged_images(bundle.root()).unwrap().len(), 1);
+        bundle.validate_handoff_consumption().unwrap();
+        bundle.cleanup().unwrap();
+        cleanup_job_stage(&stage).unwrap();
+        assert!(!stage.exists());
+        assert!(source.is_file());
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join("preserve.txt"), b"not an image bundle").unwrap();
+        assert!(cleanup_job_stage(&stage).is_err());
+        assert!(stage.join("preserve.txt").exists());
+        assert!(cleanup_job_stage(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

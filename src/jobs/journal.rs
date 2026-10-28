@@ -18,6 +18,7 @@ use crate::ask::ContextRef;
 use crate::context::ContextRecovery;
 use crate::fsx;
 use crate::json::Json;
+use crate::sha256::{hex_encode, sha256};
 use crate::signals::fnv1a_64;
 
 use super::{JobMode, JobSpec, JobState, JobView, LaneGrant, LanePlan, PathGrant};
@@ -453,7 +454,11 @@ fn validate_existing(record: &JobRecord, fingerprint: &str, mode: JobMode) -> Re
 
 pub(crate) fn request_fingerprint(spec: &JobSpec) -> Result<String, JobError> {
     let canonical = canonical_request_json(spec)?;
-    Ok(format!("{:016x}", fnv1a_64(&canonical)))
+    if spec.request.images.is_empty() {
+        Ok(format!("{:016x}", fnv1a_64(&canonical)))
+    } else {
+        Ok(hex_encode(&sha256(canonical.as_bytes())))
+    }
 }
 
 fn canonical_request_json(spec: &JobSpec) -> Result<String, JobError> {
@@ -466,6 +471,20 @@ fn canonical_request_json(spec: &JobSpec) -> Result<String, JobError> {
         Json::Bool(spec.request.allow_subagents),
     );
     map.insert("context".to_string(), context_json(&spec.request.context));
+    if !spec.request.images.is_empty() {
+        let digests = spec
+            .request
+            .images
+            .iter()
+            .map(|image| {
+                image
+                    .expected_digest()
+                    .map(|digest| Json::Str(digest.to_string()))
+                    .map_err(JobError::invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        map.insert("image_sha256".to_string(), Json::Array(digests));
+    }
     map.insert(
         "cwd".to_string(),
         Json::Str(canonical_path(&spec.request.cwd)),
@@ -1118,7 +1137,7 @@ fn parse_record_line(line: &str) -> Result<JobRecord, JobError> {
     let request_fingerprint = required_string(&value, "request_fingerprint")?;
     if !is_fingerprint(&request_fingerprint) {
         return Err(JobError::corrupt(
-            "corrupt: journal fingerprint is not 16 lowercase hex characters",
+            "corrupt: journal fingerprint is not legacy 16 or SHA-256 64 lowercase hex characters",
         ));
     }
     let record = JobRecord {
@@ -1851,7 +1870,7 @@ fn is_canonical_uuid(value: &str) -> bool {
 }
 
 fn is_fingerprint(value: &str) -> bool {
-    value.len() == 16
+    matches!(value.len(), 16 | 64)
         && value
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
@@ -1900,6 +1919,7 @@ fn system_now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -2161,6 +2181,80 @@ mod tests {
             assert!(!stored.contains(secret), "{secret} leaked into the journal");
         }
         assert!(!stored.contains("\"prompt\""));
+    }
+
+    #[test]
+    fn text_fingerprints_keep_the_exact_legacy_material_and_algorithm() {
+        let request = spec(JOB_A, "unchanged text request");
+        let canonical = canonical_request_json(&request).unwrap();
+        assert!(!canonical.contains("image_sha256"));
+        assert_eq!(
+            request_fingerprint(&request).unwrap(),
+            format!("{:016x}", fnv1a_64(&canonical))
+        );
+    }
+
+    #[test]
+    fn image_fingerprints_bind_ordered_content_not_source_paths() {
+        let mut first = spec(JOB_A, "review the fixture");
+        let first_path = env::temp_dir().join("private-first.png");
+        first.request.images = vec![
+            crate::image_attachments::ImageAttachment::asynchronous_source(
+                first_path,
+                "a".repeat(64),
+            )
+            .unwrap(),
+        ];
+        let mut moved = first.clone();
+        moved.request.images = vec![
+            crate::image_attachments::ImageAttachment::asynchronous_source(
+                env::temp_dir().join("private-moved.png"),
+                "a".repeat(64),
+            )
+            .unwrap(),
+        ];
+        let fingerprint = request_fingerprint(&first).unwrap();
+        assert_eq!(fingerprint.len(), 64);
+        assert_eq!(fingerprint, request_fingerprint(&moved).unwrap());
+        assert!(!canonical_request_json(&first)
+            .unwrap()
+            .contains("private-first"));
+        moved.request.images = vec![
+            crate::image_attachments::ImageAttachment::asynchronous_source(
+                env::temp_dir().join("private-moved.png"),
+                "b".repeat(64),
+            )
+            .unwrap(),
+        ];
+        assert_ne!(fingerprint, request_fingerprint(&moved).unwrap());
+        first.request.images.push(moved.request.images[0].clone());
+        let ordered = request_fingerprint(&first).unwrap();
+        first.request.images.reverse();
+        assert_ne!(ordered, request_fingerprint(&first).unwrap());
+    }
+
+    #[test]
+    fn image_job_lookup_never_reopens_source_and_journal_keeps_no_path() {
+        let fixture = Fixture::new("image-cache");
+        let mut request = spec(JOB_A, "review the fixture");
+        let missing = env::temp_dir().join("private-never-created-image.png");
+        request.request.images = vec![
+            crate::image_attachments::ImageAttachment::asynchronous_source(missing, "c".repeat(64))
+                .unwrap(),
+        ];
+        fixture.store.begin(&request).unwrap();
+        assert!(fixture.store.existing(&request).unwrap().is_some());
+        let journal = fs::read_to_string(fixture.journal(JOB_A)).unwrap();
+        assert!(!journal.contains("private-never-created-image"));
+        assert!(!journal.contains("review the fixture"));
+        request.request.images = vec![
+            crate::image_attachments::ImageAttachment::asynchronous_source(
+                env::temp_dir().join("another-private-name.png"),
+                "d".repeat(64),
+            )
+            .unwrap(),
+        ];
+        assert!(fixture.store.existing(&request).is_err());
     }
 
     #[test]

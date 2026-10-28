@@ -74,6 +74,7 @@ fn runtime(store: Arc<JobStore>, root: &Path) -> Arc<RuntimeInner> {
         threads: Mutex::new(Vec::new()),
         event_log: None,
         escrow_dir: root.join("escrow"),
+        image_root: root.join("image-jobs").join(PROFILE),
         handoff_dir: None,
         handoff_lock: Mutex::new(()),
         max_concurrent: 1,
@@ -216,6 +217,38 @@ fn corrupt_journal_aborts_recovery_before_transitions() {
     let before = durable_bytes(&store, JOB_ID);
     assert!(open_recovered_store(&root, PROFILE, None).is_err());
     assert_eq!(durable_bytes(&store, JOB_ID), before);
+}
+
+#[test]
+fn image_restart_cleans_only_interrupted_owned_staging_without_replay() {
+    let root = temp("image-recovery");
+    let store = JobStore::open_at(&root, PROFILE).unwrap();
+    store.begin(&spec(&root, JOB_ID)).unwrap();
+    store
+        .transition(JOB_ID, &transition(JobState::Running, None))
+        .unwrap();
+    let image_root = root.join("image-jobs").join(PROFILE);
+    let stage = image_root.join(format!("job-{JOB_ID}"));
+    fs::create_dir_all(&stage).unwrap();
+    let unknown = image_root.join("job-00000000-0000-4000-8000-000000000000");
+    fs::create_dir_all(&unknown).unwrap();
+    fs::write(unknown.join("preserve.txt"), "unknown job evidence").unwrap();
+    let lease = ExecutionLease::acquire_profile(&root, PROFILE, JOB_ID).unwrap();
+    assert!(open_recovered_store(&root, PROFILE, None).is_err());
+    assert!(stage.exists());
+    assert_eq!(store.get(JOB_ID).unwrap().unwrap().state, JobState::Running);
+    drop(lease);
+    let recovered = open_recovered_store(&root, PROFILE, None).unwrap();
+    assert_eq!(
+        recovered.get(JOB_ID).unwrap().unwrap().state,
+        JobState::Interrupted
+    );
+    assert!(!stage.exists());
+    assert!(unknown.join("preserve.txt").is_file());
+    let before = durable_bytes(&recovered, JOB_ID);
+    open_recovered_store(&root, PROFILE, None).unwrap();
+    assert_eq!(durable_bytes(&recovered, JOB_ID), before);
+    assert!(!recovered.begin(&spec(&root, JOB_ID)).unwrap().created());
 }
 
 struct OwnedChild(Child);
@@ -396,6 +429,7 @@ fn synthetic_runtime_child() {
         None,
         &CancellationToken::default(),
         &JobObserver {
+            image_stage_root: None,
             store: Arc::clone(&inner.store),
             job_id: JOB_ID.to_string(),
             require_lane_result: false,

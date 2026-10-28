@@ -111,9 +111,9 @@ pub(crate) fn run_invocation_status(
     inherit_stdin: bool,
 ) -> Result<std::process::ExitStatus, String> {
     let mut command = Command::new(&invocation.command);
+    invocation.configure_environment(&mut command);
     command
         .args(&invocation.args)
-        .envs(&invocation.env)
         .stdin(if inherit_stdin {
             Stdio::inherit()
         } else {
@@ -666,9 +666,9 @@ fn spawn_child(
     }
 
     let mut command = Command::new(&invocation.command);
+    invocation.configure_environment(&mut command);
     command
         .args(&invocation.args)
-        .envs(&invocation.env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
