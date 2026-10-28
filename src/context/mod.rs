@@ -4,10 +4,13 @@
 //! The low-level readers and journal remain isolated here; `ask` owns policy,
 //! logging, health, and child-process ordering around them.
 
+mod active_index;
 mod error;
 mod excluded_bytes;
 mod grok_prompt;
 mod journal;
+mod lineage;
+mod logical_file;
 mod oversized;
 mod parse;
 mod plan;

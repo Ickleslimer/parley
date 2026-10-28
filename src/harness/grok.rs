@@ -18,7 +18,8 @@ impl Harness for GrokHarness {
                 policy.grok_allows(),
                 policy.grok_subagents_disabled(),
             ),
-        ))
+        )
+        .isolate_handoff_environment())
     }
 }
 

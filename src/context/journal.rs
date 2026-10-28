@@ -51,6 +51,8 @@ mod catch_up_state_tests {
             session_id: "source".to_string(),
             path,
             identity: reader.identity().clone(),
+            parts: Vec::new(),
+            selection: None,
         };
         let store = JournalStore::open_at(root.join("state"));
         let key = ContextKey::new("target", "codex", "source").unwrap();
@@ -330,7 +332,7 @@ impl JournalStore {
             }
         }
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         plan_seed(source, &mut reader, bounds)
     }
@@ -351,7 +353,7 @@ impl JournalStore {
             }
         }
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         plan_seed(source, &mut reader, bounds)
     }
@@ -429,7 +431,7 @@ impl JournalStore {
             ));
         }
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
         self.verify_range(&snapshot, &mut reader)?;
@@ -449,7 +451,7 @@ impl JournalStore {
             ));
         }
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
         let (summary, messages) = self.verify_range(&snapshot, &mut reader)?;
@@ -474,7 +476,7 @@ impl JournalStore {
             ));
         }
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
         let (summary, messages) = self.verify_range(&snapshot, &mut reader)?;
@@ -501,7 +503,7 @@ impl JournalStore {
             ));
         }
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
         self.verify_range(&snapshot, &mut reader)?;
@@ -533,7 +535,7 @@ impl JournalStore {
             ));
         }
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
         self.verify_range(&snapshot, &mut reader)?;
@@ -564,7 +566,7 @@ impl JournalStore {
             ));
         }
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
         self.verify_range(&snapshot, &mut reader)?;
@@ -584,7 +586,7 @@ impl JournalStore {
             ));
         }
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(&snapshot, reader.identity())?;
         self.verify_range(&snapshot, &mut reader)?;
@@ -704,7 +706,7 @@ impl JournalStore {
         bounds: &ContextBounds,
     ) -> Result<ContextPlan, ContextError> {
         self.verify_source_session(key, source)?;
-        let mut reader = SharedJsonlReader::open(&source.path)?;
+        let mut reader = SharedJsonlReader::open_source(source)?;
         self.verify_live_identity(source, reader.identity())?;
         self.verify_identity(snapshot, reader.identity())?;
         self.verify_range(snapshot, &mut reader)?;
@@ -811,7 +813,11 @@ impl JournalStore {
         }
         refuse_reparse_chain(path.parent().unwrap_or(&self.root))?;
         let record = JournalRecord {
-            schema_version: 1,
+            schema_version: if plan.source_identity.history.is_empty() {
+                1
+            } else {
+                2
+            },
             record_id: new_record_id(),
             timestamp_ms: timestamp_ms(),
             state,
@@ -893,7 +899,7 @@ impl JournalStore {
         live: &SourceIdentity,
     ) -> Result<(), ContextError> {
         match &snapshot.source_identity {
-            Some(stored) if stored.same_file(live) => Ok(()),
+            Some(stored) if live.retains(stored, snapshot.end_offset) => Ok(()),
             Some(_) => Err(ContextError::new(
                 ErrorKind::Replaced,
                 "source file was replaced since the cursor was written",
@@ -1120,12 +1126,24 @@ fn parse_journal_record(line: &str) -> Result<JournalRecord, ContextError> {
     })?;
     let schema_version = required_u64(&json, "schema_version")
         .map_err(|error| ContextError::corrupt(error.message))?;
-    if schema_version != 1 {
+    if schema_version != 1 && schema_version != 2 {
         return Err(ContextError::corrupt(format!(
             "unsupported journal schema {schema_version}"
         )));
     }
     let identity = parse_identity(required_object(&json, "source_identity")?)?;
+    if identity.history.first().is_some_and(|part| {
+        part.volume_serial != identity.volume_serial || part.file_index != identity.file_index
+    }) {
+        return Err(ContextError::corrupt(
+            "journal history root identity does not match source",
+        ));
+    }
+    if (schema_version == 2) != !identity.history.is_empty() {
+        return Err(ContextError::corrupt(
+            "journal history identity does not match its schema",
+        ));
+    }
     Ok(JournalRecord {
         schema_version,
         record_id: required_str(&json, "record_id")?,
@@ -1160,6 +1178,7 @@ fn parse_identity(object: &Json) -> Result<SourceIdentity, ContextError> {
             ContextError::corrupt("journal source_identity.file_index is not a u64")
         })?,
         canonical_path: required_str(object, "path_fingerprint")?,
+        history: parse_history(object.get("history"))?,
     })
 }
 
@@ -1192,7 +1211,106 @@ fn identity_json(identity: &SourceIdentity) -> Json {
         "path_fingerprint".to_string(),
         Json::Str(format!("{:016x}", fnv1a_64(&identity.canonical_path))),
     );
+    if !identity.history.is_empty() {
+        map.insert(
+            "history".to_string(),
+            Json::Array(
+                identity
+                    .history
+                    .iter()
+                    .map(|part| {
+                        let mut fields = BTreeMap::new();
+                        fields.insert(
+                            "volume_serial".to_string(),
+                            Json::Str(part.volume_serial.to_string()),
+                        );
+                        fields.insert(
+                            "file_index".to_string(),
+                            Json::Str(part.file_index.to_string()),
+                        );
+                        fields.insert(
+                            "logical_start".to_string(),
+                            Json::Number(part.logical_start as f64),
+                        );
+                        fields.insert(
+                            "physical_start".to_string(),
+                            Json::Number(part.physical_start as f64),
+                        );
+                        fields.insert(
+                            "physical_end".to_string(),
+                            part.physical_end
+                                .map_or(Json::Null, |end| Json::Number(end as f64)),
+                        );
+                        fields.insert(
+                            "header_fingerprint".to_string(),
+                            Json::Str(part.header_fingerprint.clone()),
+                        );
+                        Json::Object(fields)
+                    })
+                    .collect(),
+            ),
+        );
+    }
     Json::Object(map)
+}
+
+fn parse_history(
+    value: Option<&Json>,
+) -> Result<Vec<super::winfile::HistoryIdentity>, ContextError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Json::Array(parts) = value else {
+        return Err(ContextError::corrupt("journal history is not an array"));
+    };
+    if !(2..=8).contains(&parts.len()) {
+        return Err(ContextError::corrupt(
+            "journal history has invalid segment count",
+        ));
+    }
+    let mut history = Vec::new();
+    let mut logical_start = 0;
+    for (position, part) in parts.iter().enumerate() {
+        let physical_start = required_u64(part, "physical_start")?;
+        let physical_end = match part.get("physical_end") {
+            Some(Json::Null) if position + 1 == parts.len() => None,
+            Some(_) if position + 1 < parts.len() => Some(required_u64(part, "physical_end")?),
+            _ => {
+                return Err(ContextError::corrupt(
+                    "journal history segment has invalid limit",
+                ))
+            }
+        };
+        let fingerprint = required_str(part, "header_fingerprint")?;
+        if required_u64(part, "logical_start")? != logical_start
+            || (position == 0 && physical_start != 0)
+            || fingerprint.len() != 16
+            || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ContextError::corrupt(
+                "journal history geometry or header fingerprint is invalid",
+            ));
+        }
+        history.push(super::winfile::HistoryIdentity {
+            volume_serial: required_str(part, "volume_serial")?
+                .parse()
+                .map_err(|_| ContextError::corrupt("invalid history volume"))?,
+            file_index: required_str(part, "file_index")?
+                .parse()
+                .map_err(|_| ContextError::corrupt("invalid history file identity"))?,
+            logical_start,
+            physical_start,
+            physical_end,
+            header_fingerprint: fingerprint,
+        });
+        if let Some(end) = physical_end {
+            logical_start = end
+                .checked_sub(physical_start)
+                .and_then(|length| logical_start.checked_add(length))
+                .ok_or_else(|| ContextError::corrupt("journal history offset overflow"))?;
+        }
+    }
+    Ok(history)
 }
 
 fn anchor_json(anchor: Option<&MessageAnchor>) -> Json {

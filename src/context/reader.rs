@@ -7,7 +7,7 @@ use std::path::Path;
 use super::error::{ContextError, ErrorKind};
 use super::excluded_bytes::is_skippable_invalid_utf8_record;
 use super::oversized::OversizedJsonScanner;
-use super::winfile::{open_shared_read, source_identity, SourceIdentity};
+use super::winfile::{open_shared_read, SourceIdentity};
 
 pub(crate) const MAX_PHYSICAL_RECORD: usize = 8 * 1024 * 1024;
 const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
@@ -58,26 +58,35 @@ pub(crate) struct ReadBatch {
 }
 
 pub(crate) struct SharedJsonlReader {
-    file: File,
+    file: super::logical_file::LogicalFile,
     identity: SourceIdentity,
     max_physical_record: usize,
 }
 
 impl SharedJsonlReader {
+    #[cfg(test)]
     pub(crate) fn open(path: &Path) -> Result<Self, ContextError> {
         Self::open_with_limit(path, MAX_PHYSICAL_RECORD)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_limit(
         path: &Path,
         max_physical_record: usize,
     ) -> Result<Self, ContextError> {
-        let file = open_shared_read(path)?;
-        let identity = source_identity(&file, path)?;
+        let (file, identity) = super::logical_file::LogicalFile::single(path)?;
         Ok(Self {
             file,
             identity,
             max_physical_record,
+        })
+    }
+
+    pub(crate) fn open_source(source: &super::root::ResolvedSource) -> Result<Self, ContextError> {
+        Ok(Self {
+            file: super::logical_file::LogicalFile::open(source)?,
+            identity: source.identity.clone(),
+            max_physical_record: MAX_PHYSICAL_RECORD,
         })
     }
 
@@ -86,7 +95,7 @@ impl SharedJsonlReader {
     }
 
     pub(crate) fn file_len(&self) -> Result<u64, ContextError> {
-        Ok(self.file.metadata()?.len())
+        self.file.len()
     }
 
     #[cfg(test)]
@@ -217,6 +226,15 @@ impl SharedJsonlReader {
                             }
                             CompletedRecord::Retained(record) => {
                                 debug_assert!(fingerprint_record);
+                                if !self.identity.history.is_empty() && record.start_offset > 3 {
+                                    let value = super::parse::parse_json(&record.text)?;
+                                    if super::parse::get_str(&value, "type") == Some("session_meta")
+                                    {
+                                        return Err(ContextError::malformed(
+                                            "unexpected metadata inside linked history payload",
+                                        ));
+                                    }
+                                }
                                 first_record_start.get_or_insert(record.start_offset);
                                 on_record(record)?;
                             }
@@ -266,6 +284,13 @@ impl SharedJsonlReader {
             Some(end) => end.max(complete_begin),
             None => pending_start,
         };
+        self.file.verify()?;
+        if self.file_len()? < size {
+            return Err(ContextError::new(
+                ErrorKind::Truncated,
+                "history shrank during scan",
+            ));
+        }
         Ok((
             ScanSummary {
                 complete_end,
@@ -283,16 +308,16 @@ impl SharedJsonlReader {
 
     fn seek_start(&mut self, start: u64) -> Result<u64, ContextError> {
         if start == 0 {
-            self.file.seek(SeekFrom::Start(0))?;
+            self.file.seek(0);
             let mut bom = [0_u8; 3];
             let read = self.file.read(&mut bom)?;
             if read == 3 && bom == BOM {
                 return Ok(3);
             }
-            self.file.seek(SeekFrom::Start(0))?;
+            self.file.seek(0);
             return Ok(0);
         }
-        self.file.seek(SeekFrom::Start(start))?;
+        self.file.seek(start);
         Ok(start)
     }
 }
@@ -479,6 +504,13 @@ pub(crate) fn read_first_complete_record(
     path: &Path,
 ) -> Result<Option<PhysicalRecord>, ContextError> {
     let mut file = open_shared_read(path)?;
+    read_first_from_file(&mut file)
+}
+
+pub(crate) fn read_first_from_file(
+    file: &mut File,
+) -> Result<Option<PhysicalRecord>, ContextError> {
+    file.seek(SeekFrom::Start(0))?;
     let mut start_offset = 0_u64;
     let mut prefix = [0_u8; 3];
     let prefix_len = file.read(&mut prefix)?;

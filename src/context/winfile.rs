@@ -19,11 +19,56 @@ pub(crate) struct SourceIdentity {
     pub volume_serial: u32,
     pub file_index: u64,
     pub canonical_path: String,
+    pub history: Vec<HistoryIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct HistoryIdentity {
+    pub volume_serial: u32,
+    pub file_index: u64,
+    pub logical_start: u64,
+    pub physical_start: u64,
+    pub physical_end: Option<u64>,
+    pub header_fingerprint: String,
 }
 
 impl SourceIdentity {
     pub(crate) fn same_file(&self, other: &Self) -> bool {
         self.volume_serial == other.volume_serial && self.file_index == other.file_index
+    }
+
+    pub(crate) fn retains(&self, stored: &Self, end: u64) -> bool {
+        if !self.same_file(stored) {
+            return false;
+        }
+        if stored.history.is_empty() {
+            return self.history.first().is_none_or(|part| {
+                part.logical_start == 0
+                    && part.physical_start == 0
+                    && part.physical_end.is_none_or(|limit| end <= limit)
+            });
+        }
+        stored
+            .history
+            .iter()
+            .filter(|part| part.logical_start < end)
+            .all(|old| {
+                self.history.iter().any(|new| {
+                    let retained_end = old
+                        .physical_end
+                        .map(|limit| old.logical_start + limit - old.physical_start)
+                        .unwrap_or(end)
+                        .min(end);
+                    new.logical_start == old.logical_start
+                        && new.physical_start == old.physical_start
+                        && new.volume_serial == old.volume_serial
+                        && new.file_index == old.file_index
+                        && new.header_fingerprint == old.header_fingerprint
+                        && new.physical_end.is_none_or(|limit| {
+                            new.logical_start + limit - new.physical_start >= retained_end
+                        })
+                })
+            })
     }
 }
 
@@ -169,6 +214,7 @@ fn identity_from_file(file: &File, canonical_path: String) -> Result<SourceIdent
             volume_serial,
             file_index,
             canonical_path,
+            history: Vec::new(),
         })
     }
     #[cfg(unix)]
@@ -179,6 +225,7 @@ fn identity_from_file(file: &File, canonical_path: String) -> Result<SourceIdent
             volume_serial: meta.dev() as u32,
             file_index: meta.ino(),
             canonical_path,
+            history: Vec::new(),
         })
     }
     #[cfg(not(any(windows, unix)))]

@@ -4,13 +4,14 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::context::{refuse_reparse_chain, AgentProfileFile};
 use crate::harness::Invocation;
 use crate::jobs::{GrantKind, PathGrant};
 use crate::json::Json;
 use crate::process::CancellationToken;
+use crate::stream_activity::{ActivityClass, ManagedActivityObserver, SafeActivity};
 
 const MAX_PROTOCOL_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REPLY_CHARS: usize = 256_000;
@@ -45,6 +46,7 @@ pub(crate) enum AcpProfile<'a> {
         broker_exe: &'a Path,
         bundle_dir: &'a Path,
         health_query_exe: Option<&'a Path>,
+        handoff_wait_exe: Option<&'a Path>,
     },
 }
 
@@ -89,6 +91,7 @@ struct TurnCapture {
 enum ProfileKind {
     Continuation,
     Images { health: bool },
+    ManagedImages { health: bool },
 }
 
 impl TurnCapture {
@@ -133,7 +136,8 @@ struct ProtocolClient<'a> {
     stderr_reader: Option<JoinHandle<()>>,
     stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     cancellation: &'a CancellationToken,
-    started: Instant,
+    execution_clock: ExecutionClock,
+    lifecycle: Option<&'a dyn ManagedActivityObserver>,
     last_activity: Instant,
     timeout: Duration,
     idle_timeout: Duration,
@@ -145,6 +149,33 @@ struct ProtocolClient<'a> {
 struct InternalResponseBudget {
     per_id: BTreeMap<&'static str, u8>,
     total: u8,
+}
+
+struct ExecutionClock {
+    elapsed: Duration,
+    last_check: Instant,
+    was_paused: bool,
+}
+
+impl ExecutionClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            elapsed: Duration::ZERO,
+            last_check: now,
+            was_paused: false,
+        }
+    }
+
+    fn sample(&mut self, now: Instant, paused: bool) -> Duration {
+        if !self.was_paused || !paused {
+            self.elapsed = self
+                .elapsed
+                .saturating_add(now.saturating_duration_since(self.last_check));
+        }
+        self.last_check = now;
+        self.was_paused = paused;
+        self.elapsed
+    }
 }
 
 pub(crate) fn run<F>(request: AcpRequest<'_>, process_created: F) -> Result<AcpOutcome, String>
@@ -163,7 +194,68 @@ where
     F: FnOnce(u32) -> Result<(), String>,
     G: FnOnce(u32) -> Result<(), String>,
 {
+    run_observed_inner(request, None, process_created, process_resumed)
+}
+
+fn publish_activity(
+    observer: Option<&dyn ManagedActivityObserver>,
+    class: ActivityClass,
+    visible_text: Option<String>,
+    status: Option<String>,
+) -> Result<(), AwaitError> {
+    if let Some(observer) = observer {
+        observer
+            .activity(SafeActivity {
+                class,
+                timestamp_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                tool_name: None,
+                status,
+                visible_text,
+            })
+            .map_err(AwaitError::Failed)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn run_managed_observed<'a, F, G>(
+    request: AcpRequest<'a>,
+    lifecycle: &'a dyn ManagedActivityObserver,
+    process_created: F,
+    process_resumed: G,
+) -> Result<AcpOutcome, String>
+where
+    F: FnOnce(u32) -> Result<(), String>,
+    G: FnOnce(u32) -> Result<(), String>,
+{
+    run_observed_inner(request, Some(lifecycle), process_created, process_resumed)
+}
+
+fn run_observed_inner<'a, F, G>(
+    request: AcpRequest<'a>,
+    lifecycle: Option<&'a dyn ManagedActivityObserver>,
+    process_created: F,
+    process_resumed: G,
+) -> Result<AcpOutcome, String>
+where
+    F: FnOnce(u32) -> Result<(), String>,
+    G: FnOnce(u32) -> Result<(), String>,
+{
     validate_request(&request)?;
+    let managed = matches!(
+        &request.profile,
+        AcpProfile::Images {
+            handoff_wait_exe: Some(_),
+            ..
+        }
+    );
+    if managed != lifecycle.is_some() {
+        return Err(
+            "managed image ACP requires exactly one genuine lifecycle observer".to_string(),
+        );
+    }
     let profile_kind = profile_kind(&request.profile);
     let profile = AgentProfileFile::create(&agent_profile(profile_kind))
         .map_err(|error| format!("create Grok ACP profile: {error}"))?;
@@ -172,7 +264,13 @@ where
         .to_str()
         .ok_or_else(|| "Grok ACP profile path is not valid Unicode".to_string())?
         .to_string();
-    let result = run_with_profile(&request, &profile_path, process_created, process_resumed);
+    let result = run_with_profile(
+        &request,
+        &profile_path,
+        lifecycle,
+        process_created,
+        process_resumed,
+    );
     let cleanup = profile
         .cleanup()
         .map_err(|error| format!("remove Grok ACP profile: {error}"));
@@ -228,9 +326,10 @@ pub(crate) fn verify_forbidden_tool_protocol() -> Result<(), String> {
     }
 }
 
-fn run_with_profile<F, G>(
-    request: &AcpRequest<'_>,
+fn run_with_profile<'a, F, G>(
+    request: &AcpRequest<'a>,
     profile_path: &str,
+    lifecycle: Option<&'a dyn ManagedActivityObserver>,
     process_created: F,
     process_resumed: G,
 ) -> Result<AcpOutcome, String>
@@ -238,7 +337,10 @@ where
     F: FnOnce(u32) -> Result<(), String>,
     G: FnOnce(u32) -> Result<(), String>,
 {
-    let invocation = acp_invocation(request, profile_path);
+    let mut invocation = acp_invocation(request, profile_path);
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.configure_image_invocation(&mut invocation)?;
+    }
     let cwd = request
         .cwd
         .to_str()
@@ -277,6 +379,7 @@ where
         request.timeout,
         request.idle_timeout,
     )?;
+    client.lifecycle = lifecycle;
     let mut capture = TurnCapture::for_profile(String::new(), profile_kind(&request.profile));
     let protocol_result = (|| {
         let initialize = client.request(
@@ -436,7 +539,8 @@ impl<'a> ProtocolClient<'a> {
             stderr_reader,
             stderr: stderr_bytes,
             cancellation,
-            started: now,
+            execution_clock: ExecutionClock::new(now),
+            lifecycle: None,
             last_activity: now,
             timeout,
             idle_timeout,
@@ -516,7 +620,30 @@ impl<'a> ProtocolClient<'a> {
                         }
                         Some("session/update") => {
                             if let Some(turn) = capture.as_deref_mut() {
+                                let previous_len = turn.reply.len();
                                 handle_session_update(&message, turn)?;
+                                if turn.reply.len() > previous_len {
+                                    publish_activity(
+                                        self.lifecycle,
+                                        ActivityClass::Text,
+                                        Some(turn.reply[previous_len..].to_string()),
+                                        None,
+                                    )?;
+                                } else {
+                                    let class = message
+                                        .get("params")
+                                        .and_then(|params| params.get("update"))
+                                        .and_then(|update| update.get("sessionUpdate"))
+                                        .and_then(Json::as_str);
+                                    if matches!(class, Some("tool_call" | "tool_call_update")) {
+                                        publish_activity(
+                                            self.lifecycle,
+                                            ActivityClass::ToolCall,
+                                            None,
+                                            None,
+                                        )?;
+                                    }
+                                }
                             }
                         }
                         Some("x.ai/session/setup" | "_x.ai/session/setup") => {
@@ -627,7 +754,18 @@ impl<'a> ProtocolClient<'a> {
             let error = self.terminate_and_reap("cancelled Grok ACP process");
             return Err(AwaitError::Cancelled(error));
         }
-        if !self.timeout.is_zero() && self.started.elapsed() >= self.timeout {
+        let paused = self
+            .lifecycle
+            .is_some_and(ManagedActivityObserver::pause_execution_clock);
+        let execution_elapsed = self.execution_clock.sample(Instant::now(), paused);
+        if let Some(reason) = self
+            .lifecycle
+            .and_then(ManagedActivityObserver::timeout_reason)
+        {
+            let error = self.terminate_and_reap(&reason);
+            return Err(AwaitError::TimedOut(error));
+        }
+        if !self.timeout.is_zero() && execution_elapsed >= self.timeout {
             let error = self.terminate_and_reap("Grok ACP execution ceiling reached");
             return Err(AwaitError::TimedOut(error));
         }
@@ -736,6 +874,7 @@ fn acp_invocation(request: &AcpRequest<'_>, profile_path: &str) -> Invocation {
             "stdio".to_string(),
         ],
     )
+    .isolate_handoff_environment()
     .with_env("GROK_ACTIVE_AGENT_MESSAGES", "0")
     .with_env("GROK_WORKFLOWS", "0")
     .with_env("GROK_MEMORY", "0")
@@ -751,15 +890,30 @@ fn profile_kind(profile: &AcpProfile<'_>) -> ProfileKind {
     match profile {
         AcpProfile::Continuation => ProfileKind::Continuation,
         AcpProfile::Images {
-            health_query_exe, ..
-        } => ProfileKind::Images {
-            health: health_query_exe.is_some(),
-        },
+            health_query_exe,
+            handoff_wait_exe,
+            ..
+        } => {
+            if handoff_wait_exe.is_some() {
+                ProfileKind::ManagedImages {
+                    health: health_query_exe.is_some(),
+                }
+            } else {
+                ProfileKind::Images {
+                    health: health_query_exe.is_some(),
+                }
+            }
+        }
     }
 }
 
 fn agent_profile(profile: ProfileKind) -> String {
     match profile {
+        ProfileKind::ManagedImages { health } => {
+            let mut profile = agent_profile(ProfileKind::Images { health });
+            profile.push_str("This is an acknowledgement-required review job. After publishing the complete marked report, use only the private zero-argument wait_for_codex_receipt tool until its real receipt is received. Never use shell, file, peek or alert tools. A receipt is delivery, never approval.\n");
+            profile
+        }
         ProfileKind::Continuation => format!(
             "---\nname: {PROFILE_NAME}\ndescription: Bounded Two Chairs direct continuation\npromptMode: extend\ntools:\n  - \"read_file\"\n  - \"list_dir\"\n  - \"grep\"\n  - \"search_replace\"\n  - \"write\"\ndisallowedTools:\n  - \"run_terminal_cmd\"\n  - \"run_terminal_command\"\n  - \"web_search\"\n  - \"web_fetch\"\n  - \"search_tool\"\n  - \"use_tool\"\n  - \"task\"\n  - \"Agent\"\n  - \"spawn_subagent\"\n  - \"workflow\"\n  - \"todo_write\"\n  - \"ask_user_question\"\nagentsMd: false\ndiscoverSkills: false\ninheritSkills: false\ninjectDefaultTools: false\nmcpInheritance: none\nmodel: inherit\n---\nYou are the direct-continuation peer for Two Chairs. Follow only the current continuation contract. Use only the listed file tools. Never invoke shell, web, MCP, subagents, workflows, memory, or any capability outside the exact prompt and brokered path grants.\n"
         ),
@@ -774,6 +928,7 @@ fn mcp_servers(profile: &AcpProfile<'_>) -> Result<Json, AwaitError> {
         broker_exe,
         bundle_dir,
         health_query_exe,
+        handoff_wait_exe,
     } = profile
     else {
         return Ok(Json::Array(Vec::new()));
@@ -798,6 +953,18 @@ fn mcp_servers(profile: &AcpProfile<'_>) -> Result<Json, AwaitError> {
                 Json::Str("PARLEY_IMAGE_HEALTH_QUERY_EXE".to_string()),
             ),
             ("value", Json::Str(health_query_exe.to_string())),
+        ]));
+    }
+    if let Some(wait_exe) = handoff_wait_exe {
+        let wait_exe = wait_exe.to_str().ok_or_else(|| {
+            AwaitError::Failed("image handoff wait helper path is not valid Unicode".to_string())
+        })?;
+        environment.push(object(vec![
+            (
+                "name",
+                Json::Str("PARLEY_IMAGE_HANDOFF_WAIT_EXE".to_string()),
+            ),
+            ("value", Json::Str(wait_exe.to_string())),
         ]));
     }
     Ok(Json::Array(vec![object(vec![
@@ -828,6 +995,7 @@ fn validate_request(request: &AcpRequest<'_>) -> Result<(), String> {
             broker_exe,
             bundle_dir,
             health_query_exe,
+            handoff_wait_exe,
         } => {
             if request.model.trim().is_empty() || request.reasoning_effort.trim().is_empty() {
                 return Err("image ACP requires explicit model and reasoning effort".to_string());
@@ -848,6 +1016,13 @@ fn validate_request(request: &AcpRequest<'_>) -> Result<(), String> {
                 }
                 refuse_reparse_chain(query)
                     .map_err(|_| "image ACP peer-health query path is unsafe".to_string())?;
+            }
+            if let Some(wait_exe) = handoff_wait_exe {
+                if !wait_exe.is_absolute() || !wait_exe.is_file() {
+                    return Err("image ACP handoff wait helper is unavailable".to_string());
+                }
+                refuse_reparse_chain(wait_exe)
+                    .map_err(|_| "image ACP handoff wait helper is unsafe".to_string())?;
             }
         }
     }
@@ -1035,7 +1210,10 @@ fn permission_response(
         )
     })?;
     let reject = || permission_selection_response(request_id.clone(), &options.reject_once);
-    if matches!(capture.profile, ProfileKind::Images { .. }) {
+    if matches!(
+        capture.profile,
+        ProfileKind::Images { .. } | ProfileKind::ManagedImages { .. }
+    ) {
         if tool_name != "use_tool" || read_only.is_none() || is_mutating {
             capture.rejected_permissions = capture.rejected_permissions.saturating_add(1);
             return Err((
@@ -1437,14 +1615,16 @@ fn enforce_tool_update(update: &Json, capture: &mut TurnCapture) -> Result<(), A
             })?;
         let allowed = match capture.profile {
             ProfileKind::Continuation => ALLOWED_PROFILE_TOOLS.contains(&tool_name),
-            ProfileKind::Images { .. } => ALLOWED_IMAGE_TOOLS.contains(&tool_name),
+            ProfileKind::Images { .. } | ProfileKind::ManagedImages { .. } => {
+                ALLOWED_IMAGE_TOOLS.contains(&tool_name)
+            }
         };
         if !allowed {
             return Err(AwaitError::Failed(match capture.profile {
                 ProfileKind::Continuation => {
                     "Grok ACP attempted a tool outside the continuation profile".to_string()
                 }
-                ProfileKind::Images { .. } => {
+                ProfileKind::Images { .. } | ProfileKind::ManagedImages { .. } => {
                     "Grok ACP attempted a tool outside the image profile".to_string()
                 }
             }));
@@ -1458,7 +1638,7 @@ fn enforce_tool_update(update: &Json, capture: &mut TurnCapture) -> Result<(), A
         ProfileKind::Continuation => {
             !read_only || ALLOWED_MUTATING_TOOLS.contains(&tool_name.as_str())
         }
-        ProfileKind::Images { .. } => false,
+        ProfileKind::Images { .. } | ProfileKind::ManagedImages { .. } => false,
     };
     let status = update.get("status").and_then(Json::as_str);
     if !matches!(
@@ -1527,8 +1707,10 @@ fn enforce_tool_update(update: &Json, capture: &mut TurnCapture) -> Result<(), A
 }
 
 fn validate_required_tool_usage(capture: &TurnCapture) -> Result<(), AwaitError> {
-    let ProfileKind::Images { health } = capture.profile else {
-        return Ok(());
+    let (health, managed) = match capture.profile {
+        ProfileKind::Images { health } => (health, false),
+        ProfileKind::ManagedImages { health } => (health, true),
+        ProfileKind::Continuation => return Ok(()),
     };
     let mut used = 0_usize;
     for (tool_call_id, (name, _read_only)) in &capture.observed_tools {
@@ -1540,9 +1722,10 @@ fn validate_required_tool_usage(capture: &TurnCapture) -> Result<(), AwaitError>
         }
     }
     let expected_uses = if health { 2 } else { 1 };
-    if used != expected_uses {
+    let minimum_uses = expected_uses + usize::from(managed);
+    if (!managed && used != expected_uses) || (managed && used < minimum_uses) {
         return Err(AwaitError::Failed(format!(
-            "Grok ACP image turn did not complete the required private tool sequence (uses={used}, expected_uses={expected_uses})"
+            "Grok ACP image turn did not complete the required private tool sequence (uses={used}, required_uses={minimum_uses}, managed={managed})"
         )));
     }
     Ok(())
@@ -3335,6 +3518,32 @@ mod tests {
     }
 
     #[test]
+    fn managed_clock_excludes_only_verified_wait_intervals() {
+        let start = Instant::now();
+        let mut clock = ExecutionClock::new(start);
+        assert_eq!(
+            clock.sample(start + Duration::from_secs(2), false),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            clock.sample(start + Duration::from_secs(3), true),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            clock.sample(start + Duration::from_secs(303), true),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            clock.sample(start + Duration::from_secs(304), false),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            clock.sample(start + Duration::from_secs(306), false),
+            Duration::from_secs(6)
+        );
+    }
+
+    #[test]
     fn only_visible_message_chunks_reach_the_reply() {
         let mut capture = TurnCapture::new("session".to_string());
         for (kind, text) in [
@@ -3463,6 +3672,7 @@ mod tests {
             health_query_exe: Some(Path::new(
                 r"C:\Program Files\Parley\health\parley-health-query.exe",
             )),
+            handoff_wait_exe: None,
         };
         let servers = mcp_servers(&profile).unwrap();
         let servers = servers.as_array().unwrap();
@@ -3489,6 +3699,33 @@ mod tests {
             environment[1].get("name").and_then(Json::as_str),
             Some("PARLEY_IMAGE_HEALTH_QUERY_EXE")
         );
+    }
+
+    #[test]
+    fn sync_and_managed_images_share_only_the_existing_private_permission_boundary() {
+        let root = temp_root("managed-image-permission");
+        for profile in [
+            ProfileKind::Images { health: true },
+            ProfileKind::ManagedImages { health: true },
+        ] {
+            for (name, kind, allow) in [
+                ("use_tool", "other", true),
+                ("use_tool", "edit", false),
+                ("write", "edit", false),
+                ("Bash", "other", false),
+            ] {
+                let message = Json::parse_exact(&format!(r#"{{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{{"sessionId":"session","options":[{{"kind":"allow_once","optionId":"allow"}},{{"kind":"reject_once","optionId":"reject"}}],"toolCall":{{"toolCallId":"private-1","kind":"{kind}","rawInput":{{}},"_meta":{{"x.ai/tool":{{"name":"{name}","read_only":false}}}}}}}}}}"#)).unwrap();
+                let mut capture = TurnCapture::for_profile("session".to_string(), profile);
+                let response = permission_response(&message, Some(&mut capture), &root, &[])
+                    .unwrap_or_else(|(response, _)| response.unwrap());
+                assert_eq!(
+                    selected_option(&response),
+                    Some(if allow { "allow" } else { "reject" })
+                );
+                assert!(capture.approved_mutations.is_empty());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

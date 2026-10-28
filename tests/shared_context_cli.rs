@@ -503,3 +503,79 @@ fn argument_after<'a>(json: &'a str, flag: &str) -> Option<&'a str> {
     let value = after_flag.get(value_start..)?;
     value.get(..value.find('"')?)
 }
+
+#[test]
+fn wrong_cwd_image_refuses_before_context_journal_or_model_start() {
+    let root = temp_dir("image-wrong-cwd");
+    let cwd = root.join("worker");
+    let other = root.join("other");
+    let native = root.join("native");
+    let state = root.join("context-state");
+    let images = root.join("image-state");
+    let id = "01a06582-d66e-7811-b0c9-0b0266e17903";
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    let directory = native.join("sessions/encoded").join(id);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("summary.json"),
+        format!(
+            "{{\"info\":{{\"id\":\"{id}\",\"cwd\":\"{}\"}}}}",
+            other.to_string_lossy().replace('\\', "\\\\")
+        ),
+    )
+    .unwrap();
+    let image = cwd.join("private-capture-nonce.png");
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend_from_slice(&13_u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&4_u32.to_be_bytes());
+    bytes.extend_from_slice(&5_u32.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&0_u32.to_be_bytes());
+    bytes.extend_from_slice(b"IEND");
+    bytes.extend_from_slice(&[0; 4]);
+    fs::write(&image, bytes).unwrap();
+    let event_log = root.join("events.jsonl");
+    let output = par()
+        .args([
+            "ask",
+            "-h",
+            "grok",
+            "-p",
+            "inspect",
+            "--model",
+            "grok-4.7",
+            "--reasoning-effort",
+            "xhigh",
+            "--resume-id",
+            id,
+            "--no-yolo",
+            "--image",
+        ])
+        .arg(&image)
+        .arg("--cwd")
+        .arg(&cwd)
+        .args([
+            "--context-from",
+            "codex:nonexistent-source",
+            "--context-mode",
+            "auto",
+        ])
+        .env("GROK_HOME", &native)
+        .env("PARLEY_CONTEXT_STATE_DIR", &state)
+        .env("PARLEY_IMAGE_STATE_DIR", &images)
+        .env("PARLEY_EVENT_LOG", &event_log)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("image_session_cwd_mismatch"), "{error}");
+    assert!(!state.exists());
+    assert!(!images.exists());
+    assert!(!fs::read_to_string(event_log)
+        .unwrap()
+        .contains("private-capture-nonce"));
+    fs::remove_dir_all(root).unwrap();
+}
